@@ -5,8 +5,12 @@ import math
 from datetime import datetime, timedelta
 import requests
 import time
+from io import BytesIO
 
-# --- Fonctions et Constantes (Définies en premier) ---
+### AJOUT : L'UNIQUE IMPORT NÉCESSAIRE POUR L'IMAGE ###
+from PIL import Image, ImageDraw, ImageFont
+
+# --- Fonctions et Constantes ---
 
 # URL de l'API OANDA (utilisez la bonne pour votre compte : practice ou live)
 OANDA_API_URL = "https://api-fxpractice.oanda.com" # Ou "https://api-fxtrade.oanda.com" pour un compte réel
@@ -47,46 +51,28 @@ def get_trend(fast, slow):
 
 # --- NOUVELLE FONCTION DE RÉCUPÉRATION DES DONNÉES OANDA ---
 def get_oanda_data(instrument, granularity, count, account_id, access_token):
-    """
-    Récupère les données de chandelier depuis l'API OANDA v20.
-    """
+    # (code inchangé)
     url = f"{OANDA_API_URL}/v3/accounts/{account_id}/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {
-        'granularity': granularity,
-        'count': count,
-        'price': 'M'  # 'M' pour Midpoint, 'B' pour Bid, 'A' pour Ask
-    }
+    params = {'granularity': granularity, 'count': count, 'price': 'M'}
 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=30)
-        response.raise_for_status()  # Lève une exception pour les codes d'erreur HTTP 4xx/5xx
+        response.raise_for_status()
         raw_data = response.json()
-
         candles_data = raw_data.get('candles', [])
         if not candles_data:
             st.toast(f"OANDA: Aucune donnée de chandelier reçue pour {instrument}", icon="⚠️")
             return pd.DataFrame()
-
         records = []
         for candle in candles_data:
-            # On ne garde que les bougies complètes
             if candle.get('complete', False):
-                records.append({
-                    'date': candle['time'],
-                    'Open': float(candle['mid']['o']),
-                    'High': float(candle['mid']['h']),
-                    'Low': float(candle['mid']['l']),
-                    'Close': float(candle['mid']['c']),
-                })
-
+                records.append({'date': candle['time'], 'Open': float(candle['mid']['o']), 'High': float(candle['mid']['h']), 'Low': float(candle['mid']['l']), 'Close': float(candle['mid']['c'])})
         if not records: return pd.DataFrame()
-
         df = pd.DataFrame(records)
         df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
         return df
-
     except requests.exceptions.RequestException as e:
         st.toast(f"Erreur réseau pour {instrument}: {e}", icon="🔥")
         return pd.DataFrame()
@@ -94,67 +80,79 @@ def get_oanda_data(instrument, granularity, count, account_id, access_token):
         st.toast(f"Erreur de traitement des données OANDA pour {instrument}: {e}", icon="🔥")
         return pd.DataFrame()
 
+### AJOUT : LA FONCTION FIABLE DE CRÉATION D'IMAGE ###
+def create_simple_image_report(df_report):
+    """Crée une image simple à partir du texte du DataFrame des résultats."""
+    
+    # Préparer le texte du rapport
+    report_title = "Classement des Paires Forex par Tendance MTF"
+    report_text = report_title + "\n" + ("-" * len(report_title)) + "\n"
+    report_text += df_report.to_string(index=False) if not df_report.empty else "Aucune donnée."
 
-# --- Fonction d'analyse principale (adaptée pour OANDA) ---
-# @st.cache_data(ttl=60*5) # Le cache est désactivé pour le débogage. Vous pourrez le réactiver.
+    # Utiliser une police de base qui est toujours disponible
+    try:
+        # Une police à espacement fixe (mono) est idéale pour les tableaux
+        font = ImageFont.truetype("DejaVuSansMono.ttf", 14) 
+    except IOError:
+        font = ImageFont.load_default() # Plan B, toujours fonctionnel
+
+    # Mesurer la taille du texte pour créer une image aux bonnes dimensions
+    temp_img = Image.new('RGB', (1, 1))
+    temp_draw = ImageDraw.Draw(temp_img)
+    text_bbox = temp_draw.multiline_textbbox((0, 0), report_text, font=font)
+    
+    padding = 20
+    width = text_bbox[2] + 2 * padding
+    height = text_bbox[3] + 2 * padding
+    
+    # Créer l'image finale et y dessiner le texte
+    img = Image.new('RGB', (width, height), color='white')
+    draw = ImageDraw.Draw(img)
+    draw.multiline_text((padding, padding), report_text, font=font, fill='black')
+    
+    # Sauvegarder l'image en mémoire pour le téléchargement
+    output_buffer = BytesIO()
+    img.save(output_buffer, format="PNG")
+    return output_buffer.getvalue()
+
+# --- Fonction d'analyse principale (inchangée) ---
 def analyze_forex_pairs(account_id, access_token):
+    # (code inchangé)
     results_internal = []
-    
-    # Paramètres de récupération pour OANDA
-    timeframe_params_oanda = {
-        'H1': {'granularity': 'H1', 'count': 200}, # 200 bougies H1 suffisent pour les calculs
-        'H4': {'granularity': 'H4', 'count': 200}, # 200 bougies H4 suffisent
-        'D':  {'granularity': 'D',  'count': 250}, # ~1 an de données journalières
-        'W':  {'granularity': 'D',  'count': 750}  # ~3 ans de données journalières pour les ré-échantillonner en Weekly
-    }
-    
+    timeframe_params_oanda = {'H1': {'granularity': 'H1', 'count': 200},'H4': {'granularity': 'H4', 'count': 200},'D':  {'granularity': 'D',  'count': 250},'W':  {'granularity': 'D',  'count': 750}}
     total_pairs = len(FOREX_PAIRS_EXTENDED)
     progress_bar = st.progress(0, text=f"Analyse de 0 / {total_pairs} paires...")
-    
     for i, pair_symbol in enumerate(FOREX_PAIRS_EXTENDED):
-        oanda_instrument = f"{pair_symbol[:3]}_{pair_symbol[3:]}" # Format OANDA (ex: EUR_USD)
+        oanda_instrument = f"{pair_symbol[:3]}_{pair_symbol[3:]}"
         try:
             data_sets = {}
             all_data_ok = True
             for tf_key, params in timeframe_params_oanda.items():
                 df = get_oanda_data(oanda_instrument, params['granularity'], params['count'], account_id, access_token)
-                
-                # Le ré-échantillonnage pour le Weekly se fait ici, après avoir récupéré les données Daily
                 if tf_key == 'W' and not df.empty:
                     df = df.resample('W-FRI').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
-
                 if df.empty:
                     all_data_ok = False
                     break
                 data_sets[tf_key] = df
-            
             if not all_data_ok:
                 st.toast(f"Données manquantes pour {oanda_instrument}, la paire est ignorée.", icon="ℹ️")
                 continue
-
-            # Les calculs de tendance restent les mêmes
             data_h1, data_h4, data_d, data_w = data_sets['H1'], data_sets['H4'], data_sets['D'], data_sets['W']
             trend_h1 = get_trend(hma(data_h1['Close'], 12), data_h1['Close'].ewm(span=20, adjust=False).mean())
             trend_h4 = get_trend(hma(data_h4['Close'], 12), data_h4['Close'].ewm(span=20, adjust=False).mean())
             trend_d  = get_trend(data_d['Close'].ewm(span=20, adjust=False).mean(), data_d['Close'].ewm(span=50, adjust=False).mean())
             trend_w  = get_trend(data_w['Close'].ewm(span=20, adjust=False).mean(), data_w['Close'].ewm(span=50, adjust=False).mean())
-            
             score = sum([1 if t == 'Bullish' else -1 if t == 'Bearish' else 0 for t in [trend_h1, trend_h4, trend_d, trend_w]])
-            results_internal.append({
-                'Paire': f"{pair_symbol[:3]}/{pair_symbol[3:]}", 
-                'H1': trend_h1, 'H4': trend_h4, 'D': trend_d, 'W': trend_w, 
-                '_score_internal': score
-            })
+            results_internal.append({'Paire': f"{pair_symbol[:3]}/{pair_symbol[3:]}", 'H1': trend_h1, 'H4': trend_h4, 'D': trend_d, 'W': trend_w, '_score_internal': score})
         except Exception as e:
             st.error(f"Erreur inattendue lors de l'analyse de {oanda_instrument}: {e}")
             continue
         finally:
             progress_bar.progress((i + 1) / total_pairs, text=f"Analyse de {i+1} / {total_pairs} paires...")
-            time.sleep(0.2) # Petite pause pour respecter les limites de l'API OANDA
-
+            time.sleep(0.2)
     progress_bar.empty()
     if not results_internal: return pd.DataFrame()
-    
     df_temp = pd.DataFrame(results_internal)
     df_temp.sort_values(by='_score_internal', ascending=False, inplace=True)
     return df_temp[['Paire', 'H1', 'H4', 'D', 'W']]
@@ -165,7 +163,7 @@ def main():
     st.set_page_config(layout="wide")
     st.title("Classement des Paires Forex par Tendance MTF (via OANDA)")
 
-    # Vérification des clés API OANDA
+    # Vérification des clés API OANDA (inchangé)
     try:
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
@@ -174,19 +172,19 @@ def main():
         st.info("Veuillez configurer les secrets requis dans les paramètres de votre application Streamlit.")
         st.stop()
 
-    # Initialisation de l'état de session
+    # Initialisation de l'état de session (inchangé)
     if 'df_results' not in st.session_state:
         st.session_state.df_results = pd.DataFrame()
     if 'analysis_done_once' not in st.session_state:
         st.session_state.analysis_done_once = False
 
-    # Logique du bouton
+    # Logique du bouton (inchangé)
     if st.button("🚀 Analyser les Paires Forex"):
         with st.spinner("Analyse des paires via OANDA en cours..."):
             st.session_state.df_results = analyze_forex_pairs(account_id, access_token)
             st.session_state.analysis_done_once = True
 
-    # Logique d'affichage (inchangée)
+    # Logique d'affichage (MODIFIÉE POUR INCLURE LE BOUTON DE TÉLÉCHARGEMENT)
     if st.session_state.analysis_done_once:
         if not st.session_state.df_results.empty:
             st.subheader("Classement des paires Forex")
@@ -203,6 +201,21 @@ def main():
             height_dynamic = (len(df_to_display) + 1) * 35 + 3
             st.dataframe(styled_df, use_container_width=True, hide_index=True, height=height_dynamic)
 
+            ### AJOUT : SECTION DE TÉLÉCHARGEMENT D'IMAGE ###
+            st.divider()
+            
+            # Générer l'image en mémoire avec la nouvelle fonction simple
+            image_bytes = create_simple_image_report(st.session_state.df_results)
+            
+            st.download_button(
+                label="🖼️ Télécharger le classement (Image)",
+                data=image_bytes,
+                file_name=f"classement_forex_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
+                mime='image/png',
+                use_container_width=True
+            )
+            ### FIN DE L'AJOUT ###
+
             st.subheader("Résumé des Indicateurs")
             st.markdown("- **H1, H4**: Tendance basée sur HMA(12) vs EMA(20).\n- **D, W**: Tendance basée sur EMA(20) vs EMA(50).")
         else:
@@ -216,3 +229,4 @@ def main():
 # --- Point d'entrée de l'application ---
 if __name__ == "__main__":
     main()
+
