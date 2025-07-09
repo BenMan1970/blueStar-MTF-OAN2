@@ -9,10 +9,10 @@ from io import BytesIO
 
 # Import pour l'image
 from PIL import Image, ImageDraw, ImageFont
-# Import pour le PDF (fonctionnera sans fichier externe)
+# Import pour le PDF
 from fpdf import FPDF
 
-# --- Constantes (inchangées) ---
+# --- Constantes ---
 OANDA_API_URL = "https://api-fxpractice.oanda.com"
 FOREX_PAIRS_EXTENDED = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD',
@@ -23,12 +23,11 @@ FOREX_PAIRS_EXTENDED = [
     'CHFJPY',
     'NZDJPY', 'NZDCAD', 'NZDCHF'
 ]
-# Dictionnaire des couleurs pour le PDF et l'affichage
 TREND_COLORS_HEX = {'Bullish': '#2E7D32', 'Bearish': '#C62828', 'Neutral': '#FFD700'}
 TREND_COLORS_RGB = {'Bullish': (46, 125, 50), 'Bearish': (198, 40, 40), 'Neutral': (255, 215, 0)}
 
 
-# --- Fonctions de l'application d'origine (inchangées) ---
+# --- Fonctions de l'application d'origine ---
 def hma(series, length):
     length = int(length)
     if len(series) < (length + int(math.sqrt(length)) - 1): return pd.Series([np.nan] * len(series), index=series.index, name='HMA')
@@ -105,10 +104,9 @@ def analyze_forex_pairs(account_id, access_token):
     df_temp = pd.DataFrame(results_internal).sort_values(by='_score_internal', ascending=False)
     return df_temp[['Paire', 'H1', 'H4', 'D', 'W']]
 
-# --- NOUVELLES FONCTIONS SIMPLES POUR LE TÉLÉCHARGEMENT ---
+# --- Fonctions simples pour le téléchargement ---
 
 def create_image_report(df_report):
-    """Crée une image simple à partir du texte du DataFrame."""
     report_title = "Classement des Paires Forex par Tendance MTF"
     report_text = report_title + "\n" + ("-" * len(report_title)) + "\n"
     report_text += df_report.to_string(index=False) if not df_report.empty else "Aucune donnée."
@@ -130,10 +128,9 @@ def create_image_report(df_report):
     return output_buffer.getvalue()
 
 def create_pdf_report_simple(df_report):
-    """Crée un rapport PDF en utilisant uniquement des polices intégrées."""
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font('Arial', 'B', 16) # Utilise la police Arial intégrée
+    pdf.set_font('Arial', 'B', 16)
     pdf.cell(0, 10, 'Classement des Paires Forex par Tendance MTF', 0, 1, 'C')
     pdf.ln(10)
     pdf.set_font('Arial', 'B', 10)
@@ -156,9 +153,11 @@ def create_pdf_report_simple(df_report):
                 fill = False
             pdf.cell(col_width, 8, value, 1, 0, 'C', fill)
         pdf.ln()
-    return pdf.output(dest='S').encode('latin-1')
+    
+    # LA CORRECTION EST ICI : on retire .encode('latin-1')
+    return pdf.output()
 
-# --- Fonction principale de l'application (légèrement modifiée) ---
+# --- Fonction principale de l'application ---
 def main():
     st.set_page_config(layout="wide")
     st.title("Classement des Paires Forex par Tendance MTF (via OANDA)")
@@ -189,7 +188,6 @@ def main():
             styled_df = df_to_display.style.map(style_trends, subset=['H1', 'H4', 'D', 'W'])
             st.dataframe(styled_df, use_container_width=True, hide_index=True, height=(len(df_to_display) + 1) * 35 + 3)
 
-            # --- SECTION DE TÉLÉCHARGEMENT SIMPLE ---
             st.divider()
             st.subheader("Télécharger le rapport")
             col1, col2 = st.columns(2)
@@ -211,7 +209,6 @@ def main():
                     mime='image/png',
                     use_container_width=True
                 )
-            # --- FIN DE LA SECTION DE TÉLÉCHARGEMENT ---
 
             st.subheader("Résumé des Indicateurs")
             st.markdown("- **H1, H4**: Tendance basée sur HMA(12) vs EMA(20).\n- **D, W**: Tendance basée sur EMA(20) vs EMA(50).")
