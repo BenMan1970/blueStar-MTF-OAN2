@@ -2,20 +2,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 import time
 from io import BytesIO
 
-### AJOUT : L'UNIQUE IMPORT NÉCESSAIRE POUR L'IMAGE ###
+### AJOUT : IMPORTS POUR L'IMAGE ET LE PDF ###
 from PIL import Image, ImageDraw, ImageFont
+from fpdf import FPDF # <-- NOUVEL IMPORT POUR LE PDF
 
-# --- Fonctions et Constantes ---
-
-# URL de l'API OANDA (utilisez la bonne pour votre compte : practice ou live)
-OANDA_API_URL = "https://api-fxpractice.oanda.com" # Ou "https://api-fxtrade.oanda.com" pour un compte réel
-
-# Constante de la liste des paires
+# --- Constantes ---
+OANDA_API_URL = "https://api-fxpractice.oanda.com"
 FOREX_PAIRS_EXTENDED = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD',
     'EURGBP', 'EURJPY', 'EURAUD', 'EURCAD', 'EURCHF', 'EURNZD',
@@ -25,8 +22,11 @@ FOREX_PAIRS_EXTENDED = [
     'CHFJPY',
     'NZDJPY', 'NZDCAD', 'NZDCHF'
 ]
+# Dictionnaire des couleurs pour la cohérence
+TREND_COLORS = {'Bullish': '#2E7D32', 'Bearish': '#C62828', 'Neutral': '#FFD700'}
 
-# Fonction HMA (inchangée)
+
+# --- Fonctions de base (inchangées) ---
 def hma(series, length):
     length = int(length)
     if len(series) < (length + int(math.sqrt(length)) - 1): return pd.Series([np.nan] * len(series), index=series.index, name='HMA')
@@ -39,7 +39,6 @@ def hma(series, length):
     hma_series = raw_hma.rolling(window=sqrt_length_period).mean()
     return hma_series
 
-# Fonction de tendance (inchangée)
 def get_trend(fast, slow):
     if fast is None or slow is None or fast.empty or slow.empty: return 'Neutral'
     fast_last_scalar = fast.dropna().iloc[-1] if not fast.dropna().empty else np.nan
@@ -49,13 +48,10 @@ def get_trend(fast, slow):
     elif fast_last_scalar < slow_last_scalar: return 'Bearish'
     else: return 'Neutral'
 
-# --- NOUVELLE FONCTION DE RÉCUPÉRATION DES DONNÉES OANDA ---
 def get_oanda_data(instrument, granularity, count, account_id, access_token):
-    # (code inchangé)
     url = f"{OANDA_API_URL}/v3/accounts/{account_id}/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {'granularity': granularity, 'count': count, 'price': 'M'}
-
     try:
         response = requests.get(url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
@@ -64,10 +60,7 @@ def get_oanda_data(instrument, granularity, count, account_id, access_token):
         if not candles_data:
             st.toast(f"OANDA: Aucune donnée de chandelier reçue pour {instrument}", icon="⚠️")
             return pd.DataFrame()
-        records = []
-        for candle in candles_data:
-            if candle.get('complete', False):
-                records.append({'date': candle['time'], 'Open': float(candle['mid']['o']), 'High': float(candle['mid']['h']), 'Low': float(candle['mid']['l']), 'Close': float(candle['mid']['c'])})
+        records = [{'date': c['time'], 'Open': float(c['mid']['o']), 'High': float(c['mid']['h']), 'Low': float(c['mid']['l']), 'Close': float(c['mid']['c'])} for c in candles_data if c.get('complete', False)]
         if not records: return pd.DataFrame()
         df = pd.DataFrame(records)
         df['date'] = pd.to_datetime(df['date'])
@@ -80,44 +73,90 @@ def get_oanda_data(instrument, granularity, count, account_id, access_token):
         st.toast(f"Erreur de traitement des données OANDA pour {instrument}: {e}", icon="🔥")
         return pd.DataFrame()
 
-### AJOUT : LA FONCTION FIABLE DE CRÉATION D'IMAGE ###
+
+# --- Fonctions de génération de rapports (Image et PDF) ---
+
 def create_simple_image_report(df_report):
-    """Crée une image simple à partir du texte du DataFrame des résultats."""
-    
-    # Préparer le texte du rapport
     report_title = "Classement des Paires Forex par Tendance MTF"
     report_text = report_title + "\n" + ("-" * len(report_title)) + "\n"
     report_text += df_report.to_string(index=False) if not df_report.empty else "Aucune donnée."
-
-    # Utiliser une police de base qui est toujours disponible
     try:
-        # Une police à espacement fixe (mono) est idéale pour les tableaux
         font = ImageFont.truetype("DejaVuSansMono.ttf", 14) 
     except IOError:
-        font = ImageFont.load_default() # Plan B, toujours fonctionnel
-
-    # Mesurer la taille du texte pour créer une image aux bonnes dimensions
+        font = ImageFont.load_default()
     temp_img = Image.new('RGB', (1, 1))
     temp_draw = ImageDraw.Draw(temp_img)
     text_bbox = temp_draw.multiline_textbbox((0, 0), report_text, font=font)
-    
     padding = 20
     width = text_bbox[2] + 2 * padding
     height = text_bbox[3] + 2 * padding
-    
-    # Créer l'image finale et y dessiner le texte
     img = Image.new('RGB', (width, height), color='white')
     draw = ImageDraw.Draw(img)
     draw.multiline_text((padding, padding), report_text, font=font, fill='black')
-    
-    # Sauvegarder l'image en mémoire pour le téléchargement
     output_buffer = BytesIO()
     img.save(output_buffer, format="PNG")
     return output_buffer.getvalue()
 
+### --- NOUVELLE FONCTION DE CRÉATION DE PDF --- ###
+def create_pdf_report(df_report):
+    """Crée un rapport PDF à partir du DataFrame des résultats."""
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # IMPORTANT : Ajouter une police supportant l'UTF-8 comme DejaVu
+    # L'utilisateur doit placer 'DejaVuSans.ttf' dans le même dossier.
+    try:
+        pdf.add_font('DejaVu', '', 'DejaVuSans.ttf', uni=True)
+        pdf.set_font('DejaVu', '', 14)
+    except RuntimeError:
+        # Plan B si la police n'est pas trouvée
+        pdf.set_font('Arial', '', 14)
+        st.toast("Police DejaVu non trouvée. Le PDF est généré avec Arial.", icon="⚠️")
+
+    # Titre
+    pdf.cell(0, 10, 'Classement des Paires Forex par Tendance MTF', 0, 1, 'C')
+    pdf.ln(5)
+
+    # Entêtes du tableau
+    pdf.set_font_size(10)
+    pdf.set_fill_color(220, 220, 220) # Gris clair pour l'entête
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_line_width(0.3)
+    
+    col_width = pdf.w / (len(df_report.columns) + 1)  # Largeur de colonne approximative
+    
+    for col_name in df_report.columns:
+        pdf.cell(col_width, 8, col_name, 1, 0, 'C', 1)
+    pdf.ln()
+
+    # Contenu du tableau
+    pdf.set_font_size(9)
+    for index, row in df_report.iterrows():
+        for col_name in df_report.columns:
+            value = str(row[col_name])
+            
+            # Appliquer les couleurs
+            if value in TREND_COLORS:
+                hex_color = TREND_COLORS[value].lstrip('#')
+                rgb_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                pdf.set_fill_color(rgb_color[0], rgb_color[1], rgb_color[2])
+                pdf.set_text_color(255, 255, 255) # Texte blanc pour les fonds colorés
+                fill = True
+            else:
+                pdf.set_fill_color(255, 255, 255) # Fond blanc
+                pdf.set_text_color(0, 0, 0) # Texte noir
+                fill = False
+
+            pdf.cell(col_width, 8, value, 1, 0, 'C', fill)
+        pdf.ln()
+
+    # Retourner les données binaires du PDF
+    return pdf.output(dest='S').encode('latin-1')
+
+
 # --- Fonction d'analyse principale (inchangée) ---
 def analyze_forex_pairs(account_id, access_token):
-    # (code inchangé)
     results_internal = []
     timeframe_params_oanda = {'H1': {'granularity': 'H1', 'count': 200},'H4': {'granularity': 'H4', 'count': 200},'D':  {'granularity': 'D',  'count': 250},'W':  {'granularity': 'D',  'count': 750}}
     total_pairs = len(FOREX_PAIRS_EXTENDED)
@@ -163,37 +202,30 @@ def main():
     st.set_page_config(layout="wide")
     st.title("Classement des Paires Forex par Tendance MTF (via OANDA)")
 
-    # Vérification des clés API OANDA (inchangé)
     try:
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
     except (KeyError, FileNotFoundError):
-        st.error("Erreur Critique: Les secrets `OANDA_ACCOUNT_ID` et `OANDA_ACCESS_TOKEN` ne sont pas configurés. L'application ne peut pas fonctionner.")
-        st.info("Veuillez configurer les secrets requis dans les paramètres de votre application Streamlit.")
+        st.error("Erreur Critique: Les secrets `OANDA_ACCOUNT_ID` et `OANDA_ACCESS_TOKEN` ne sont pas configurés.")
         st.stop()
 
-    # Initialisation de l'état de session (inchangé)
     if 'df_results' not in st.session_state:
         st.session_state.df_results = pd.DataFrame()
     if 'analysis_done_once' not in st.session_state:
         st.session_state.analysis_done_once = False
 
-    # Logique du bouton (inchangé)
     if st.button("🚀 Analyser les Paires Forex"):
         with st.spinner("Analyse des paires via OANDA en cours..."):
             st.session_state.df_results = analyze_forex_pairs(account_id, access_token)
             st.session_state.analysis_done_once = True
 
-    # Logique d'affichage (MODIFIÉE POUR INCLURE LE BOUTON DE TÉLÉCHARGEMENT)
     if st.session_state.analysis_done_once:
         if not st.session_state.df_results.empty:
             st.subheader("Classement des paires Forex")
             df_to_display = st.session_state.df_results.copy()
-            df_to_display['Paire'] = df_to_display['Paire'].fillna('Erreur de Paire')
-
+            
             def style_trends(val):
-                colors = {'Bullish': '#2E7D32', 'Bearish': '#C62828', 'Neutral': '#FFD700'}
-                color = colors.get(val, '')
+                color = TREND_COLORS.get(val, '')
                 text_color = 'white' if val in ['Bullish', 'Bearish'] else 'black'
                 return f'background-color: {color}; color: {text_color};'
             
@@ -201,32 +233,44 @@ def main():
             height_dynamic = (len(df_to_display) + 1) * 35 + 3
             st.dataframe(styled_df, use_container_width=True, hide_index=True, height=height_dynamic)
 
-            ### AJOUT : SECTION DE TÉLÉCHARGEMENT D'IMAGE ###
+            ### --- SECTION DE TÉLÉCHARGEMENT MODIFIÉE --- ###
             st.divider()
+            st.subheader("Options de téléchargement")
             
-            # Générer l'image en mémoire avec la nouvelle fonction simple
-            image_bytes = create_simple_image_report(st.session_state.df_results)
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Générer l'image en mémoire
+                image_bytes = create_simple_image_report(st.session_state.df_results)
+                st.download_button(
+                    label="🖼️ Télécharger en PNG",
+                    data=image_bytes,
+                    file_name=f"classement_forex_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
+                    mime='image/png',
+                    use_container_width=True
+                )
             
-            st.download_button(
-                label="🖼️ Télécharger le classement (Image)",
-                data=image_bytes,
-                file_name=f"classement_forex_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
-                mime='image/png',
-                use_container_width=True
-            )
-            ### FIN DE L'AJOUT ###
+            with col2:
+                # Générer le PDF en mémoire
+                pdf_bytes = create_pdf_report(st.session_state.df_results)
+                st.download_button(
+                    label="📄 Télécharger en PDF",
+                    data=pdf_bytes,
+                    file_name=f"classement_forex_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    mime='application/pdf',
+                    use_container_width=True
+                )
+            ### --- FIN DE LA SECTION MODIFIÉE --- ###
 
             st.subheader("Résumé des Indicateurs")
             st.markdown("- **H1, H4**: Tendance basée sur HMA(12) vs EMA(20).\n- **D, W**: Tendance basée sur EMA(20) vs EMA(50).")
         else:
-            st.warning("L'analyse n'a produit aucun résultat. Cela peut être dû à un problème de connexion avec l'API OANDA ou des données manquantes pour toutes les paires. Vérifiez les notifications (toasts) pour plus de détails.")
+            st.warning("L'analyse n'a produit aucun résultat.")
     else:
         st.info("Cliquez sur 'Analyser' pour charger les données et voir le classement.")
 
     st.markdown("---")
     st.caption("Données via OANDA v20 REST API.")
 
-# --- Point d'entrée de l'application ---
 if __name__ == "__main__":
     main()
-
