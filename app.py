@@ -5,7 +5,7 @@ import math
 from datetime import datetime
 import requests
 import time
-from io import BytesIO
+from io import BytesIO  # <-- NOUVEL IMPORT NÉCESSAIRE
 
 # Import pour l'image et le PDF
 from PIL import Image, ImageDraw, ImageFont
@@ -153,9 +153,13 @@ def create_pdf_report_simple(df_report):
             pdf.cell(col_width, 8, value, 1, 0, 'C', fill)
         pdf.ln()
     
-    # CORRECTION DÉFINITIVE: Retourner le PDF sous forme de BYTES en utilisant .encode('latin-1')
-    # C'est la méthode qui a fonctionné sur vos autres applications.
-    return pdf.output(dest='S').encode('latin-1')
+    # LA CORRECTION ULTIME ET STANDARD :
+    # 1. Créer un buffer (fichier virtuel en mémoire)
+    buffer = BytesIO()
+    # 2. Ecrire le PDF dans ce buffer
+    pdf.output(buffer)
+    # 3. Récupérer les données binaires (bytes) du buffer
+    return buffer.getvalue()
 
 # --- Fonction principale de l'application ---
 def main():
