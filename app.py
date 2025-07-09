@@ -153,9 +153,9 @@ def create_pdf_report_simple(df_report):
             pdf.cell(col_width, 8, value, 1, 0, 'C', fill)
         pdf.ln()
     
-    # LA CORRECTION FINALE : pdf.output(dest='S')
-    # Ceci retourne les données du PDF sous forme de bytes, ce que Streamlit attend.
-    return pdf.output(dest='S')
+    # CORRECTION DÉFINITIVE: Retourner le PDF sous forme de BYTES en utilisant .encode('latin-1')
+    # C'est la méthode qui a fonctionné sur vos autres applications.
+    return pdf.output(dest='S').encode('latin-1')
 
 # --- Fonction principale de l'application ---
 def main():
