@@ -7,9 +7,8 @@ import requests
 import time
 from io import BytesIO
 
-# Import pour l'image
+# Import pour l'image et le PDF
 from PIL import Image, ImageDraw, ImageFont
-# Import pour le PDF
 from fpdf import FPDF
 
 # --- Constantes ---
@@ -154,8 +153,9 @@ def create_pdf_report_simple(df_report):
             pdf.cell(col_width, 8, value, 1, 0, 'C', fill)
         pdf.ln()
     
-    # LA CORRECTION EST ICI : on retire .encode('latin-1')
-    return pdf.output()
+    # LA CORRECTION FINALE : pdf.output(dest='S')
+    # Ceci retourne les données du PDF sous forme de bytes, ce que Streamlit attend.
+    return pdf.output(dest='S')
 
 # --- Fonction principale de l'application ---
 def main():
