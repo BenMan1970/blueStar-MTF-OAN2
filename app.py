@@ -22,8 +22,8 @@ FOREX_PAIRS_EXTENDED = [
     'CHFJPY',
     'NZDJPY', 'NZDCAD', 'NZDCHF'
 ]
-TREND_COLORS_HEX = {'Bullish': '#008f7a', 'Bearish': '#cc0a00', 'Neutral': '#808080'}
-TREND_COLORS_RGB = {'Bullish': (0, 143, 122), 'Bearish': (204, 10, 0), 'Neutral': (128, 128, 128)}
+TREND_COLORS_HEX = {'Bullish': '#008f7a', 'Bearish': '#d9534f', 'Neutral': '#808080'}
+TREND_COLORS_RGB = {'Bullish': (0, 143, 122), 'Bearish': (217, 83, 79), 'Neutral': (128, 128, 128)}
 
 # --- Paramètres Bluestar ---
 LENGTH = 70
@@ -257,6 +257,11 @@ def get_oanda_data(instrument, granularity, count, account_id, access_token):
         st.toast(f"Erreur de traitement des données OANDA pour {instrument}: {e}", icon="🔥")
         return pd.DataFrame()
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_cached_oanda_data(instrument, granularity, count, account_id, access_token):
+    """Version cachée de get_oanda_data pour éviter les appels API répétés"""
+    return get_oanda_data(instrument, granularity, count, account_id, access_token)
+
 def analyze_forex_pairs(account_id, access_token):
     results_internal = []
     
@@ -282,7 +287,7 @@ def analyze_forex_pairs(account_id, access_token):
             
             # Récupération des données pour chaque timeframe
             for tf_key, params in timeframe_params_oanda.items():
-                df = get_oanda_data(
+                df = get_cached_oanda_data(
                     oanda_instrument,
                     params['granularity'],
                     params['count'],
@@ -454,34 +459,71 @@ def main():
 
     if st.session_state.analysis_done_once:
         if not st.session_state.df_results.empty:
-            st.subheader("📊 Classement des paires Forex")
+            # Filtres interactifs
+            st.subheader("🎯 Filtres")
+            col_filter1, col_filter2 = st.columns(2)
+            
+            with col_filter1:
+                min_alignment = st.slider(
+                    "Alignement MTF minimum (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=50,
+                    step=5,
+                    help="Afficher uniquement les paires avec un alignement supérieur à ce seuil"
+                )
+            
+            with col_filter2:
+                trend_filter = st.selectbox(
+                    "Filtrer par tendance dominante",
+                    options=["Tous", "Bullish uniquement", "Bearish uniquement"],
+                    help="Afficher uniquement les paires avec une tendance spécifique"
+                )
+            
+            # Application des filtres
             df_to_display = st.session_state.df_results.copy()
+            df_to_display['_alignment_num'] = df_to_display['MTF'].str.extract(r'(\d+)%')[0].astype(float)
+            df_to_display = df_to_display[df_to_display['_alignment_num'] >= min_alignment]
             
-            def style_trends(val):
-                if val in TREND_COLORS_HEX:
-                    return f'background-color: {TREND_COLORS_HEX[val]}; color: white; font-weight: bold;'
-                return ''
+            if trend_filter == "Bullish uniquement":
+                df_to_display = df_to_display[df_to_display['MTF'].str.contains('Bullish')]
+            elif trend_filter == "Bearish uniquement":
+                df_to_display = df_to_display[df_to_display['MTF'].str.contains('Bearish')]
             
-            styled_df = df_to_display.style.map(
-                style_trends,
-                subset=['15m', '1H', '4H', 'D', 'W', 'M']
-            )
-            st.dataframe(
-                styled_df,
-                use_container_width=True,
-                hide_index=True,
-                height=(len(df_to_display) + 1) * 35 + 3
-            )
+            df_to_display = df_to_display.drop(columns=['_alignment_num'])
+            
+            st.subheader("📊 Classement des paires Forex")
+            
+            if df_to_display.empty:
+                st.warning("Aucune paire ne correspond aux filtres sélectionnés.")
+            else:
+                st.info(f"**{len(df_to_display)}** paires affichées sur {len(st.session_state.df_results)}")
+                
+                def style_trends(val):
+                    if val in TREND_COLORS_HEX:
+                        return f'background-color: {TREND_COLORS_HEX[val]}; color: white; font-weight: bold;'
+                    return ''
+                
+                styled_df = df_to_display.style.map(
+                    style_trends,
+                    subset=['15m', '1H', '4H', 'D', 'W', 'M']
+                )
+                st.dataframe(
+                    styled_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min((len(df_to_display) + 1) * 35 + 3, 600)
+                )
 
             st.divider()
             st.subheader("📥 Télécharger le rapport")
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             now_str = datetime.now().strftime('%Y%m%d_%H%M')
 
             with col1:
                 st.download_button(
                     label="📄 Télécharger en PDF",
-                    data=create_pdf_report_simple(st.session_state.df_results),
+                    data=create_pdf_report_simple(df_to_display),
                     file_name=f"classement_forex_bluestar_{now_str}.pdf",
                     mime='application/pdf',
                     use_container_width=True
@@ -489,28 +531,43 @@ def main():
             with col2:
                 st.download_button(
                     label="🖼️ Télécharger en Image (PNG)",
-                    data=create_image_report(st.session_state.df_results),
+                    data=create_image_report(df_to_display),
                     file_name=f"classement_forex_bluestar_{now_str}.png",
                     mime='image/png',
                     use_container_width=True
                 )
+            with col3:
+                csv_data = df_to_display.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📊 Télécharger en CSV",
+                    data=csv_data,
+                    file_name=f"classement_forex_bluestar_{now_str}.csv",
+                    mime='text/csv',
+                    use_container_width=True
+                )
 
             st.subheader("ℹ️ À propos de la méthode Bluestar MTF Pro+")
-            st.markdown("""
-            **Logique de calcul professionnelle :**
-            - **ZLEMA (Zero-Lag EMA)** : Indicateur principal avec lag réduit
-            - **Bandes de volatilité adaptatives** : Basées sur l'ATR avec ratio dynamique
-            - **Système de scoring multicritères** :
-              - Position par rapport au ZLEMA (2 points)
-              - Structure de marché (1 point)
-              - Momentum RSI/MACD (1 point)
-              - Confirmation par volume et chandeliers (1 point)
-              - Cassure de bandes (2 points)
-            - **Confirmation sur 3 barres** : Filtre les faux signaux
-            - **Score d'alignement MTF pondéré** : 15m(1) → 1H(1.5) → 4H(2) → D(2.5) → W(3) → M(3)
-            
-            **Timeframes analysés :** 15m, 1H, 4H, Daily, Weekly, Monthly
-            """)
+            with st.expander("📖 Voir les détails de la logique de calcul"):
+                st.markdown("""
+                **Logique de calcul professionnelle :**
+                - **ZLEMA (Zero-Lag EMA)** : Indicateur principal avec lag réduit
+                - **Bandes de volatilité adaptatives** : Basées sur l'ATR avec ratio dynamique
+                - **Système de scoring multicritères** :
+                  - Position par rapport au ZLEMA (2 points)
+                  - Structure de marché (1 point)
+                  - Momentum RSI/MACD (1 point)
+                  - Confirmation par volume et chandeliers (1 point)
+                  - Cassure de bandes (2 points)
+                - **Confirmation sur 3 barres** : Filtre les faux signaux
+                - **Score d'alignement MTF pondéré** : 15m(1) → 1H(1.5) → 4H(2) → D(2.5) → W(3) → M(3)
+                
+                **Timeframes analysés :** 15m, 1H, 4H, Daily, Weekly, Monthly
+                
+                **Légende des couleurs :**
+                - 🟢 **Bullish** (vert) : Tendance haussière confirmée
+                - 🔴 **Bearish** (rouge adouci) : Tendance baissière confirmée
+                - ⚪ **Neutral** (gris) : Pas de tendance claire
+                """)
         else:
             st.warning("L'analyse n'a produit aucun résultat.")
     else:
