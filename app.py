@@ -709,7 +709,7 @@ def main():
             if quality_filter:
                 df_to_display = df_to_display[df_to_display['Quality'].isin(quality_filter)]
             
-            df_to_display = df_to_display.drop(columns=['_alignment_num'])
+            # Ne pas supprimer _alignment_num encore, on en a besoin pour le tri
             
             st.divider()
             st.subheader("📈 Résultats de l'analyse")
@@ -720,7 +720,7 @@ def main():
                 st.success(f"✅ **{len(df_to_display)}** paires affichées sur {len(df_full)}")
                 
                 if len(df_to_display) > 0:
-                    df_sorted = df_to_display.sort_values(by=['Consistency', '_alignment'], ascending=False)
+                    df_sorted = df_to_display.sort_values(by=['Consistency', '_alignment_num'], ascending=False)
                     
                     top_bullish = df_sorted[df_sorted['MTF'].str.contains('Bullish')].head(3)
                     top_bearish = df_sorted[df_sorted['MTF'].str.contains('Bearish')].head(3)
@@ -749,6 +749,7 @@ def main():
                                     if row['Consistency'] < 70:
                                         st.caption(f"  ⚠️ {row['Alerts'][0]}")
                 
+                # Supprimer les colonnes internes avant affichage
                 df_display_clean = df_to_display[['Paire', '15m', '1H', '4H', 'D', 'W', 'M', 'MTF', 'Quality', 'Consistency', 'Signal_Quality']].copy()
                 
                 st.markdown("---")
@@ -814,7 +815,8 @@ def main():
             st.divider()
             st.subheader("📥 Télécharger le rapport")
             
-            df_export = df_to_display[['Paire', '15m', '1H', '4H', 'D', 'W', 'M', 'MTF', 'Quality', 'Consistency']].copy() if not df_to_display.empty else df_full[['Paire', '15m', '1H', '4H', 'D', 'W', 'M', 'MTF', 'Quality']].copy()
+            # Préparer un dataframe propre pour l'export (sans colonnes internes)
+            df_export_clean = df_to_display[['Paire', '15m', '1H', '4H', 'D', 'W', 'M', 'MTF', 'Quality', 'Consistency']].copy() if not df_to_display.empty else df_full[['Paire', '15m', '1H', '4H', 'D', 'W', 'M', 'MTF', 'Quality']].copy()
             
             col1, col2, col3 = st.columns(3)
             now_str = datetime.now().strftime('%Y%m%d_%H%M')
@@ -822,7 +824,7 @@ def main():
             with col1:
                 st.download_button(
                     label="📄 Télécharger en PDF",
-                    data=create_pdf_report_simple(df_export),
+                    data=create_pdf_report_simple(df_export_clean),
                     file_name=f"classement_forex_bluestar_{now_str}.pdf",
                     mime='application/pdf',
                     use_container_width=True
@@ -830,13 +832,13 @@ def main():
             with col2:
                 st.download_button(
                     label="🖼️ Télécharger en Image (PNG)",
-                    data=create_image_report(df_export),
+                    data=create_image_report(df_export_clean),
                     file_name=f"classement_forex_bluestar_{now_str}.png",
                     mime='image/png',
                     use_container_width=True
                 )
             with col3:
-                csv_data = df_export.to_csv(index=False).encode('utf-8')
+                csv_data = df_export_clean.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📊 Télécharger en CSV",
                     data=csv_data,
