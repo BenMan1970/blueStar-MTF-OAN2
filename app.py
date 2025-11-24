@@ -1,4 +1,4 @@
-# app.py
+# app.py - Bluestar MTF Pro+ Optimisé - Version FINALE (24/11/2025)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,11 +16,11 @@ st.set_page_config(
     page_title="Bluestar MTF Pro+",
     page_icon="",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # ==================== CONSTANTES ====================
-OANDA_API_URL = "https://api-fxpractice.oanda.com"   # ou "https://api-fxtrade.oanda.com" pour compte réel
+OANDA_API_URL = "https://api-fxpractice.oanda.com"  # ou api-fxtrade.oanda.com pour compte réel
 
 FOREX_PAIRS_EXTENDED = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD',
@@ -36,13 +36,20 @@ TREND_COLORS_HEX = {
     'Neutral': '#808080', 'Range': '#f0ad4e'
 }
 
-# ==================== INDICATEURS TECHNIQUES ====================
+# Paramètres Bluestar originaux (ceux qui marchent vraiment)
+LENGTH = 70
+MULT = 1.2
+ADX_THRESHOLD = 25
+VOLATILITY_PERIOD = 14
+MTF_WEIGHTS = {'15m': 0.5, '1H': 1.0, '4H': 2.0, 'D': 3.0, 'W': 4.5, 'M': 6.0}
+TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())
+CONFIRMATION_BARS = {'15m': 2, '1H': 2, '4H': 3, 'D': 3, 'W': 2, 'M': 1}
+
+# ==================== INDICATEURS ====================
 def zlema(series, length):
-    if len(series) < length:
-        return pd.Series([np.nan] * len(series), index=series.index)
     lag = int((length - 1) / 2)
-    src_adjusted = series + (series - series.shift(lag))
-    return src_adjusted.ewm(span=length, adjust=False).mean()
+    src_adj = series + (series - series.shift(lag))
+    return src_adj.ewm(span=length, adjust=False).mean()
 
 def atr(high, low, close, period):
     tr1 = high - low
@@ -62,41 +69,33 @@ def adx(high, low, close, period=14):
     minus_dm = np.where((down > up) & (down > 0), down, 0)
     plus_dm = pd.Series(plus_dm, index=close.index)
     minus_dm = pd.Series(minus_dm, index=close.index)
-    atr_smooth = tr.ewm(span=period, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr_smooth)
-    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr_smooth)
+    atr_s = tr.ewm(span=period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr_s)
+    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr_s)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
     return dx.ewm(span=period, adjust=False).mean(), plus_di, minus_di
 
+# ==================== FONCTION BLUSTAR CORRIGÉE ====================
 def calc_professional_trend(df, timeframe='D'):
     if df.empty or len(df) < 100:
         return 'Neutral', 0, 'D', 0
-
-    LENGTH = 70
-    MULT = 1.2
-    ADX_THRESHOLD = 25
-    VOLATILITY_PERIOD = 14
-    CONFIRMATION_BARS = {'15m': 2, '1H': 2, '4H': 3, 'D': 3, 'W': 2, 'M': 1}
-
-    adj_length = 12 if timeframe == 'M' else 26 if timeframe == 'W' else LENGTH
-    adj_vol = 6 if timeframe == 'M' else 10 if timeframe == 'W' else VOLATILITY_PERIOD
 
     close = df['Close']
     high = df['High']
     low = df['Low']
     open_p = df['Open']
 
-    zlema_s = zlema(close, adj_length)
-    atr_a = atr(high, low, close, adj_vol)
-    volatility = atr_a.rolling(adj_length * 3).max() * MULT * (atr_a / atr_a.rolling(adj_length).mean())
+    # ZLEMA + Bandes adaptatives
+    zlema_s = zlema(close, LENGTH)
+    atr_a = atr(high, low, close, VOLATILITY_PERIOD)
+    atr_ma = atr_a.rolling(LENGTH).mean()
+    vol_ratio = atr_a / atr_ma
+    volatility = atr_a.rolling(LENGTH*3).max() * MULT * vol_ratio
 
     upper = zlema_s + volatility
     lower = zlema_s - volatility
 
-    adx_val, plus_di, minus_di = adx(high, low, close)
-    is_ranging = adx_val < ADX_THRESHOLD
-
-    # Signaux simplifiés mais puissants
+    # Détection breakout
     raw_trend = pd.Series(0, index=close.index)
     for i in range(1, len(close)):
         if close.iloc[i] > upper.iloc[i] and close.iloc[i-1] <= upper.iloc[i-1]:
@@ -106,8 +105,9 @@ def calc_professional_trend(df, timeframe='D'):
         else:
             raw_trend.iloc[i] = raw_trend.iloc[i-1]
 
-    confirmed = raw_trend.copy()
+    # Confirmation
     confirm_bars = CONFIRMATION_BARS.get(timeframe, 3)
+    confirmed = pd.Series(0, index=close.index)
     count = 0
     current = 0
     for i in range(len(raw_trend)):
@@ -120,19 +120,25 @@ def calc_professional_trend(df, timeframe='D'):
             count = 0
         confirmed.iloc[i] = current
 
-    last_trend = int(confirmed.iloc[-1])
-    strength = min(100, abs((close.iloc[-1] - zlema_s.iloc[-1]) / zlema_s.iloc[-1] * 100) + adx_val.iloc[-1])
+    # ADX
+    adx_val, _, _ = adx(high, low, close)
+    last_adx = adx_val.iloc[-1]
 
-    if adx_val.iloc[-1] < ADX_THRESHOLD:
-        trend_label = 'Range'
+    last_confirmed = int(confirmed.iloc[-1])
+
+    if last_adx < ADX_THRESHOLD:
+        trend = 'Range'
     else:
-        trend_label = 'Bullish' if last_trend == 1 else 'Bearish' if last_trend == -1 else 'Neutral'
+        trend = 'Bullish' if last_confirmed == 1 else 'Bearish' if last_confirmed == -1 else 'Neutral'
 
-    quality = 'A+' if strength > 80 else 'A' if strength > 65 else 'B' if strength > 50 else 'C'
+    # Force
+    distance = abs(close.iloc[-1] - zlema_s.iloc[-1]) / zlema_s.iloc[-1] * 100
+    strength = min(100, distance * 2 + last_adx / 2)
+    quality = 'A+' if strength >= 80 else 'A' if strength >= 65 else 'B' if strength >= 45 else 'C'
 
-    return trend_label, round(strength, 1), quality, round(adx_val.iloc[-1], 1)
+    return trend, round(strength, 1), quality, round(last_adx, 1)
 
-# ==================== API OANDA ROBUSTE (ANTI-502) ====================
+# ==================== API OANDA ROBUSTE ====================
 def get_oanda_data(instrument, granularity, count, account_id, access_token, max_retries=6):
     url = f"{OANDA_API_URL}/v3/accounts/{account_id}/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -140,37 +146,34 @@ def get_oanda_data(instrument, granularity, count, account_id, access_token, max
 
     for attempt in range(max_retries):
         try:
-            r = requests.get(url, headers=headers, params=params, timeout=20)
+            r = requests.get(url, headers=headers, params=params, timeout=25)
             if r.status_code in (502, 503, 504):
                 wait = (2 ** attempt) + random.uniform(0, 1)
-                st.toast(f"502/503 sur {instrument} – retry {attempt+1}/{max_retries} dans {wait:.1f}s")
+                st.toast(f"502 sur {instrument} – retry dans {wait:.1f}s")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            candles = r.json().get('candles', [])
-            records = [c for c in candles if c.get('complete')]
-            if not records:
+            candles = [c for c in r.json().get('candles', []) if c.get('complete')]
+            if not candles:
                 return pd.DataFrame()
             df = pd.DataFrame([{
-                'date': c['time'],
-                'Open': float(c['mid']['o']),
-                'High': float(c['mid']['h']),
-                'Low': float(c['mid']['l']),
+                'date': c['time'], 'Open': float(c['mid']['o']),
+                'High': float(c['mid']['h']), 'Low': float(c['mid']['l']),
                 'Close': float(c['mid']['c'])
-            } for c in records])
+            } for c in candles])
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
             return df
         except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+            if attempt == max_retries - 1:
+                st.error(f"Échec {instrument}: {e}")
             else:
-                st.error(f"Échec définitif {instrument} {granularity}: {e}")
+                time.sleep(2 ** attempt)
     return pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_cached_oanda_data(_instrument, _granularity, _count, _account_id, _access_token):
-    return get_oanda_data(_instrument, _granularity, _count, _account_id, _access_token)
+def get_cached_oanda_data(instrument, granularity, count, account_id, access_token):
+    return get_oanda_data(instrument, granularity, count, account_id, access_token)
 
 # ==================== ANALYSE COMPLETE ====================
 def analyze_forex_pairs(account_id, access_token):
@@ -180,58 +183,57 @@ def analyze_forex_pairs(account_id, access_token):
         'D': ('D', 300), 'W': ('D', 900), 'M': ('D', 2500)
     }
     total = len(FOREX_PAIRS_EXTENDED)
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    progress = st.progress(0)
+    status = st.empty()
 
     for idx, pair in enumerate(FOREX_PAIRS_EXTENDED):
         instrument = f"{pair[:3]}_{pair[3:]}"
-        status_text.text(f"Analyse en cours : {pair} ({idx+1}/{total})")
+        status.text(f"Analyse {pair} ({idx+1}/{total})")
         data = {}
-        all_ok = True
+        ok = True
 
-        for tf, (gran, cnt) in tf_params.items():
-            df = get_cached_oanda_data(instrument, gran, cnt, account_id, access_token)
+        for tf, (g, c) in tf_params.items():
+            df = get_cached_oanda_data(instrument, g, c, account_id, access_token)
             if tf == 'W' and not df.empty:
                 df = df.resample('W-FRI').agg({'Open':'first','High':'max','Low':'min','Close':'last'}).dropna()
             if tf == 'M' and not df.empty:
                 df = df.resample('ME').agg({'Open':'first','High':'max','Low':'min','Close':'last'}).dropna()
             if df.empty:
-                all_ok = False
+                ok = False
                 break
             data[tf] = df
 
-        if not all_ok:
+        if not ok:
             continue
 
         trends = {}
         for tf in tf_params:
-            trend, strength, quality, adx_v = calc_professional_trend(data[tf], tf)
+            trend, _, quality, _ = calc_professional_trend(data[tf], tf)
             trends[tf] = trend
 
-        # Calcul tendance dominante
-        weights = {'15m':0.5, '1H':1.0, '4H':2.0, 'D':3.0, 'W':4.5, 'M':6.0}
-        score_bull = sum(weights[t] for t in trends if trends[t] == 'Bullish')
-        score_bear = sum(weights[t] for t in trends if trends[t] == 'Bearish')
-        total_w = sum(weights.values())
-        align = max(score_bull, score_bear) / total_w * 100
-        dominant = 'Range' if sum(1 for v in trends.values() if v == 'Range') >= 4 else ('Bullish' if score_bull > score_bear else 'Bearish')
+        # Calcul alignement MTF avec poids
+        bull_score = sum(MTF_WEIGHTS[tf] for tf in trends if trends[tf] == 'Bullish')
+        bear_score = sum(MTF_WEIGHTS[tf] for tf in trends if trends[tf] == 'Bearish')
+        alignment = max(bull_score, bear_score) / TOTAL_WEIGHT * 100
+        range_count = sum(1 for v in trends.values() if v == 'Range')
+        dominant = 'Range' if range_count >= 4 else ('Bullish' if bull_score > bear_score else 'Bearish')
 
         results.append({
             'Paire': f"{pair[:3]}/{pair[3:]}",
             '15m': trends['15m'], '1H': trends['1H'], '4H': trends['4H'],
             'D': trends['D'], 'W': trends['W'], 'M': trends['M'],
-            'MTF': f"{dominant} ({align:.0f}%)",
-            'Quality': 'A+'
+            'MTF': f"{dominant} ({alignment:.0f}%)",
+            'Quality': quality
         })
 
-        progress_bar.progress((idx + 1) / total)
-        time.sleep(0.9)  # Respect OANDA + évite 502
+        progress.progress((idx + 1) / total)
+        time.sleep(0.9)  # Respect OANDA
 
-    progress_bar.empty()
-    status_text.empty()
-    return pd.DataFrame(results) if results else pd.DataFrame()
+    progress.empty()
+    status.empty()
+    return pd.DataFrame(results).sort_values('MTF', key=lambda x: x.str.contains('Bullish'), ascending=False)
 
-# ==================== RAPPORTS PDF & PNG ====================
+# ==================== RAPPORTS ====================
 def create_pdf_report(df):
     pdf = FPDF()
     pdf.add_page()
@@ -249,11 +251,11 @@ def create_pdf_report(df):
         for val in row:
             val_str = str(val)
             fill = False
-            if val_str == "Bullish":
+            if "Bullish" in val_str:
                 pdf.set_fill_color(0, 143, 122); pdf.set_text_color(255,255,255); fill = True
-            elif val_str == "Bearish":
+            elif "Bearish" in val_str:
                 pdf.set_fill_color(217, 83, 79); pdf.set_text_color(255,255,255); fill = True
-            elif val_str == "Range":
+            elif "Range" in val_str:
                 pdf.set_fill_color(240, 173, 78); pdf.set_text_color(255,255,255); fill = True
             else:
                 pdf.set_fill_color(255,255,255); pdf.set_text_color(0,0,0)
@@ -265,12 +267,12 @@ def create_pdf_report(df):
     return buffer.getvalue()
 
 def create_png_report(df):
-    text = f"Bluestar MTF Pro+ - {datetime.now():%Y-%m-%d %H:%M}\n" + "="*70 + "\n"
+    text = f"Bluestar MTF Pro+ - {datetime.now():%d/%m/%Y %H:%M}\n" + "="*80 + "\n"
     text += df.to_string(index=False)
     font = ImageFont.load_default()
     lines = text.split('\n')
-    h = len(lines) * 18 + 40
-    img = Image.new('RGB', (1400, h), 'white')
+    h = len(lines) * 18 + 50
+    img = Image.new('RGB', (1500, h), 'white')
     draw = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         draw.text((20, 20 + i*18), line, fill='black', font=font)
@@ -291,24 +293,23 @@ def main():
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
     except:
-        st.error("Configurer OANDA_ACCOUNT_ID et OANDA_ACCESS_TOKEN dans les Secrets")
+        st.error("Configurer OANDA_ACCOUNT_ID et OANDA_ACCESS_TOKEN dans Secrets")
         st.stop()
 
-    if st.button("Lancer l'analyse complète (28 paires)", type="primary", use_container_width=True):
-        with st.spinner("Analyse en cours – patientez 2 à 3 minutes..."):
+    if st.button("Lancer l'analyse complète", type="primary", use_container_width=True):
+        with st.spinner("Analyse en cours (2-3 minutes)..."):
             df = analyze_forex_pairs(account_id, access_token)
         if df.empty:
-            st.error("Aucune donnée récupérée – vérifiez vos clés OANDA")
+            st.error("Aucune donnée – vérifiez vos clés OANDA")
             return
         st.session_state.df = df
-        st.success(f"Analyse terminée ! {len(df)} paires analysées")
+        st.success(f"Analyse terminée ! {len(df)} paires")
 
     if "df" in st.session_state:
         df = st.session_state.df
 
-        # Style
         def color_trend(val):
-            return f"background-color: {TREND_COLORS_HEX.get(val, '')}; color: white; font-weight: bold" if val in TREND_COLORS_HEX else ""
+            return f"background-color: {TREND_COLORS_HEX.get(val.split()[0], '')}; color: white; font-weight: bold" if val.split()[0] in TREND_COLORS_HEX else ""
 
         styled = df.style.map(color_trend, subset=['15m','1H','4H','D','W','M','MTF'])
 
@@ -323,7 +324,7 @@ def main():
         with c3:
             st.download_button("CSV", df.to_csv(index=False).encode(), f"Bluestar_{now}.csv", "text/csv")
 
-        st.caption("Données via OANDA • Bluestar MTF Pro+ Optimisé • 2025")
+        st.caption("Données OANDA • Bluestar MTF Pro+ Optimisé • 2025")
 
 if __name__ == "__main__":
     main()
