@@ -1,4 +1,4 @@
-# app.py - Bluestar Hedge Fund GPS (Version Finale Clean)
+# app.py - Bluestar Hedge Fund GPS (Version Finale & Corrigée PDF)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -34,7 +34,7 @@ FOREX_PAIRS_EXTENDED = [
 TREND_COLORS = {
     'Bullish': '#2ecc71',     # Vert Vif
     'Bearish': '#e74c3c',     # Rouge Vif
-    'Retracement': '#f39c12', # Orange (Ex-Correction)
+    'Retracement': '#f39c12', # Orange
     'Range': '#95a5a6'        # Gris
 }
 
@@ -134,7 +134,6 @@ def calc_intraday_trend(df):
         elif has_base and curr_price > curr_base: trend = "Retracement" # Baisse au dessus de la 200
         else: trend = "Bearish"
 
-    # Filtre ADX faible = Range (seulement si ce n'est pas un retracement clair)
     if curr_adx < 20 and trend == "Retracement": trend = "Range"
     
     score = curr_adx
@@ -233,35 +232,42 @@ def analyze_market(account_id, access_token):
     bar.empty(); status.empty()
     return pd.DataFrame(results)
 
-# ==================== EXPORTS ====================
+# ==================== EXPORTS (FIX PDF) ====================
 def create_pdf(df):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 10, "Bluestar GPS Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.ln(5)
+    
     cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality']
     w = pdf.w / (len(cols)+1)
+    
     pdf.set_font("Helvetica", "B", 7)
-    for c in cols: pdf.cell(w, 8, c, 1, align='C', new_x=XPos.RIGHT, new_y=YPos.TOP)
+    for c in cols: 
+        pdf.cell(w, 8, c, border=1, align='C', new_x=XPos.RIGHT, new_y=YPos.TOP)
     pdf.ln()
+    
     pdf.set_font("Helvetica", "", 7)
     for _, row in df.iterrows():
         for c in cols:
             val = str(row[c])
             pdf.set_fill_color(255,255,255)
-            # Logique couleur PDF mise à jour pour Retracement
             if "Bull" in val: pdf.set_fill_color(46, 204, 113)
             elif "Bear" in val: pdf.set_fill_color(231, 76, 60)
             elif "Retr" in val: pdf.set_fill_color(243, 156, 18)
             elif "Range" in val: pdf.set_fill_color(149, 165, 166)
-            pdf.cell(w, 8, val, 1, align='C', fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+            
+            pdf.cell(w, 8, val, border=1, align='C', fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.ln()
-    return pdf.output(dest='S').encode('latin-1')
+    
+    # CORRECTION ICI : Utilisation de BytesIO pour éviter l'erreur d'encodage
+    buffer = BytesIO()
+    pdf.output(buffer)
+    return buffer.getvalue()
 
 # ==================== MAIN UI ====================
 def main():
-    # Header épuré selon ta demande
     st.markdown("""
         <div style='text-align:center; padding:15px; background:#2c3e50; color:white; border-radius:10px; margin-bottom:15px'>
             <h2 style='margin:0'>🏛️ Bluestar Hedge Fund GPS</h2>
@@ -292,7 +298,6 @@ def main():
                 if "Range" in v: return f"background-color: {TREND_COLORS['Range']}; color:white"
             return ""
 
-        # Hauteur dynamique
         h = (len(df) + 1) * 35 + 3
         st.dataframe(df[cols_order].style.map(style_map), height=h, use_container_width=True)
         
