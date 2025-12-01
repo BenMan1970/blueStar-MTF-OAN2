@@ -1,4 +1,4 @@
-# app.py - Bluestar Hedge Fund GPS (Version Finale & Corrigée PDF)
+# app.py - Bluestar Hedge Fund GPS (Version avec ATR Daily et nouveaux actifs)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -27,7 +27,8 @@ FOREX_PAIRS_EXTENDED = [
     'GBPJPY', 'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPNZD',
     'AUDJPY', 'AUDCAD', 'AUDCHF', 'AUDNZD',
     'CADJPY', 'CADCHF', 'CHFJPY',
-    'NZDJPY', 'NZDCAD', 'NZDCHF'
+    'NZDJPY', 'NZDCAD', 'NZDCHF',
+    'XAUUSD', 'XPTUSD', 'US30USD', 'SPX500USD', 'NAS100USD'
 ]
 
 # Couleurs Visuelles
@@ -67,6 +68,14 @@ def adx(high, low, close, period=14):
     minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr_s)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
     return dx.ewm(span=period, adjust=False).mean(), plus_di, minus_di
+
+def atr(high, low, close, period=14):
+    """Calcule l'Average True Range"""
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
 
 # ==================== LOGIQUE "GPS" (MACRO) ====================
 def calc_macro_trend(df):
@@ -179,10 +188,20 @@ def analyze_market(account_id, access_token):
     status = st.empty()
     
     for idx, pair in enumerate(FOREX_PAIRS_EXTENDED):
-        inst = f"{pair[:3]}_{pair[3:]}"
-        status.text(f"GPS Institutionnel : {pair}...")
+        # Gestion des noms spéciaux pour les indices et métaux
+        if pair in ['XAUUSD', 'XPTUSD']:
+            inst = f"{pair[:3]}_{pair[3:]}"
+            display_name = f"{pair[:3]}/USD"
+        elif pair in ['US30USD', 'SPX500USD', 'NAS100USD']:
+            inst = pair
+            display_name = pair.replace('USD', '')
+        else:
+            inst = f"{pair[:3]}_{pair[3:]}"
+            display_name = f"{pair[:3]}/{pair[3:]}"
         
-        row_data = {'Paire': f"{pair[:3]}/{pair[3:]}"}
+        status.text(f"GPS Institutionnel : {display_name}...")
+        
+        row_data = {'Paire': display_name}
         trends_map = {}
         scores_map = {}
         valid_pair = True
@@ -206,6 +225,11 @@ def analyze_market(account_id, access_token):
             trends_map[tf] = t
             scores_map[tf] = s
             row_data[tf] = t
+
+        # Calcul de l'ATR Daily
+        df_daily = data_cache['D']
+        atr_daily = atr(df_daily['High'], df_daily['Low'], df_daily['Close'], 14).iloc[-1]
+        row_data['ATR_Daily'] = f"{atr_daily:.5f}" if atr_daily < 1 else f"{atr_daily:.2f}"
 
         w_bull = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bullish')
         w_bear = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bearish')
@@ -240,12 +264,12 @@ def create_pdf(df):
     pdf.cell(0, 10, "Bluestar GPS Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.ln(5)
     
-    cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality']
+    cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily']
     w = pdf.w / (len(cols)+1)
     
     pdf.set_font("Helvetica", "B", 7)
     for c in cols: 
-        pdf.cell(w, 8, c, border=1, align='C', new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(w, 8, c.replace('_', ' '), border=1, align='C', new_x=XPos.RIGHT, new_y=YPos.TOP)
     pdf.ln()
     
     pdf.set_font("Helvetica", "", 7)
@@ -261,7 +285,6 @@ def create_pdf(df):
             pdf.cell(w, 8, val, border=1, align='C', fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.ln()
     
-    # CORRECTION ICI : Utilisation de BytesIO pour éviter l'erreur d'encodage
     buffer = BytesIO()
     pdf.output(buffer)
     return buffer.getvalue()
@@ -288,7 +311,7 @@ def main():
     
     if "df" in st.session_state:
         df = st.session_state.df
-        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality']
+        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily']
         
         def style_map(v):
             if isinstance(v, str):
