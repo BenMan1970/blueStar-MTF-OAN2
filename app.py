@@ -1,4 +1,4 @@
-# app.py - Bluestar Hedge Fund GPS (Version avec ATR Daily et nouveaux actifs)
+# app.py - Bluestar Hedge Fund GPS (Version avec ATR Daily, H1 et 15m)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -226,10 +226,18 @@ def analyze_market(account_id, access_token):
             scores_map[tf] = s
             row_data[tf] = t
 
-        # Calcul de l'ATR Daily
+        # Calcul de l'ATR Daily, H1 et 15m
         df_daily = data_cache['D']
         atr_daily = atr(df_daily['High'], df_daily['Low'], df_daily['Close'], 14).iloc[-1]
         row_data['ATR_Daily'] = f"{atr_daily:.5f}" if atr_daily < 1 else f"{atr_daily:.2f}"
+        
+        df_h1 = data_cache['1H']
+        atr_h1 = atr(df_h1['High'], df_h1['Low'], df_h1['Close'], 14).iloc[-1]
+        row_data['ATR_H1'] = f"{atr_h1:.5f}" if atr_h1 < 1 else f"{atr_h1:.2f}"
+        
+        df_15m = data_cache['15m']
+        atr_15m = atr(df_15m['High'], df_15m['Low'], df_15m['Close'], 14).iloc[-1]
+        row_data['ATR_15m'] = f"{atr_15m:.5f}" if atr_15m < 1 else f"{atr_15m:.2f}"
 
         w_bull = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bullish')
         w_bear = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bearish')
@@ -264,15 +272,15 @@ def create_pdf(df):
     pdf.cell(0, 10, "Bluestar GPS Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.ln(5)
     
-    cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily']
+    cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
     w = pdf.w / (len(cols)+1)
     
-    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_font("Helvetica", "B", 6)
     for c in cols: 
         pdf.cell(w, 8, c.replace('_', ' '), border=1, align='C', new_x=XPos.RIGHT, new_y=YPos.TOP)
     pdf.ln()
     
-    pdf.set_font("Helvetica", "", 7)
+    pdf.set_font("Helvetica", "", 6)
     for _, row in df.iterrows():
         for c in cols:
             val = str(row[c])
@@ -311,7 +319,7 @@ def main():
     
     if "df" in st.session_state:
         df = st.session_state.df
-        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily']
+        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         
         def style_map(v):
             if isinstance(v, str):
