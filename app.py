@@ -90,32 +90,40 @@ def calc_institutional_trend_macro(df):
     Logique pour Monthly/Weekly (Timeframes Macro)
     Basée sur SMA 200, EMA 50 et EMA 21
     """
-    if len(df) < 200:
+    if len(df) < 50:
         return 'Range', 0
     
     close = df['Close']
     curr_price = close.iloc[-1]
     
-    sma200 = sma(close, 200)
+    # Utiliser SMA 50 si pas assez de données pour SMA 200
+    has_200 = len(df) >= 200
+    sma200 = sma(close, 200) if has_200 else sma(close, 50)
     ema50 = ema(close, 50)
-    ema21 = ema(close, 21)
     
     curr_sma200 = sma200.iloc[-1]
     curr_ema50 = ema50.iloc[-1]
-    curr_ema21 = ema21.iloc[-1]
     
-    # Conditions strictes pour Monthly/Weekly
+    # Conditions pour Monthly/Weekly
     above_sma200 = curr_price > curr_sma200
     below_sma200 = curr_price < curr_sma200
     ema50_above_sma = curr_ema50 > curr_sma200
     ema50_below_sma = curr_ema50 < curr_sma200
     
+    # Perfect alignment
     if above_sma200 and ema50_above_sma:
         trend = "Bullish"
         score = 85
     elif below_sma200 and ema50_below_sma:
         trend = "Bearish"
         score = 85
+    # Simple position vs SMA
+    elif above_sma200:
+        trend = "Bullish"
+        score = 65
+    elif below_sma200:
+        trend = "Bearish"
+        score = 65
     else:
         trend = "Range"
         score = 40
@@ -350,7 +358,14 @@ def analyze_market(account_id, access_token):
             if df.empty: valid_pair = False; break
             
             if tf == 'M':
+                # Pour Monthly : utiliser les 4500 daily bars et resampler
                 df = df.resample('ME').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+                # Si pas assez de données mensuelles, garder quand même
+                if len(df) < 50:
+                    # Fallback: utiliser weekly comme proxy
+                    df_temp = get_cached_oanda_data(inst, 'D', 2000, account_id, access_token)
+                    if not df_temp.empty:
+                        df = df_temp.resample('ME').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
             elif tf == 'W':
                 df = df.resample('W-FRI').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
             data_cache[tf] = df
