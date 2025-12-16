@@ -36,7 +36,9 @@ TREND_COLORS = {
     'Bullish': '#2ecc71',     # Vert Vif
     'Bearish': '#e74c3c',     # Rouge Vif
     'Retracement': '#f39c12', # Orange
-    'Range': '#95a5a6'        # Gris
+    'Range': '#95a5a6',       # Gris
+    'Retracement Bull': '#7dcea0',  # Vert clair (pullback haussier)
+    'Retracement Bear': '#f1948a'   # Rouge clair (correction baissière)
 }
 
 # Poids pour le Score MTF global (Rebalancés pour priorité macro)
@@ -133,7 +135,7 @@ def calc_institutional_trend_macro(df):
 def calc_institutional_trend_daily(df):
     """
     Logique pour Daily (Timeframe Pivot)
-    Combine SMA 200, EMA 50, EMA 21 avec filtres de qualité + Retracements
+    Combine SMA 200, EMA 50, EMA 21 avec filtres de qualité + Retracements directionnels
     """
     if len(df) < 200:
         return 'Range', 0
@@ -175,14 +177,14 @@ def calc_institutional_trend_daily(df):
     if below_sma200 and ema50_below_sma and (ema21_below_50 or price_below_21):
         return "Bearish", 70
     
-    # RETRACEMENT: Prix contre-tendance par rapport à la baseline (SMA 200)
-    # Retracement haussier: Prix sous SMA 200 mais structure haussière (EMA 50 > SMA 200)
+    # RETRACEMENT DIRECTIONNEL: Prix contre-tendance par rapport à la baseline
+    # Retracement Bull: Prix sous SMA 200 mais structure haussière (EMA 50 > SMA 200)
     if below_sma200 and ema50_above_sma:
-        return "Retracement", 55
+        return "Retracement Bull", 55
     
-    # Retracement baissier: Prix au-dessus SMA 200 mais structure baissière (EMA 50 < SMA 200)
+    # Retracement Bear: Prix au-dessus SMA 200 mais structure baissière (EMA 50 < SMA 200)
     if above_sma200 and ema50_below_sma:
-        return "Retracement", 55
+        return "Retracement Bear", 55
     
     # Weak Bull/Bear
     if above_sma200:
@@ -195,7 +197,7 @@ def calc_institutional_trend_daily(df):
 def calc_institutional_trend_4h(df):
     """
     Logique pour 4H
-    Similaire au Daily mais avec critères légèrement assouplis + Retracements
+    Similaire au Daily mais avec critères légèrement assouplis + Retracements directionnels
     """
     if len(df) < 200:
         return 'Range', 0
@@ -233,19 +235,19 @@ def calc_institutional_trend_4h(df):
     if below_sma200 and price_below_21:
         return "Bearish", 60
     
-    # RETRACEMENT 4H
+    # RETRACEMENT DIRECTIONNEL 4H
     if below_sma200 and ema50_above_sma:
-        return "Retracement", 50
+        return "Retracement Bull", 50
     
     if above_sma200 and curr_ema50 < curr_sma200:
-        return "Retracement", 50
+        return "Retracement Bear", 50
     
     return "Range", 40
 
-def calc_institutional_trend_intraday(df):
+def calc_institutional_trend_intraday(df, macro_trend=None):
     """
     Logique pour 1H et 15m (Timeframes Intraday)
-    Basée sur EMA alignment, momentum, volume + Retracements
+    Basée sur EMA alignment, momentum, volume + Retracements directionnels
     """
     if len(df) < 50:
         return 'Range', 0
@@ -297,7 +299,7 @@ def calc_institutional_trend_intraday(df):
     momentum_bull = rsi_val > 50 and curr_macd > curr_signal
     momentum_bear = rsi_val < 50 and curr_macd < curr_signal
     
-    # Decision avec Retracements
+    # Decision avec Retracements directionnels
     bullish = curr_price > curr_zlema and ema_bull_align and momentum_bull
     bearish = curr_price < curr_zlema and ema_bear_align and momentum_bear
     
@@ -313,15 +315,18 @@ def calc_institutional_trend_intraday(df):
         score = min(75, base_strength + momentum_bonus)
         return "Bearish", score
     
-    # RETRACEMENT Intraday: Prix contre la baseline mais ZLEMA montre une structure
+    # RETRACEMENT DIRECTIONNEL Intraday: Utiliser le macro_trend pour la direction
     if has_baseline:
-        # Retracement haussier: Prix sous baseline mais au-dessus de ZLEMA
-        if curr_price < curr_baseline and curr_price > curr_zlema:
-            return "Retracement", 45
+        # Déterminer la tendance de fond (baseline direction)
+        baseline_trend = "Bullish" if curr_ema50 > curr_baseline else "Bearish"
         
-        # Retracement baissier: Prix au-dessus baseline mais sous ZLEMA
-        if curr_price > curr_baseline and curr_price < curr_zlema:
-            return "Retracement", 45
+        # Retracement Bull: Prix sous baseline mais baseline haussière
+        if curr_price < curr_baseline and baseline_trend == "Bullish":
+            return "Retracement Bull", 45
+        
+        # Retracement Bear: Prix au-dessus baseline mais baseline baissière
+        if curr_price > curr_baseline and baseline_trend == "Bearish":
+            return "Retracement Bear", 45
     
     return "Range", 30
 
@@ -450,32 +455,43 @@ def analyze_market(account_id, access_token):
         row_data['15m'] = trends_map['15m']
 
         # Calcul du score MTF pondéré par FORCE (Ajustement 1)
-        # On traite les Retracements comme neutres dans le score MTF
+        # Traitement des Retracements directionnels
         w_bull = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bullish')
         w_bear = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bearish')
-        w_retr = sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement')  # Contribution réduite
         
-        # Quality basée sur alignement + force des hauts TF (Ajustement 2)
+        # Retracements Bull comptent pour la tendance haussière (avec réduction)
+        w_bull += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bull')
+        # Retracements Bear comptent pour la tendance baissière (avec réduction)
+        w_bear += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bear')
+        
+        # Quality basée sur alignement + force des hauts TF (Ajustement 2 - SEUILS STRICTS)
         high_tf_avg = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
         
         quality = 'C'
-        if trends_map['D'] == trends_map['M'] == trends_map['W'] and trends_map['D'] != 'Retracement':
+        # Vérifier que les hauts TF ne sont pas en Retracement pour Quality A/A+
+        high_tf_clean = (
+            'Retracement' not in trends_map['D'] and 
+            'Retracement' not in trends_map['M'] and 
+            'Retracement' not in trends_map['W']
+        )
+        
+        if trends_map['D'] == trends_map['M'] == trends_map['W'] and high_tf_clean:
             if high_tf_avg >= 80: quality = 'A+'
-            elif high_tf_avg >= 65: quality = 'A'
+            elif high_tf_avg >= 70: quality = 'A'
             else: quality = 'B'
-        elif trends_map['D'] == trends_map['M'] and trends_map['D'] != 'Retracement':
-            if high_tf_avg >= 70: quality = 'B+'
+        elif trends_map['D'] == trends_map['M'] and high_tf_clean:
+            if high_tf_avg >= 75: quality = 'B+'
             else: quality = 'B'
-        elif trends_map['D'] == trends_map['W'] and trends_map['D'] != 'Retracement':
+        elif trends_map['D'] == trends_map['W'] and high_tf_clean:
             quality = 'B-'
         else:
             quality = 'C'
 
         if w_bull > w_bear:
-            perc = ((w_bull + w_retr) / (TOTAL_WEIGHT + w_retr)) * 100
+            perc = (w_bull / TOTAL_WEIGHT) * 100
             final_trend = f"Bullish ({perc:.0f}%)"
         elif w_bear > w_bull:
-            perc = ((w_bear + w_retr) / (TOTAL_WEIGHT + w_retr)) * 100
+            perc = (w_bear / TOTAL_WEIGHT) * 100
             final_trend = f"Bearish ({perc:.0f}%)"
         else:
             final_trend = "Range"
@@ -509,10 +525,16 @@ def create_pdf(df):
         for c in cols:
             val = str(row[c])
             pdf.set_fill_color(255,255,255)
-            if "Bull" in val: pdf.set_fill_color(46, 204, 113)
-            elif "Bear" in val: pdf.set_fill_color(231, 76, 60)
-            elif "Retr" in val: pdf.set_fill_color(243, 156, 18)
-            elif "Range" in val: pdf.set_fill_color(149, 165, 166)
+            if "Bull" in val and "Retracement" not in val: 
+                pdf.set_fill_color(46, 204, 113)
+            elif "Bear" in val and "Retracement" not in val: 
+                pdf.set_fill_color(231, 76, 60)
+            elif "Retracement Bull" in val: 
+                pdf.set_fill_color(125, 206, 160)
+            elif "Retracement Bear" in val: 
+                pdf.set_fill_color(241, 148, 138)
+            elif "Range" in val: 
+                pdf.set_fill_color(149, 165, 166)
             
             pdf.cell(w, 8, val, border=1, align='C', fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.ln()
@@ -547,10 +569,16 @@ def main():
         
         def style_map(v):
             if isinstance(v, str):
-                if "Bull" in v: return f"background-color: {TREND_COLORS['Bullish']}; color:white; font-weight:bold"
-                if "Bear" in v: return f"background-color: {TREND_COLORS['Bearish']}; color:white; font-weight:bold"
-                if "Retr" in v: return f"background-color: {TREND_COLORS['Retracement']}; color:white"
-                if "Range" in v: return f"background-color: {TREND_COLORS['Range']}; color:white"
+                if "Bull" in v and "Retracement" not in v: 
+                    return f"background-color: {TREND_COLORS['Bullish']}; color:white; font-weight:bold"
+                if "Bear" in v and "Retracement" not in v: 
+                    return f"background-color: {TREND_COLORS['Bearish']}; color:white; font-weight:bold"
+                if "Retracement Bull" in v: 
+                    return f"background-color: {TREND_COLORS['Retracement Bull']}; color:white"
+                if "Retracement Bear" in v: 
+                    return f"background-color: {TREND_COLORS['Retracement Bear']}; color:white"
+                if "Range" in v: 
+                    return f"background-color: {TREND_COLORS['Range']}; color:white"
             return ""
 
         h = (len(df) + 1) * 35 + 3
