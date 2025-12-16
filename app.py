@@ -133,7 +133,7 @@ def calc_institutional_trend_macro(df):
 def calc_institutional_trend_daily(df):
     """
     Logique pour Daily (Timeframe Pivot)
-    Combine SMA 200, EMA 50, EMA 21 avec filtres de qualité
+    Combine SMA 200, EMA 50, EMA 21 avec filtres de qualité + Retracements
     """
     if len(df) < 200:
         return 'Range', 0
@@ -175,6 +175,15 @@ def calc_institutional_trend_daily(df):
     if below_sma200 and ema50_below_sma and (ema21_below_50 or price_below_21):
         return "Bearish", 70
     
+    # RETRACEMENT: Prix contre-tendance par rapport à la baseline (SMA 200)
+    # Retracement haussier: Prix sous SMA 200 mais structure haussière (EMA 50 > SMA 200)
+    if below_sma200 and ema50_above_sma:
+        return "Retracement", 55
+    
+    # Retracement baissier: Prix au-dessus SMA 200 mais structure baissière (EMA 50 < SMA 200)
+    if above_sma200 and ema50_below_sma:
+        return "Retracement", 55
+    
     # Weak Bull/Bear
     if above_sma200:
         return "Bullish", 50
@@ -186,7 +195,7 @@ def calc_institutional_trend_daily(df):
 def calc_institutional_trend_4h(df):
     """
     Logique pour 4H
-    Similaire au Daily mais avec critères légèrement assouplis
+    Similaire au Daily mais avec critères légèrement assouplis + Retracements
     """
     if len(df) < 200:
         return 'Range', 0
@@ -224,12 +233,19 @@ def calc_institutional_trend_4h(df):
     if below_sma200 and price_below_21:
         return "Bearish", 60
     
+    # RETRACEMENT 4H
+    if below_sma200 and ema50_above_sma:
+        return "Retracement", 50
+    
+    if above_sma200 and curr_ema50 < curr_sma200:
+        return "Retracement", 50
+    
     return "Range", 40
 
 def calc_institutional_trend_intraday(df):
     """
     Logique pour 1H et 15m (Timeframes Intraday)
-    Basée sur EMA alignment, momentum et volume
+    Basée sur EMA alignment, momentum, volume + Retracements
     """
     if len(df) < 50:
         return 'Range', 0
@@ -253,8 +269,13 @@ def calc_institutional_trend_intraday(df):
     # ZLEMA pour confirmation
     lag = 17
     src_adj = close + (close - close.shift(lag))
-    zlema = src_adj.ewm(span=50, adjust=False).mean()
-    curr_zlema = zlema.iloc[-1]
+    zlema_val = src_adj.ewm(span=50, adjust=False).mean()
+    curr_zlema = zlema_val.iloc[-1]
+    
+    # Baseline (SMA 200 si disponible, sinon EMA 50)
+    has_baseline = len(df) >= 200
+    baseline = sma(close, 200) if has_baseline else curr_ema50
+    curr_baseline = baseline.iloc[-1] if has_baseline else curr_ema50
     
     # Momentum indicators
     rsi_val = rsi(close, 14).iloc[-1]
@@ -276,7 +297,7 @@ def calc_institutional_trend_intraday(df):
     momentum_bull = rsi_val > 50 and curr_macd > curr_signal
     momentum_bear = rsi_val < 50 and curr_macd < curr_signal
     
-    # Decision
+    # Decision avec Retracements
     bullish = curr_price > curr_zlema and ema_bull_align and momentum_bull
     bearish = curr_price < curr_zlema and ema_bear_align and momentum_bear
     
@@ -291,6 +312,16 @@ def calc_institutional_trend_intraday(df):
         momentum_bonus = 15 if strong_vol else 0
         score = min(75, base_strength + momentum_bonus)
         return "Bearish", score
+    
+    # RETRACEMENT Intraday: Prix contre la baseline mais ZLEMA montre une structure
+    if has_baseline:
+        # Retracement haussier: Prix sous baseline mais au-dessus de ZLEMA
+        if curr_price < curr_baseline and curr_price > curr_zlema:
+            return "Retracement", 45
+        
+        # Retracement baissier: Prix au-dessus baseline mais sous ZLEMA
+        if curr_price > curr_baseline and curr_price < curr_zlema:
+            return "Retracement", 45
     
     return "Range", 30
 
@@ -419,30 +450,32 @@ def analyze_market(account_id, access_token):
         row_data['15m'] = trends_map['15m']
 
         # Calcul du score MTF pondéré par FORCE (Ajustement 1)
+        # On traite les Retracements comme neutres dans le score MTF
         w_bull = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bullish')
         w_bear = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bearish')
+        w_retr = sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement')  # Contribution réduite
         
         # Quality basée sur alignement + force des hauts TF (Ajustement 2)
         high_tf_avg = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
         
         quality = 'C'
-        if trends_map['D'] == trends_map['M'] == trends_map['W']:
+        if trends_map['D'] == trends_map['M'] == trends_map['W'] and trends_map['D'] != 'Retracement':
             if high_tf_avg >= 80: quality = 'A+'
             elif high_tf_avg >= 65: quality = 'A'
             else: quality = 'B'
-        elif trends_map['D'] == trends_map['M']:
+        elif trends_map['D'] == trends_map['M'] and trends_map['D'] != 'Retracement':
             if high_tf_avg >= 70: quality = 'B+'
             else: quality = 'B'
-        elif trends_map['D'] == trends_map['W']:
+        elif trends_map['D'] == trends_map['W'] and trends_map['D'] != 'Retracement':
             quality = 'B-'
         else:
             quality = 'C'
 
         if w_bull > w_bear:
-            perc = (w_bull / TOTAL_WEIGHT) * 100
+            perc = ((w_bull + w_retr) / (TOTAL_WEIGHT + w_retr)) * 100
             final_trend = f"Bullish ({perc:.0f}%)"
         elif w_bear > w_bull:
-            perc = (w_bear / TOTAL_WEIGHT) * 100
+            perc = ((w_bear + w_retr) / (TOTAL_WEIGHT + w_retr)) * 100
             final_trend = f"Bearish ({perc:.0f}%)"
         else:
             final_trend = "Range"
