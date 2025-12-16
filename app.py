@@ -39,8 +39,8 @@ TREND_COLORS = {
     'Range': '#95a5a6'        # Gris
 }
 
-# Poids pour le Score MTF global
-MTF_WEIGHTS = {'M': 3.0, 'W': 2.5, 'D': 4.0, '4H': 3.0, '1H': 1.5, '15m': 1.0}
+# Poids pour le Score MTF global (Rebalancés pour priorité macro)
+MTF_WEIGHTS = {'M': 5.0, 'W': 4.0, 'D': 4.0, '4H': 2.5, '1H': 1.5, '15m': 1.0}
 TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())
 
 # ==================== INDICATEURS ====================
@@ -403,15 +403,25 @@ def analyze_market(account_id, access_token):
         row_data['1H'] = trends_map['1H']
         row_data['15m'] = trends_map['15m']
 
-        # Calcul du score MTF pondéré
-        w_bull = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bullish')
-        w_bear = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bearish')
+        # Calcul du score MTF pondéré par FORCE (Ajustement 1)
+        w_bull = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bullish')
+        w_bear = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bearish')
         
-        # Quality basée sur l'alignement des hauts timeframes
+        # Quality basée sur alignement + force des hauts TF (Ajustement 2)
+        high_tf_avg = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
+        
         quality = 'C'
-        if trends_map['D'] == trends_map['M']: quality = 'B'
-        if trends_map['D'] == trends_map['M'] == trends_map['W']: quality = 'A'
-        if quality == 'A' and scores_map['D'] > 70: quality = 'A+'
+        if trends_map['D'] == trends_map['M'] == trends_map['W']:
+            if high_tf_avg >= 80: quality = 'A+'
+            elif high_tf_avg >= 65: quality = 'A'
+            else: quality = 'B'
+        elif trends_map['D'] == trends_map['M']:
+            if high_tf_avg >= 70: quality = 'B+'
+            else: quality = 'B'
+        elif trends_map['D'] == trends_map['W']:
+            quality = 'B-'
+        else:
+            quality = 'C'
 
         if w_bull > w_bear:
             perc = (w_bull / TOTAL_WEIGHT) * 100
