@@ -1,4 +1,4 @@
-# app.py - Bluestar Hedge Fund GPS (Version avec ATR Daily, H1 et 15m)
+# app.py - Bluestar Hedge Fund GPS (Nouvelle Logique MTF Institutionnelle)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -31,7 +31,7 @@ FOREX_PAIRS_EXTENDED = [
     'XAUUSD', 'XPTUSD', 'US30USD', 'SPX500USD', 'NAS100USD'
 ]
 
-# Couleurs Visuelles
+# Couleurs Visuelles (INCHANGÉES)
 TREND_COLORS = {
     'Bullish': '#2ecc71',     # Vert Vif
     'Bearish': '#e74c3c',     # Rouge Vif
@@ -47,10 +47,8 @@ TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())
 def sma(series, length):
     return series.rolling(window=length).mean()
 
-def zlema(series, length):
-    lag = int((length - 1) / 2)
-    src_adj = series + (series - series.shift(lag))
-    return src_adj.ewm(span=length, adjust=False).mean()
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
 
 def adx(high, low, close, period=14):
     tr1 = high - low
@@ -77,76 +75,216 @@ def atr(high, low, close, period=14):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.ewm(span=period, adjust=False).mean()
 
-# ==================== LOGIQUE "GPS" (MACRO) ====================
-def calc_macro_trend(df):
-    """Logique SMA 200 stricte pour Monthly/Weekly (Pas de Range sauf exception)"""
-    if len(df) < 50: return 'Neutral', 0
+def rsi(close, period=14):
+    """Calcule le RSI"""
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# ==================== NOUVELLE LOGIQUE MTF INSTITUTIONNELLE ====================
+
+def calc_institutional_trend_macro(df):
+    """
+    Logique pour Monthly/Weekly (Timeframes Macro)
+    Basée sur SMA 200, EMA 50 et EMA 21
+    """
+    if len(df) < 200:
+        return 'Range', 0
     
     close = df['Close']
     curr_price = close.iloc[-1]
     
-    sma50 = sma(close, 50)
     sma200 = sma(close, 200)
+    ema50 = ema(close, 50)
+    ema21 = ema(close, 21)
     
-    curr_sma50 = sma50.iloc[-1]
-    has_200 = len(df) >= 200
-    curr_sma200 = sma200.iloc[-1] if has_200 else None
-
-    trend = "Neutral"
-    score = 0
-
-    if has_200:
-        if curr_price > curr_sma200:
-            trend = "Bullish"
-            score = 60
-            if curr_price > curr_sma50: score += 20
-            if curr_sma50 > curr_sma200: score += 20
-        else:
-            trend = "Bearish"
-            score = 60
-            if curr_price < curr_sma50: score += 20
-            if curr_sma50 < curr_sma200: score += 20
+    curr_sma200 = sma200.iloc[-1]
+    curr_ema50 = ema50.iloc[-1]
+    curr_ema21 = ema21.iloc[-1]
+    
+    # Conditions strictes pour Monthly/Weekly
+    above_sma200 = curr_price > curr_sma200
+    below_sma200 = curr_price < curr_sma200
+    ema50_above_sma = curr_ema50 > curr_sma200
+    ema50_below_sma = curr_ema50 < curr_sma200
+    
+    if above_sma200 and ema50_above_sma:
+        trend = "Bullish"
+        score = 85
+    elif below_sma200 and ema50_below_sma:
+        trend = "Bearish"
+        score = 85
     else:
-        if curr_price > curr_sma50:
-            trend = "Bullish"; score = 50
-        else:
-            trend = "Bearish"; score = 50
-            
-    return trend, min(100, score)
+        trend = "Range"
+        score = 40
+    
+    return trend, score
 
-# ==================== LOGIQUE "TIMING" (INTRADAY) ====================
-def calc_intraday_trend(df):
-    """Logique ZLEMA + Baseline pour Daily -> 15m"""
-    if len(df) < 50: return 'Range', 0
+def calc_institutional_trend_daily(df):
+    """
+    Logique pour Daily (Timeframe Pivot)
+    Combine SMA 200, EMA 50, EMA 21 avec filtres de qualité
+    """
+    if len(df) < 200:
+        return 'Range', 0
     
     close = df['Close']
-    zlema_val = zlema(close, 50)
-    baseline = sma(close, 200)
-    adx_val, _, _ = adx(df['High'], df['Low'], close, 14)
+    curr_price = close.iloc[-1]
+    
+    sma200 = sma(close, 200)
+    ema50 = ema(close, 50)
+    ema21 = ema(close, 21)
+    
+    curr_sma200 = sma200.iloc[-1]
+    curr_ema50 = ema50.iloc[-1]
+    curr_ema21 = ema21.iloc[-1]
+    
+    # Conditions pour Daily avec gradations
+    above_sma200 = curr_price > curr_sma200
+    below_sma200 = curr_price < curr_sma200
+    ema50_above_sma = curr_ema50 > curr_sma200
+    ema50_below_sma = curr_ema50 < curr_sma200
+    ema21_above_50 = curr_ema21 > curr_ema50
+    ema21_below_50 = curr_ema21 < curr_ema50
+    price_above_21 = curr_price > curr_ema21
+    price_below_21 = curr_price < curr_ema21
+    
+    # Perfect Bull: Tout aligné
+    if above_sma200 and ema50_above_sma and ema21_above_50 and price_above_21:
+        return "Bullish", 90
+    
+    # Perfect Bear: Tout aligné
+    if below_sma200 and ema50_below_sma and ema21_below_50 and price_below_21:
+        return "Bearish", 90
+    
+    # Strong Bull: Au moins 3 conditions sur 4
+    if above_sma200 and ema50_above_sma and (ema21_above_50 or price_above_21):
+        return "Bullish", 70
+    
+    # Strong Bear: Au moins 3 conditions sur 4
+    if below_sma200 and ema50_below_sma and (ema21_below_50 or price_below_21):
+        return "Bearish", 70
+    
+    # Weak Bull/Bear
+    if above_sma200:
+        return "Bullish", 50
+    if below_sma200:
+        return "Bearish", 50
+    
+    return "Range", 35
+
+def calc_institutional_trend_4h(df):
+    """
+    Logique pour 4H
+    Similaire au Daily mais avec critères légèrement assouplis
+    """
+    if len(df) < 200:
+        return 'Range', 0
+    
+    close = df['Close']
+    curr_price = close.iloc[-1]
+    
+    sma200 = sma(close, 200)
+    ema50 = ema(close, 50)
+    ema21 = ema(close, 21)
+    
+    curr_sma200 = sma200.iloc[-1]
+    curr_ema50 = ema50.iloc[-1]
+    curr_ema21 = ema21.iloc[-1]
+    
+    above_sma200 = curr_price > curr_sma200
+    below_sma200 = curr_price < curr_sma200
+    ema21_above_50 = curr_ema21 > curr_ema50
+    ema21_below_50 = curr_ema21 < curr_ema50
+    ema50_above_sma = curr_ema50 > curr_sma200
+    price_above_21 = curr_price > curr_ema21
+    price_below_21 = curr_price < curr_ema21
+    
+    # Perfect alignment
+    if above_sma200 and ema21_above_50 and ema50_above_sma and price_above_21:
+        return "Bullish", 80
+    
+    if below_sma200 and ema21_below_50 and curr_ema50 < curr_sma200 and price_below_21:
+        return "Bearish", 80
+    
+    # Strong
+    if above_sma200 and price_above_21:
+        return "Bullish", 60
+    
+    if below_sma200 and price_below_21:
+        return "Bearish", 60
+    
+    return "Range", 40
+
+def calc_institutional_trend_intraday(df):
+    """
+    Logique pour 1H et 15m (Timeframes Intraday)
+    Basée sur EMA alignment, momentum et volume
+    """
+    if len(df) < 50:
+        return 'Range', 0
+    
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
+    volume_data = df.get('Volume', pd.Series([1]*len(df), index=df.index))
     
     curr_price = close.iloc[-1]
-    curr_zlema = zlema_val.iloc[-1]
-    curr_adx = adx_val.iloc[-1]
     
-    has_base = len(df) >= 200
-    curr_base = baseline.iloc[-1] if has_base else curr_zlema
-
-    trend = "Range"
+    # EMAs rapides
+    ema50 = ema(close, 50)
+    ema21 = ema(close, 21)
+    ema9 = ema(close, 9)
     
-    # Logique de Retracement vs Tendance
-    if curr_price > curr_zlema:
-        if has_base and curr_price > curr_base: trend = "Bullish"
-        elif has_base and curr_price < curr_base: trend = "Retracement" # Hausse sous la 200
-        else: trend = "Bullish"
-    elif curr_price < curr_zlema:
-        if has_base and curr_price < curr_base: trend = "Bearish"
-        elif has_base and curr_price > curr_base: trend = "Retracement" # Baisse au dessus de la 200
-        else: trend = "Bearish"
-
-    if curr_adx < 20 and trend == "Retracement": trend = "Range"
+    curr_ema50 = ema50.iloc[-1]
+    curr_ema21 = ema21.iloc[-1]
+    curr_ema9 = ema9.iloc[-1]
     
-    score = curr_adx
-    return trend, score
+    # ZLEMA pour confirmation
+    lag = 17
+    src_adj = close + (close - close.shift(lag))
+    zlema = src_adj.ewm(span=50, adjust=False).mean()
+    curr_zlema = zlema.iloc[-1]
+    
+    # Momentum indicators
+    rsi_val = rsi(close, 14).iloc[-1]
+    macd_line = ema(close, 12) - ema(close, 26)
+    signal_line = ema(macd_line, 9)
+    curr_macd = macd_line.iloc[-1]
+    curr_signal = signal_line.iloc[-1]
+    
+    # Volume analysis
+    vol = volume_data.iloc[-1]
+    vol_ma = volume_data.rolling(20).mean().iloc[-1]
+    strong_vol = vol > vol_ma * 1.3
+    
+    # EMA Alignment
+    ema_bull_align = curr_ema9 > curr_ema21 and curr_ema21 > curr_ema50
+    ema_bear_align = curr_ema9 < curr_ema21 and curr_ema21 < curr_ema50
+    
+    # Momentum conditions
+    momentum_bull = rsi_val > 50 and curr_macd > curr_signal
+    momentum_bear = rsi_val < 50 and curr_macd < curr_signal
+    
+    # Decision
+    bullish = curr_price > curr_zlema and ema_bull_align and momentum_bull
+    bearish = curr_price < curr_zlema and ema_bear_align and momentum_bear
+    
+    if bullish:
+        base_strength = min(75, abs(curr_price - curr_zlema) / curr_price * 1000)
+        momentum_bonus = 15 if strong_vol else 0
+        score = min(75, base_strength + momentum_bonus)
+        return "Bullish", score
+    
+    if bearish:
+        base_strength = min(75, abs(curr_price - curr_zlema) / curr_price * 1000)
+        momentum_bonus = 15 if strong_vol else 0
+        score = min(75, base_strength + momentum_bonus)
+        return "Bearish", score
+    
+    return "Range", 30
 
 # ==================== DATA FETCHING ====================
 def get_oanda_data(instrument, granularity, count, account_id, access_token):
@@ -161,7 +299,7 @@ def get_oanda_data(instrument, granularity, count, account_id, access_token):
         df = pd.DataFrame([{
             'date': c['time'], 'Open': float(c['mid']['o']),
             'High': float(c['mid']['h']), 'Low': float(c['mid']['l']),
-            'Close': float(c['mid']['c'])
+            'Close': float(c['mid']['c']), 'Volume': float(c.get('volume', 0))
         } for c in data['candles'] if c.get('complete')])
         df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
@@ -178,8 +316,8 @@ def analyze_market(account_id, access_token):
     tf_config = {
         'M':   ('D', 4500, 'Macro'),
         'W':   ('D', 2000, 'Macro'),
-        'D':   ('D', 300,  'Intra'),
-        '4H':  ('H4', 300, 'Intra'),
+        'D':   ('D', 300,  'Daily'),
+        '4H':  ('H4', 300, '4H'),
         '1H':  ('H1', 300, 'Intra'),
         '15m': ('M15', 300,'Intra')
     }
@@ -188,7 +326,7 @@ def analyze_market(account_id, access_token):
     status = st.empty()
     
     for idx, pair in enumerate(FOREX_PAIRS_EXTENDED):
-        # Gestion des noms spéciaux pour les indices et métaux
+        # Gestion des noms spéciaux
         if pair in ['XAUUSD', 'XPTUSD']:
             inst = f"{pair[:3]}_{pair[3:]}"
             display_name = f"{pair[:3]}/USD"
@@ -212,16 +350,26 @@ def analyze_market(account_id, access_token):
             if df.empty: valid_pair = False; break
             
             if tf == 'M':
-                df = df.resample('ME').agg({'Open':'first','High':'max','Low':'min','Close':'last'}).dropna()
+                df = df.resample('ME').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
             elif tf == 'W':
-                df = df.resample('W-FRI').agg({'Open':'first','High':'max','Low':'min','Close':'last'}).dropna()
+                df = df.resample('W-FRI').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
             data_cache[tf] = df
 
         if not valid_pair: continue
 
+        # Application des logiques selon timeframe
         for tf, (_, _, mode) in tf_config.items():
             df = data_cache[tf]
-            t, s = calc_macro_trend(df) if mode == 'Macro' else calc_intraday_trend(df)
+            
+            if mode == 'Macro':
+                t, s = calc_institutional_trend_macro(df)
+            elif mode == 'Daily':
+                t, s = calc_institutional_trend_daily(df)
+            elif mode == '4H':
+                t, s = calc_institutional_trend_4h(df)
+            else:  # Intra
+                t, s = calc_institutional_trend_intraday(df)
+            
             trends_map[tf] = t
             scores_map[tf] = s
             row_data[tf] = t
@@ -239,13 +387,31 @@ def analyze_market(account_id, access_token):
         atr_15m = atr(df_15m['High'], df_15m['Low'], df_15m['Close'], 14).iloc[-1]
         row_data['ATR_15m'] = f"{atr_15m:.5f}" if atr_15m < 1 else f"{atr_15m:.2f}"
 
+        # Filtre institutionnel: Les intradays doivent être alignés avec le macro
+        macro_trend = trends_map['M'] if trends_map['M'] != 'Range' else trends_map['W'] if trends_map['W'] != 'Range' else trends_map['D']
+        
+        # Filtrer 1H et 15m si contre-tendance macro
+        if macro_trend == 'Bearish' and trends_map['1H'] == 'Bullish':
+            trends_map['1H'] = 'Range'
+        if macro_trend == 'Bullish' and trends_map['1H'] == 'Bearish':
+            trends_map['1H'] = 'Range'
+        if macro_trend == 'Bearish' and trends_map['15m'] == 'Bullish':
+            trends_map['15m'] = 'Range'
+        if macro_trend == 'Bullish' and trends_map['15m'] == 'Bearish':
+            trends_map['15m'] = 'Range'
+        
+        row_data['1H'] = trends_map['1H']
+        row_data['15m'] = trends_map['15m']
+
+        # Calcul du score MTF pondéré
         w_bull = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bullish')
         w_bear = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] == 'Bearish')
         
+        # Quality basée sur l'alignement des hauts timeframes
         quality = 'C'
         if trends_map['D'] == trends_map['M']: quality = 'B'
         if trends_map['D'] == trends_map['M'] == trends_map['W']: quality = 'A'
-        if quality == 'A' and scores_map['D'] > 25: quality = 'A+'
+        if quality == 'A' and scores_map['D'] > 70: quality = 'A+'
 
         if w_bull > w_bear:
             perc = (w_bull / TOTAL_WEIGHT) * 100
@@ -264,7 +430,7 @@ def analyze_market(account_id, access_token):
     bar.empty(); status.empty()
     return pd.DataFrame(results)
 
-# ==================== EXPORTS (FIX PDF) ====================
+# ==================== EXPORTS (PDF) ====================
 def create_pdf(df):
     pdf = FPDF()
     pdf.add_page()
@@ -311,7 +477,7 @@ def main():
     except: st.error("Secrets OANDA manquants."); st.stop()
 
     if st.button("LANCER L'ANALYSE TOP-DOWN", type="primary", use_container_width=True):
-        with st.spinner("Analyse SMA 200 & Structures de marché..."):
+        with st.spinner("Analyse Institutionnelle Multi-Timeframe..."):
             df = analyze_market(acc, tok)
             if not df.empty:
                 df = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False]) 
