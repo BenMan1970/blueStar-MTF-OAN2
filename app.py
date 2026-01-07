@@ -219,7 +219,7 @@ def calc_institutional_trend_intraday(df, macro_trend=None):
     return "Range", 30
 
 # ==========================================
-# 5. DATA FETCHING (CORRIGÉ)
+# 5. DATA FETCHING
 # ==========================================
 def get_oanda_data(client, instrument, granularity, count):
     try:
@@ -247,7 +247,6 @@ def get_oanda_data(client, instrument, granularity, count):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_cached_oanda_data(access_token, environment, inst, gran, cnt):
-    """Wrapper caché qui recrée le client à l'intérieur (Fix UnhashableParamError)"""
     client_instance = oandapyV20.API(access_token=access_token, environment=environment)
     return get_oanda_data(client_instance, inst, gran, cnt)
 
@@ -272,13 +271,11 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
     pct_special = {}
     scores_special = {}
 
-    # Fetch Forex
     for pair in forex_pairs:
         df = get_cached_oanda_data(access_token, environment, pair, gran, 100)
         if df is not None and not df.empty: 
             prices[pair] = df['Close']
 
-    # Fetch Indices & Metaux
     for symbol, name in special_assets.items():
         df = get_cached_oanda_data(access_token, environment, symbol, gran, 100)
         if df is not None and not df.empty:
@@ -288,7 +285,6 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
             cat = "INDICES" if symbol in indices else "METAUX"
             pct_special[name] = {'pct': pct, 'cat': cat}
 
-    # Calc Forces Devises
     if not prices: 
         return None, None, None, None
     
@@ -493,8 +489,11 @@ def analyze_market(access_token, environment):
 # ==========================================
 def create_pdf(df, heatmap_data=None):
     """
-    Génère un PDF compatible et fonctionnel avec Heatmap
+    Génère un PDF compatible et fonctionnel avec Heatmap et corrections de sauts de page
     """
+    # Nettoyage des données "None" pour le PDF
+    df = df.fillna("-")
+
     try:
         from fpdf import FPDF
         
@@ -511,6 +510,7 @@ def create_pdf(df, heatmap_data=None):
                     self.ln(3)
         
         pdf = PDF(orientation='L')  # 'L' = Landscape (Paysage)
+        pdf.set_auto_page_break(False) # On gère les sauts de page manuellement pour éviter les coupures
         pdf.add_page()
         
         # ===== SECTION 1: HEATMAP FOREX =====
@@ -625,6 +625,10 @@ def create_pdf(df, heatmap_data=None):
                 pdf.ln(10)
         
         # ===== SECTION 2: TABLEAU GPS =====
+        # Vérifier si on a assez de place pour le header, sinon nouvelle page
+        if pdf.get_y() > 170:
+            pdf.add_page()
+
         pdf.set_font("Arial", "B", 14)
         pdf.set_fill_color(30, 58, 138)
         pdf.set_text_color(255, 255, 255)
@@ -632,7 +636,7 @@ def create_pdf(df, heatmap_data=None):
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
         
-        # Configuration des colonnes (optimisée pour paysage)
+        # Configuration des colonnes
         cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         col_widths = {
             'Paire': 22,
@@ -642,26 +646,32 @@ def create_pdf(df, heatmap_data=None):
             'ATR_Daily': 19, 'ATR_H1': 19, 'ATR_15m': 19
         }
         
-        # En-têtes du tableau
-        pdf.set_fill_color(30, 58, 138)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Arial", "B", 9)  # Police légèrement plus grande en paysage
-        
-        # Vérifier s'il y a assez de place, sinon nouvelle page
-        if pdf.get_y() > 170:
-            pdf.add_page()
-        
-        for col in cols:
-            pdf.cell(col_widths[col], 8, col.replace('_', ' '), 1, 0, 'C', True)
-        pdf.ln()
+        def print_table_header():
+            pdf.set_fill_color(30, 58, 138)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Arial", "B", 9)
+            for col in cols:
+                pdf.cell(col_widths[col], 8, col.replace('_', ' '), 1, 0, 'C', True)
+            pdf.ln()
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Arial", "", 8)
+
+        print_table_header()
         
         # Lignes de données
-        pdf.set_font("Arial", "", 8)  # Police des données
+        pdf.set_font("Arial", "", 8)
         pdf.set_text_color(0, 0, 0)
+        
         for idx, row in df.iterrows():
+            # Vérification saut de page
+            if pdf.get_y() > 185: # Limite pour Paysage
+                pdf.add_page() # UN SEUL add_page()
+                print_table_header() # Réimprimer l'en-tête
+
             for col in cols:
                 val = str(row[col])
-                
+                if val == "None" or val == "nan": val = "-"
+
                 # Couleurs selon le contenu
                 if col in ['M', 'W', 'D', '4H', '1H', '15m', 'MTF']:
                     if "Bull" in val and "Retracement" not in val:
@@ -706,24 +716,11 @@ def create_pdf(df, heatmap_data=None):
             
             pdf.ln()
             pdf.set_text_color(0, 0, 0)
-            
-            # Nouvelle page si nécessaire
-            if pdf.get_y() > 180:  # Limite ajustée pour paysage
-                pdf.add_page()
-                pdf.add_page()
-                pdf.set_font("Arial", "B", 8)
-                pdf.set_fill_color(30, 58, 138)
-                pdf.set_text_color(255, 255, 255)
-                for col in cols:
-                    pdf.cell(col_widths[col], 8, col.replace('_', ' '), 1, 0, 'C', True)
-                pdf.ln()
-                pdf.set_font("Arial", "", 7)
         
         # Génération du buffer
         buffer = BytesIO()
         pdf_output = pdf.output(dest='S')
         
-        # Gestion compatibilité fpdf v1 vs v2
         if isinstance(pdf_output, str):
             buffer.write(pdf_output.encode('latin-1'))
         else:
@@ -734,7 +731,6 @@ def create_pdf(df, heatmap_data=None):
         
     except Exception as e:
         logging.error(f"Erreur critique PDF : {e}")
-        # En cas d'erreur, créer un PDF minimal valide
         try:
             pdf = FPDF()
             pdf.add_page()
@@ -794,6 +790,9 @@ def main():
     # --- AFFICHAGE DES RÉSULTATS (PERSISTANT) ---
     if st.session_state.get('df') is not None:
         df = st.session_state['df']
+        # Suppression des None/NaN pour l'affichage
+        df = df.fillna("") 
+        
         data_heat = st.session_state.get('heatmap_data')
         
         # -- AFFICHAGE HEATMAP --
@@ -845,6 +844,7 @@ def main():
         # Calcul hauteur dynamique
         h = min(600, (len(df) + 1) * 35 + 3)
         
+        # Affichage avec fillna pour éviter "None"
         st.dataframe(
             df[cols_order].style.apply(quality_style, axis=0).applymap(style_map), 
             height=h, 
