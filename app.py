@@ -9,7 +9,6 @@ import time
 # Note: pip install fpdf
 try:
     from fpdf import FPDF
-    from fpdf.enums import XPos, YPos
 except ImportError:
     st.warning("⚠️ La librairie 'fpdf' est requise pour l'export PDF. Installez-la via: pip install fpdf")
 
@@ -430,40 +429,146 @@ def analyze_market(account_id, access_token):
     return pd.DataFrame(results)
 
 def create_pdf(df):
+    """Génère un PDF optimisé en mode paysage"""
     try:
-        pdf = FPDF()
+        pdf = FPDF(orientation='L', unit='mm', format='A4')  # MODE PAYSAGE
         pdf.add_page()
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 10, "Bluestar GPS Report V2.1", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
-        pdf.ln(5)
         
+        # En-tête
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "BLUESTAR HEDGE FUND GPS V2.1", ln=True, align="C")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
+        pdf.ln(3)
+        
+        # Colonnes du tableau
         cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
-        w = pdf.w / (len(cols) + 1)
         
-        pdf.set_font("Helvetica", "B", 6)
-        for c in cols: 
-            pdf.cell(w, 8, c.replace('_', ' '), border=1, align='C', new_x=XPos.RIGHT, new_y=YPos.TOP)
+        # Largeurs optimisées pour paysage (297mm - marges)
+        col_widths = {
+            'Paire': 22,
+            'M': 20, 'W': 20, 'D': 20, '4H': 20, '1H': 20, '15m': 20,
+            'MTF': 28,
+            'Quality': 18,
+            'ATR_Daily': 18, 'ATR_H1': 18, 'ATR_15m': 18
+        }
+        
+        # En-têtes du tableau
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(30, 58, 138)  # Bleu foncé
+        pdf.set_text_color(255, 255, 255)  # Texte blanc
+        
+        for c in cols:
+            pdf.cell(col_widths[c], 8, c.replace('_', ' '), border=1, align='C', fill=True)
         pdf.ln()
         
-        pdf.set_font("Helvetica", "", 6)
+        # Lignes de données
+        pdf.set_font("Helvetica", "", 7)
+        
         for _, row in df.iterrows():
             for c in cols:
                 val = str(row[c])
-                pdf.set_fill_color(255, 255, 255)
-                if "Bull" in val and "Retracement" not in val: pdf.set_fill_color(46, 204, 113)
-                elif "Bear" in val and "Retracement" not in val: pdf.set_fill_color(231, 76, 60)
-                elif "Retracement Bull" in val: pdf.set_fill_color(125, 206, 160)
-                elif "Retracement Bear" in val: pdf.set_fill_color(241, 148, 138)
-                elif "Range" in val: pdf.set_fill_color(149, 165, 166)
                 
-                pdf.cell(w, 8, val, border=1, align='C', fill=True, new_x=XPos.RIGHT, new_y=YPos.TOP)
+                # Couleurs selon la valeur
+                pdf.set_fill_color(255, 255, 255)  # Blanc par défaut
+                pdf.set_text_color(0, 0, 0)  # Texte noir
+                
+                if "Bull" in val and "Retracement" not in val:
+                    pdf.set_fill_color(46, 204, 113)  # Vert
+                    pdf.set_text_color(255, 255, 255)
+                elif "Bear" in val and "Retracement" not in val:
+                    pdf.set_fill_color(231, 76, 60)  # Rouge
+                    pdf.set_text_color(255, 255, 255)
+                elif "Retracement Bull" in val:
+                    pdf.set_fill_color(125, 206, 160)  # Vert clair
+                    pdf.set_text_color(255, 255, 255)
+                elif "Retracement Bear" in val:
+                    pdf.set_fill_color(241, 148, 138)  # Rouge clair
+                    pdf.set_text_color(255, 255, 255)
+                elif "Range" in val:
+                    pdf.set_fill_color(149, 165, 166)  # Gris
+                    pdf.set_text_color(255, 255, 255)
+                elif c == 'Quality':
+                    # Couleurs spéciales pour Quality
+                    if val == 'A+':
+                        pdf.set_fill_color(251, 191, 36)  # Or
+                    elif val == 'A':
+                        pdf.set_fill_color(163, 230, 53)  # Vert citron
+                    elif val.startswith('B'):
+                        pdf.set_fill_color(96, 165, 250)  # Bleu
+                    else:
+                        pdf.set_fill_color(156, 163, 175)  # Gris
+                    pdf.set_text_color(0, 0, 0)
+                
+                # Tronquer le texte si trop long
+                if len(val) > 15:
+                    val = val[:13] + '..'
+                
+                pdf.cell(col_widths[c], 7, val, border=1, align='C', fill=True)
+            
             pdf.ln()
+            pdf.set_text_color(0, 0, 0)  # Reset couleur texte
+        
+        # Légende
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(0, 5, "LEGEND:", ln=True)
+        pdf.set_font("Helvetica", "", 7)
+        
+        legends = [
+            ("Bullish", 46, 204, 113),
+            ("Bearish", 231, 76, 60),
+            ("Retracement Bull", 125, 206, 160),
+            ("Retracement Bear", 241, 148, 138),
+            ("Range", 149, 165, 166),
+            ("Quality A+", 251, 191, 36),
+            ("Quality A", 163, 230, 53),
+            ("Quality B", 96, 165, 250)
+        ]
+        
+        x_start = 10
+        y_pos = pdf.get_y()
+        for legend, r, g, b in legends:
+            pdf.set_fill_color(r, g, b)
+            pdf.rect(x_start, y_pos, 4, 4, 'F')
+            pdf.set_xy(x_start + 5, y_pos)
+            pdf.cell(35, 4, legend)
+            x_start += 40
+            if x_start > 250:
+                x_start = 10
+                y_pos += 5
+                pdf.set_xy(x_start, y_pos)
+        
+        # Générer le buffer
+        buffer = BytesIO()
+        pdf_output = pdf.output(dest='S')
+        
+        # Gestion de la compatibilité Python 2/3
+        if isinstance(pdf_output, str):
+            buffer.write(pdf_output.encode('latin-1'))
+        else:
+            buffer.write(pdf_output)
+        
+        buffer.seek(0)
+        return buffer.getvalue()
+        
+    except Exception as e:
+        # En cas d'erreur, créer un PDF minimal avec le message d'erreur
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 10, "PDF Generation Error", ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 10, f"Error: {str(e)}")
         
         buffer = BytesIO()
-        pdf.output(buffer)
+        pdf_output = pdf.output(dest='S')
+        if isinstance(pdf_output, str):
+            buffer.write(pdf_output.encode('latin-1'))
+        else:
+            buffer.write(pdf_output)
+        buffer.seek(0)
         return buffer.getvalue()
-    except:
-        return b"Error generating PDF"
 
 # ==========================================
 # UI PRINCIPALE
@@ -476,71 +581,4 @@ def main():
         acc = st.secrets["OANDA_ACCOUNT_ID"]
         tok = st.secrets["OANDA_ACCESS_TOKEN"]
     except Exception:
-        st.error("❌ Secrets OANDA manquants")
-        st.stop()
-
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        show_only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
-        st.info("Le cache dure 10 minutes pour optimiser les performances API.")
-
-    if st.button("🚀 LANCER L'ANALYSE TOUS ACTIFS", type="primary", use_container_width=True):
-        with st.spinner("Analyse Multi-Timeframe en cours..."):
-            df = analyze_market(acc, tok)
-        
-        if not df.empty:
-            # Filtrage UX
-            if show_only_best:
-                df = df[df['Quality'].isin(['A+', 'A'])]
-            
-            # Tri
-            df = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False]) 
-            st.session_state.df = df
-    
-    if "df" in st.session_state:
-        df = st.session_state.df
-        
-        # --- COMMAND CENTER ---
-        c1, c2, c3, c4 = st.columns(4)
-        total = len(df)
-        a_plus = len(df[df['Quality'] == 'A+'])
-        a_grade = len(df[df['Quality'] == 'A'])
-        b_grade = len(df[df['Quality'].str.startswith('B')])
-        
-        c1.metric("Total Analyzed", total)
-        c2.metric("Setups A+ (GOLD)", a_plus, delta_color="inverse")
-        c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
-        c4.metric("Setups B (BLUE)", b_grade, delta_color="inverse")
-        
-        # --- TABLEAU STYLE ---
-        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
-        
-        def style_map(v):
-            if isinstance(v, str):
-                if "Bull" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bullish']}; color:white; font-weight:bold"
-                if "Bear" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bearish']}; color:white; font-weight:bold"
-                if "Retracement Bull" in v: return f"background-color: {TREND_COLORS['Retracement Bull']}; color:white"
-                if "Retracement Bear" in v: return f"background-color: {TREND_COLORS['Retracement Bear']}; color:white"
-                if "Range" in v: return f"background-color: {TREND_COLORS['Range']}; color:white"
-            return ""
-
-        def quality_style(s):
-            if s.name == 'Quality':
-                return [f"color: black; font-weight:bold; background-color: {GRADE_COLORS.get(x, 'grey')}" for x in s]
-            return [''] * len(s)
-
-        st.dataframe(
-            df[cols_order].style.apply(quality_style, axis=0).applymap(style_map), 
-            height=min(600, (len(df)+1)*35 + 10), 
-            use_container_width=True
-        )
-        
-        # --- EXPORTS ---
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("📄 Télécharger PDF", create_pdf(df[cols_order]), "Bluestar_GPS.pdf", "application/pdf", use_container_width=True)
-        with c2:
-            st.download_button("📊 Télécharger CSV", df[cols_order].to_csv(index=False).encode(), "Bluestar_GPS.csv", "text/csv", use_container_width=True)
-
-if __name__ == "__main__":
-    main()
+        st.error("
