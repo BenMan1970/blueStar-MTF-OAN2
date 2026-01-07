@@ -31,7 +31,7 @@ FOREX_PAIRS_EXTENDED = [
     'EUR_GBP', 'EUR_JPY', 'EUR_AUD', 'EUR_CAD', 'EUR_CHF', 'EUR_NZD',
     'GBP_JPY', 'GBP_AUD', 'GBP_CAD', 'GBP_CHF', 'GBP_NZD',
     'AUD_JPY', 'AUD_CAD', 'AUD_CHF', 'AUD_NZD',
-    'CAD_JPY', 'CAD_CHF', 'NZD_JPY', 'NZD_CAD', 'NZD_CHF', 'CHF_JPY',
+    'CAD_JPY', 'CAD_CHF', 'NZDCAD', 'NZD_CHF', 'CHF_JPY',
     'XAU_USD', 'XPT_USD', 'US30_USD', 'SPX500_USD', 'NAS100_USD'
 ]
 
@@ -428,147 +428,277 @@ def analyze_market(account_id, access_token):
     status.empty()
     return pd.DataFrame(results)
 
+# ==========================================
+# GÉNÉRATION PDF PROFESSIONNELLE (AMÉLIORÉE)
+# ==========================================
+
 def create_pdf(df):
-    """Génère un PDF optimisé en mode paysage"""
+    """
+    Génère un PDF professionnel pour analystes avec encodage garanti
+    et présentation optimisée
+    """
     try:
-        pdf = FPDF(orientation='L', unit='mm', format='A4')  # MODE PAYSAGE
+        # Initialiser PDF en mode paysage
+        pdf = FPDF(orientation='L', unit='mm', format='A4')
         pdf.add_page()
         
-        # En-tête
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "BLUESTAR HEDGE FUND GPS V2.1", ln=True, align="C")
-        pdf.set_font("Helvetica", "", 9)
+        # =================== EN-TÊTE ===================
+        # Titre principal
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(30, 58, 138)  # Bleu institutionnel
+        pdf.cell(0, 15, "BLUESTAR HEDGE FUND GPS V2.1", ln=True, align="C")
+        
+        # Sous-titre
+        pdf.set_font("Helvetica", "I", 11)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(0, 8, "Multi-Timeframe Institutional Scanner", ln=True, align="C")
+        
+        # Date et heure
+        pdf.set_font("Helvetica", "", 10)
         pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
-        pdf.ln(3)
         
-        # Colonnes du tableau
-        cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
+        # Ligne séparatrice
+        pdf.set_draw_color(30, 58, 138)
+        pdf.line(10, pdf.get_y() + 3, 287, pdf.get_y() + 3)
+        pdf.ln(8)
         
-        # Largeurs optimisées pour paysage (297mm - marges)
+        # =================== TABLEAU ===================
+        # Colonnes avec largeurs optimisées
         col_widths = {
-            'Paire': 22,
-            'M': 20, 'W': 20, 'D': 20, '4H': 20, '1H': 20, '15m': 20,
-            'MTF': 28,
-            'Quality': 18,
+            'Paire': 18,
+            'M': 16, 'W': 16, 'D': 16, '4H': 16, '1H': 16, '15m': 16,
+            'MTF': 25,
+            'Quality': 15,
             'ATR_Daily': 18, 'ATR_H1': 18, 'ATR_15m': 18
         }
         
-        # En-têtes du tableau
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_fill_color(30, 58, 138)  # Bleu foncé
-        pdf.set_text_color(255, 255, 255)  # Texte blanc
+        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 
+                     'ATR_Daily', 'ATR_H1', 'ATR_15m']
         
-        for c in cols:
-            pdf.cell(col_widths[c], 8, c.replace('_', ' '), border=1, align='C', fill=True)
+        # En-têtes du tableau
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(40, 68, 148)
+        pdf.set_text_color(255, 255, 255)
+        
+        # Noms complets des colonnes pour plus de clarté
+        headers = {
+            'Paire': 'PAIR',
+            'M': 'MONTHLY',
+            'W': 'WEEKLY',
+            'D': 'DAILY',
+            '4H': '4H',
+            '1H': '1H',
+            '15m': '15M',
+            'MTF': 'CONSENSUS',
+            'Quality': 'GRADE',
+            'ATR_Daily': 'ATR D',
+            'ATR_H1': 'ATR 1H',
+            'ATR_15m': 'ATR 15M'
+        }
+        
+        for col in cols_order:
+            pdf.cell(col_widths[col], 8, headers[col], border=1, align='C', fill=True)
         pdf.ln()
         
-        # Lignes de données
-        pdf.set_font("Helvetica", "", 7)
+        # Données du tableau
+        pdf.set_font("Helvetica", "", 8)
         
         for _, row in df.iterrows():
-            for c in cols:
-                val = str(row[c])
+            for col in cols_order:
+                val = str(row[col])
                 
-                # Couleurs selon la valeur
-                pdf.set_fill_color(255, 255, 255)  # Blanc par défaut
-                pdf.set_text_color(0, 0, 0)  # Texte noir
+                # FORMATAGE DES VALEURS POUR MEILLEURE LISIBILITÉ
+                if col == 'Paire':
+                    val = val.replace('/', '')
+                elif col in ['M', 'W', 'D', '4H', '1H', '15m']:
+                    # Simplifier les tendances pour économiser de l'espace
+                    if "Bullish" in val:
+                        val = "BULL"
+                    elif "Bearish" in val:
+                        val = "BEAR"
+                    elif "Retracement Bull" in val:
+                        val = "R-BULL"
+                    elif "Retracement Bear" in val:
+                        val = "R-BEAR"
+                    elif "Range" in val:
+                        val = "RANGE"
                 
-                if "Bull" in val and "Retracement" not in val:
-                    pdf.set_fill_color(46, 204, 113)  # Vert
-                    pdf.set_text_color(255, 255, 255)
-                elif "Bear" in val and "Retracement" not in val:
-                    pdf.set_fill_color(231, 76, 60)  # Rouge
-                    pdf.set_text_color(255, 255, 255)
+                # COULEURS DES CELLULES
+                fill_color = (255, 255, 255)  # Blanc par défaut
+                text_color = (0, 0, 0)       # Noir par défaut
+                
+                # Bullish
+                if "Bullish" in val and "Retracement" not in val:
+                    fill_color = (46, 204, 113)
+                    text_color = (255, 255, 255)
+                # Bearish
+                elif "Bearish" in val and "Retracement" not in val:
+                    fill_color = (231, 76, 60)
+                    text_color = (255, 255, 255)
+                # Retracement Bull
                 elif "Retracement Bull" in val:
-                    pdf.set_fill_color(125, 206, 160)  # Vert clair
-                    pdf.set_text_color(255, 255, 255)
+                    fill_color = (125, 206, 160)
+                    text_color = (255, 255, 255)
+                # Retracement Bear
                 elif "Retracement Bear" in val:
-                    pdf.set_fill_color(241, 148, 138)  # Rouge clair
-                    pdf.set_text_color(255, 255, 255)
+                    fill_color = (241, 148, 138)
+                    text_color = (255, 255, 255)
+                # Range
                 elif "Range" in val:
-                    pdf.set_fill_color(149, 165, 166)  # Gris
-                    pdf.set_text_color(255, 255, 255)
-                elif c == 'Quality':
-                    # Couleurs spéciales pour Quality
+                    fill_color = (149, 165, 166)
+                    text_color = (255, 255, 255)
+                # Grades
+                elif col == 'Quality':
                     if val == 'A+':
-                        pdf.set_fill_color(251, 191, 36)  # Or
+                        fill_color = (255, 215, 0)  # Or
+                        text_color = (0, 0, 0)
                     elif val == 'A':
-                        pdf.set_fill_color(163, 230, 53)  # Vert citron
+                        fill_color = (76, 175, 80)  # Vert
+                        text_color = (255, 255, 255)
                     elif val.startswith('B'):
-                        pdf.set_fill_color(96, 165, 250)  # Bleu
-                    else:
-                        pdf.set_fill_color(156, 163, 175)  # Gris
-                    pdf.set_text_color(0, 0, 0)
+                        fill_color = (33, 150, 243)  # Bleu
+                        text_color = (255, 255, 255)
+                    else:  # C
+                        fill_color = (158, 158, 158)  # Gris
+                        text_color = (255, 255, 255)
                 
-                # Tronquer le texte si trop long
-                if len(val) > 15:
-                    val = val[:13] + '..'
+                # Appliquer les couleurs
+                pdf.set_fill_color(*fill_color)
+                pdf.set_text_color(*text_color)
                 
-                pdf.cell(col_widths[c], 7, val, border=1, align='C', fill=True)
+                # Tronquer si trop long
+                if len(val) > 12:
+                    val = val[:10] + '..'
+                
+                # Dessiner la cellule
+                pdf.cell(col_widths[col], 7, val, border=1, align='C', fill=True)
             
             pdf.ln()
-            pdf.set_text_color(0, 0, 0)  # Reset couleur texte
         
-        # Légende
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(0, 5, "LEGEND:", ln=True)
-        pdf.set_font("Helvetica", "", 7)
+        # Saut de ligne avant légende
+        pdf.ln(5)
         
-        legends = [
-            ("Bullish", 46, 204, 113),
-            ("Bearish", 231, 76, 60),
-            ("Retracement Bull", 125, 206, 160),
-            ("Retracement Bear", 241, 148, 138),
-            ("Range", 149, 165, 166),
-            ("Quality A+", 251, 191, 36),
-            ("Quality A", 163, 230, 53),
-            ("Quality B", 96, 165, 250)
+        # =================== LÉGENDE DÉTAILLÉE ===================
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(30, 58, 138)
+        pdf.cell(0, 8, "COLOR LEGEND & SYMBOLS:", ln=True)
+        
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(0, 0, 0)
+        
+        # Légende en deux colonnes
+        y_start = pdf.get_y()
+        x_left = 10
+        x_right = 110
+        
+        # Colonne gauche
+        pdf.set_xy(x_left, y_start)
+        
+        legend_items_left = [
+            ("BULL", "Strong Bullish Trend", (46, 204, 113)),
+            ("BEAR", "Strong Bearish Trend", (231, 76, 60)),
+            ("R-BULL", "Bullish Retracement", (125, 206, 160)),
+            ("R-BEAR", "Bearish Retracement", (241, 148, 138)),
+            ("RANGE", "Sideways Market", (149, 165, 166))
         ]
         
-        x_start = 10
-        y_pos = pdf.get_y()
-        for legend, r, g, b in legends:
-            pdf.set_fill_color(r, g, b)
-            pdf.rect(x_start, y_pos, 4, 4, 'F')
-            pdf.set_xy(x_start + 5, y_pos)
-            pdf.cell(35, 4, legend)
-            x_start += 40
-            if x_start > 250:
-                x_start = 10
-                y_pos += 5
-                pdf.set_xy(x_start, y_pos)
+        for symbol, desc, color in legend_items_left:
+            # Carré de couleur
+            pdf.set_fill_color(*color)
+            pdf.rect(pdf.get_x(), pdf.get_y() + 1, 4, 4, 'F')
+            
+            # Texte
+            pdf.set_xy(pdf.get_x() + 6, pdf.get_y())
+            pdf.cell(20, 5, symbol)
+            
+            pdf.set_xy(pdf.get_x() + 20, pdf.get_y())
+            pdf.cell(70, 5, desc)
+            
+            pdf.ln(6)
         
-        # Générer le buffer
+        # Colonne droite (Grades)
+        pdf.set_xy(x_right, y_start)
+        
+        legend_items_right = [
+            ("A+", "Premium Setup (Gold)", (255, 215, 0)),
+            ("A", "High Quality (Green)", (76, 175, 80)),
+            ("B / B+ / B-", "Good Setup (Blue)", (33, 150, 243)),
+            ("C", "Neutral / Wait (Gray)", (158, 158, 158))
+        ]
+        
+        for symbol, desc, color in legend_items_right:
+            # Carré de couleur
+            pdf.set_fill_color(*color)
+            pdf.rect(pdf.get_x(), pdf.get_y() + 1, 4, 4, 'F')
+            
+            # Texte
+            pdf.set_xy(pdf.get_x() + 6, pdf.get_y())
+            pdf.cell(25, 5, symbol)
+            
+            pdf.set_xy(pdf.get_x() + 25, pdf.get_y())
+            pdf.cell(70, 5, desc)
+            
+            pdf.ln(6)
+        
+        # =================== NOTES TECHNIQUES ===================
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(100, 100, 100)
+        
+        notes = [
+            "• MTF Consensus: Weighted average across all timeframes (M5, W4, D4, 4H2.5, 1H1.5, 15M1)",
+            "• ATR Values: Average True Range - higher values indicate greater volatility",
+            "• Grade A+/A: Highest conviction setups with multi-timeframe alignment",
+            "• Retracement: Counter-trend move within a larger established trend",
+            f"• Total Instruments Analyzed: {len(df)} • Analysis Time: {datetime.now().strftime('%H:%M UTC')}"
+        ]
+        
+        for note in notes:
+            pdf.cell(0, 4, note, ln=True)
+        
+        # =================== PIED DE PAGE ===================
+        pdf.set_y(-15)
+        pdf.set_font("Helvetica", "I", 7)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 10, "Bluestar GPS v2.1 - Institutional Use Only - Confidential", 0, 0, 'C')
+        
+        # =================== GÉNÉRATION DU PDF ===================
         buffer = BytesIO()
         pdf_output = pdf.output(dest='S')
         
-        # Gestion de la compatibilité Python 2/3
+        # ENCODAGE LATIN-1 POUR COMPATIBILITÉ MAXIMALE
         if isinstance(pdf_output, str):
-            buffer.write(pdf_output.encode('latin-1'))
+            # Convertir en latin-1 (standard PDF)
+            buffer.write(pdf_output.encode('latin-1', errors='replace'))
         else:
+            # Déjà en bytes
             buffer.write(pdf_output)
         
         buffer.seek(0)
         return buffer.getvalue()
         
     except Exception as e:
-        # En cas d'erreur, créer un PDF minimal avec le message d'erreur
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 10, "PDF Generation Error", ln=True)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 10, f"Error: {str(e)}")
-        
-        buffer = BytesIO()
-        pdf_output = pdf.output(dest='S')
-        if isinstance(pdf_output, str):
-            buffer.write(pdf_output.encode('latin-1'))
-        else:
-            buffer.write(pdf_output)
-        buffer.seek(0)
-        return buffer.getvalue()
+        # Fallback en cas d'erreur
+        return create_fallback_pdf(str(e))
+
+def create_fallback_pdf(error_msg=""):
+    """PDF minimal en cas d'erreur"""
+    pdf = FPDF(orientation='L')
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 20, "BLUESTAR GPS REPORT", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 12)
+    pdf.multi_cell(0, 10, "Report generation encountered an issue.")
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "I", 10)
+    pdf.multi_cell(0, 8, f"Error: {error_msg[:200]}")
+    pdf.ln(10)
+    pdf.multi_cell(0, 8, "Please use CSV export or try again later.")
+    
+    buffer = BytesIO()
+    buffer.write(pdf.output(dest='S').encode('latin-1'))
+    buffer.seek(0)
+    return buffer.getvalue()
 
 # ==========================================
 # UI PRINCIPALE
@@ -586,66 +716,4 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ Configuration")
-        show_only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
-        st.info("Le cache dure 10 minutes pour optimiser les performances API.")
-
-    if st.button("🚀 LANCER L'ANALYSE TOUS ACTIFS", type="primary", use_container_width=True):
-        with st.spinner("Analyse Multi-Timeframe en cours..."):
-            df = analyze_market(acc, tok)
-        
-        if not df.empty:
-            # Filtrage UX
-            if show_only_best:
-                df = df[df['Quality'].isin(['A+', 'A'])]
-            
-            # Tri
-            df = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False]) 
-            st.session_state.df = df
-    
-    if "df" in st.session_state:
-        df = st.session_state.df
-        
-        # --- COMMAND CENTER ---
-        c1, c2, c3, c4 = st.columns(4)
-        total = len(df)
-        a_plus = len(df[df['Quality'] == 'A+'])
-        a_grade = len(df[df['Quality'] == 'A'])
-        b_grade = len(df[df['Quality'].str.startswith('B')])
-        
-        c1.metric("Total Analyzed", total)
-        c2.metric("Setups A+ (GOLD)", a_plus, delta_color="inverse")
-        c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
-        c4.metric("Setups B (BLUE)", b_grade, delta_color="inverse")
-        
-        # --- TABLEAU STYLE ---
-        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
-        
-        def style_map(v):
-            if isinstance(v, str):
-                if "Bull" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bullish']}; color:white; font-weight:bold"
-                if "Bear" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bearish']}; color:white; font-weight:bold"
-                if "Retracement Bull" in v: return f"background-color: {TREND_COLORS['Retracement Bull']}; color:white"
-                if "Retracement Bear" in v: return f"background-color: {TREND_COLORS['Retracement Bear']}; color:white"
-                if "Range" in v: return f"background-color: {TREND_COLORS['Range']}; color:white"
-            return ""
-
-        def quality_style(s):
-            if s.name == 'Quality':
-                return [f"color: black; font-weight:bold; background-color: {GRADE_COLORS.get(x, 'grey')}" for x in s]
-            return [''] * len(s)
-
-        st.dataframe(
-            df[cols_order].style.apply(quality_style, axis=0).applymap(style_map), 
-            height=min(600, (len(df)+1)*35 + 10), 
-            use_container_width=True
-        )
-        
-        # --- EXPORTS ---
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("📄 Télécharger PDF", create_pdf(df[cols_order]), "Bluestar_GPS.pdf", "application/pdf", use_container_width=True)
-        with c2:
-            st.download_button("📊 Télécharger CSV", df[cols_order].to_csv(index=False).encode(), "Bluestar_GPS.csv", "text/csv", use_container_width=True)
-
-if __name__ == "__main__":
-    main()
+        show_only_best = st.checkbox("Affic
