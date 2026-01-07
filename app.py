@@ -275,12 +275,13 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
     # Fetch Forex
     for pair in forex_pairs:
         df = get_cached_oanda_data(access_token, environment, pair, gran, 100)
-        if df is not None and not df.empty: prices[pair] = df['Close']
+        if df is not None and not df.empty: 
+            prices[pair] = df['Close']
 
     # Fetch Indices & Metaux
     for symbol, name in special_assets.items():
         df = get_cached_oanda_data(access_token, environment, symbol, gran, 100)
-        if df is not None:
+        if df is not None and not df.empty:
             rsi_series = rsi(df['Close'], 14)
             scores_special[name] = (normalize_score(rsi_series.iloc[-1]), normalize_score(rsi_series.iloc[-2]))
             pct = df['Close'].pct_change().iloc[-1] * 100
@@ -288,7 +289,9 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
             pct_special[name] = {'pct': pct, 'cat': cat}
 
     # Calc Forces Devises
-    if not prices: return None, None, None
+    if not prices: 
+        return None, None, None, None
+    
     df_prices = pd.DataFrame(prices).fillna(method='ffill').fillna(method='bfill')
     currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
     scores_forex = {}
@@ -299,14 +302,18 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
             pair_d = f"{curr}_{opp}"
             pair_i = f"{opp}_{curr}"
             rsi_s = None
-            if pair_d in df_prices.columns: rsi_s = rsi(df_prices[pair_d])
-            elif pair_i in df_prices.columns: rsi_s = rsi(1/df_prices[pair_i])
-            if rsi_s is not None:
+            if pair_d in df_prices.columns: 
+                rsi_s = rsi(df_prices[pair_d])
+            elif pair_i in df_prices.columns: 
+                rsi_s = rsi(1/df_prices[pair_i])
+            if rsi_s is not None and not rsi_s.empty and len(rsi_s) >= 2:
                 total_curr += normalize_score(rsi_s.iloc[-1])
                 total_prev += normalize_score(rsi_s.iloc[-2])
                 count += 1
-        if count > 0: scores_forex[curr] = (total_curr / count, total_prev / count)
-        else: scores_forex[curr] = (5.0, 5.0)
+        if count > 0: 
+            scores_forex[curr] = (total_curr / count, total_prev / count)
+        else: 
+            scores_forex[curr] = (5.0, 5.0)
 
     return scores_forex, scores_special, df_prices, pct_special
 
@@ -791,11 +798,15 @@ def main():
         
         # -- AFFICHAGE HEATMAP --
         st.markdown('<div class="section-title">⚡ MARKET HEATMAP (Momentum)</div>', unsafe_allow_html=True)
-        if data_heat:
+        if data_heat and data_heat[0] is not None:
             s_forex, s_special, df_prices, pct_special = data_heat
-            if s_forex and df_prices is not None:
+            if s_forex and df_prices is not None and not df_prices.empty:
                 html_map = generate_exact_map_html(df_prices, pct_special)
                 st.components.v1.html(html_map, height=600, scrolling=True)
+            else:
+                st.warning("Données heatmap insuffisantes")
+        else:
+            st.info("Lancez une analyse pour afficher la heatmap")
         
         st.markdown("---")
         
