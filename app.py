@@ -497,16 +497,16 @@ def create_pdf(df):
                 self.cell(0, 10, 'Bluestar GPS Report', 0, 1, 'C')
                 self.ln(5)
         
-        pdf = PDF()
+        pdf = PDF(orientation='L')  # 'L' = Landscape (Paysage)
         pdf.add_page()
         pdf.set_font("Arial", "B", 8)
         
-        # Configuration des colonnes
+        # Configuration des colonnes (optimisée pour paysage)
         cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         col_widths = {
-            'Paire': 25,
-            'M': 18, 'W': 18, 'D': 18, '4H': 18, '1H': 18, '15m': 18,
-            'MTF': 28,
+            'Paire': 22,
+            'M': 20, 'W': 20, 'D': 20, '4H': 20, '1H': 20, '15m': 20,
+            'MTF': 30,
             'Quality': 18,
             'ATR_Daily': 20, 'ATR_H1': 20, 'ATR_15m': 20
         }
@@ -514,12 +514,13 @@ def create_pdf(df):
         # En-têtes du tableau
         pdf.set_fill_color(30, 58, 138)
         pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Arial", "B", 9)  # Police légèrement plus grande en paysage
         for col in cols:
             pdf.cell(col_widths[col], 8, col.replace('_', ' '), 1, 0, 'C', True)
         pdf.ln()
         
         # Lignes de données
-        pdf.set_font("Arial", "", 7)
+        pdf.set_font("Arial", "", 8)  # Police des données
         for idx, row in df.iterrows():
             for col in cols:
                 val = str(row[col])
@@ -570,7 +571,8 @@ def create_pdf(df):
             pdf.set_text_color(0, 0, 0)
             
             # Nouvelle page si nécessaire
-            if pdf.get_y() > 270:
+            if pdf.get_y() > 180:  # Limite ajustée pour paysage
+                pdf.add_page()
                 pdf.add_page()
                 pdf.set_font("Arial", "B", 8)
                 pdf.set_fill_color(30, 58, 138)
