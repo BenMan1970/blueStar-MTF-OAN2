@@ -484,31 +484,153 @@ def analyze_market(access_token, environment):
 # ==========================================
 # 8. EXPORT PDF (CORRIGÉ & FONCTIONNEL)
 # ==========================================
-def create_pdf(df):
+def create_pdf(df, heatmap_data=None):
     """
-    Génère un PDF compatible et fonctionnel
+    Génère un PDF compatible et fonctionnel avec Heatmap
     """
     try:
         from fpdf import FPDF
         
         class PDF(FPDF):
             def header(self):
-                self.set_font('Arial', 'B', 16)
+                self.set_font('Arial', 'B', 18)
                 self.cell(0, 10, 'Bluestar GPS Report', 0, 1, 'C')
-                self.ln(5)
+                self.set_font('Arial', 'I', 10)
+                self.set_text_color(100, 100, 100)
+                self.cell(0, 5, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 1, 'C')
+                self.set_text_color(0, 0, 0)
+                self.ln(3)
         
         pdf = PDF(orientation='L')  # 'L' = Landscape (Paysage)
         pdf.add_page()
-        pdf.set_font("Arial", "B", 8)
+        
+        # ===== SECTION 1: HEATMAP FOREX =====
+        if heatmap_data:
+            s_forex, s_special, df_prices, pct_special = heatmap_data
+            if s_forex and df_prices is not None:
+                pdf.set_font("Arial", "B", 14)
+                pdf.set_fill_color(30, 58, 138)
+                pdf.set_text_color(255, 255, 255)
+                pdf.cell(0, 10, ' FOREX STRENGTH HEATMAP', 0, 1, 'L', True)
+                pdf.set_text_color(0, 0, 0)
+                pdf.ln(3)
+                
+                # Calculer les forces relatives
+                currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
+                pct_changes = df_prices.pct_change().iloc[-1] * 100
+                forex_strength = {}
+                
+                for curr in currencies:
+                    total_pct = 0
+                    count = 0
+                    for col in df_prices.columns:
+                        if curr in col:
+                            val = pct_changes[col]
+                            if col.startswith(curr):
+                                total_pct += val
+                            else:
+                                total_pct -= val
+                            count += 1
+                    if count > 0:
+                        forex_strength[curr] = total_pct / count
+                
+                # Trier par force
+                sorted_curr = sorted(forex_strength.items(), key=lambda x: x[1], reverse=True)
+                
+                # Tableau des forces
+                pdf.set_font("Arial", "B", 9)
+                col_w = 35
+                for curr, strength in sorted_curr:
+                    # Couleur selon force
+                    if strength > 0.05:
+                        pdf.set_fill_color(0, 153, 0)  # Vert foncé
+                    elif strength > 0:
+                        pdf.set_fill_color(51, 204, 51)  # Vert clair
+                    elif strength < -0.05:
+                        pdf.set_fill_color(204, 0, 0)  # Rouge foncé
+                    elif strength < 0:
+                        pdf.set_fill_color(255, 51, 0)  # Rouge clair
+                    else:
+                        pdf.set_fill_color(240, 240, 240)  # Neutre
+                    
+                    pdf.set_text_color(255, 255, 255) if abs(strength) > 0.01 else pdf.set_text_color(0, 0, 0)
+                    pdf.cell(col_w, 8, f'{curr}: {strength:+.2f}%', 1, 0, 'C', True)
+                
+                pdf.set_text_color(0, 0, 0)
+                pdf.ln(15)
+                
+                # Indices & Métaux
+                if pct_special:
+                    pdf.set_font("Arial", "B", 12)
+                    pdf.cell(100, 8, 'INDICES', 0, 0, 'L')
+                    pdf.cell(100, 8, 'METAUX', 0, 1, 'L')
+                    pdf.set_font("Arial", "", 9)
+                    
+                    indices_list = [k for k, v in pct_special.items() if v['cat'] == 'INDICES']
+                    metaux_list = [k for k, v in pct_special.items() if v['cat'] == 'METAUX']
+                    
+                    max_len = max(len(indices_list), len(metaux_list))
+                    
+                    for i in range(max_len):
+                        # Indices
+                        if i < len(indices_list):
+                            name = indices_list[i]
+                            pct = pct_special[name]['pct']
+                            if pct > 0.15:
+                                pdf.set_fill_color(0, 153, 0)
+                            elif pct > 0:
+                                pdf.set_fill_color(51, 204, 51)
+                            elif pct < -0.15:
+                                pdf.set_fill_color(204, 0, 0)
+                            elif pct < 0:
+                                pdf.set_fill_color(255, 51, 0)
+                            else:
+                                pdf.set_fill_color(240, 240, 240)
+                            
+                            pdf.set_text_color(255, 255, 255) if abs(pct) > 0.01 else pdf.set_text_color(0, 0, 0)
+                            pdf.cell(100, 7, f'{name}: {pct:+.2f}%', 1, 0, 'C', True)
+                        else:
+                            pdf.cell(100, 7, '', 0, 0)
+                        
+                        # Métaux
+                        if i < len(metaux_list):
+                            name = metaux_list[i]
+                            pct = pct_special[name]['pct']
+                            if pct > 0.15:
+                                pdf.set_fill_color(0, 153, 0)
+                            elif pct > 0:
+                                pdf.set_fill_color(51, 204, 51)
+                            elif pct < -0.15:
+                                pdf.set_fill_color(204, 0, 0)
+                            elif pct < 0:
+                                pdf.set_fill_color(255, 51, 0)
+                            else:
+                                pdf.set_fill_color(240, 240, 240)
+                            
+                            pdf.set_text_color(255, 255, 255) if abs(pct) > 0.01 else pdf.set_text_color(0, 0, 0)
+                            pdf.cell(100, 7, f'{name}: {pct:+.2f}%', 1, 1, 'C', True)
+                        else:
+                            pdf.ln()
+                
+                pdf.set_text_color(0, 0, 0)
+                pdf.ln(10)
+        
+        # ===== SECTION 2: TABLEAU GPS =====
+        pdf.set_font("Arial", "B", 14)
+        pdf.set_fill_color(30, 58, 138)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 10, ' INSTITUTIONAL GPS ANALYSIS', 0, 1, 'L', True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(3)
         
         # Configuration des colonnes (optimisée pour paysage)
         cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         col_widths = {
             'Paire': 22,
-            'M': 20, 'W': 20, 'D': 20, '4H': 20, '1H': 20, '15m': 20,
+            'M': 19, 'W': 19, 'D': 19, '4H': 19, '1H': 19, '15m': 19,
             'MTF': 30,
             'Quality': 18,
-            'ATR_Daily': 20, 'ATR_H1': 20, 'ATR_15m': 20
+            'ATR_Daily': 19, 'ATR_H1': 19, 'ATR_15m': 19
         }
         
         # En-têtes du tableau
@@ -713,9 +835,11 @@ def main():
         # -- EXPORTS --
         c1, c2 = st.columns(2)
         with c1:
+            # Passer les données heatmap au PDF
+            heatmap_data = st.session_state.get('heatmap_data')
             st.download_button(
                 "📄 Télécharger PDF", 
-                create_pdf(df[cols_order]),
+                create_pdf(df[cols_order], heatmap_data),
                 "Bluestar_GPS_Report.pdf", 
                 "application/pdf",
                 use_container_width=True,
