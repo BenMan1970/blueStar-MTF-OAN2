@@ -491,8 +491,10 @@ def create_pdf(df, heatmap_data=None):
     """
     Génère un PDF compatible et fonctionnel avec Heatmap et corrections de sauts de page
     """
-    # Nettoyage des données "None" pour le PDF
+    # Nettoyage rigoureux des données pour le PDF
     df = df.fillna("-")
+    df = df.replace("None", "-")
+    df = df.replace("nan", "-")
 
     try:
         from fpdf import FPDF
@@ -510,7 +512,7 @@ def create_pdf(df, heatmap_data=None):
                     self.ln(3)
         
         pdf = PDF(orientation='L')  # 'L' = Landscape (Paysage)
-        pdf.set_auto_page_break(False) # On gère les sauts de page manuellement pour éviter les coupures
+        pdf.set_auto_page_break(False) # On gère manuellement les sauts de page
         pdf.add_page()
         
         # ===== SECTION 1: HEATMAP FOREX =====
@@ -625,7 +627,6 @@ def create_pdf(df, heatmap_data=None):
                 pdf.ln(10)
         
         # ===== SECTION 2: TABLEAU GPS =====
-        # Vérifier si on a assez de place pour le header, sinon nouvelle page
         if pdf.get_y() > 170:
             pdf.add_page()
 
@@ -663,14 +664,14 @@ def create_pdf(df, heatmap_data=None):
         pdf.set_text_color(0, 0, 0)
         
         for idx, row in df.iterrows():
-            # Vérification saut de page
-            if pdf.get_y() > 185: # Limite pour Paysage
-                pdf.add_page() # UN SEUL add_page()
-                print_table_header() # Réimprimer l'en-tête
+            # Saut de page manuel
+            if pdf.get_y() > 185:
+                pdf.add_page()
+                print_table_header()
 
             for col in cols:
                 val = str(row[col])
-                if val == "None" or val == "nan": val = "-"
+                if val in ["None", "nan", ""]: val = "-"
 
                 # Couleurs selon le contenu
                 if col in ['M', 'W', 'D', '4H', '1H', '15m', 'MTF']:
@@ -790,8 +791,12 @@ def main():
     # --- AFFICHAGE DES RÉSULTATS (PERSISTANT) ---
     if st.session_state.get('df') is not None:
         df = st.session_state['df']
-        # Suppression des None/NaN pour l'affichage
+        
+        # NETTOYAGE STRICT DES DONNÉES AVANT AFFICHAGE
+        # Remplace les NaN et les chaines de caractères "None" ou "nan" par du vide
         df = df.fillna("") 
+        df = df.replace("None", "")
+        df = df.replace("nan", "")
         
         data_heat = st.session_state.get('heatmap_data')
         
@@ -844,7 +849,6 @@ def main():
         # Calcul hauteur dynamique
         h = min(600, (len(df) + 1) * 35 + 3)
         
-        # Affichage avec fillna pour éviter "None"
         st.dataframe(
             df[cols_order].style.apply(quality_style, axis=0).applymap(style_map), 
             height=h, 
