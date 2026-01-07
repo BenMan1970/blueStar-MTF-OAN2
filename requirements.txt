@@ -3,4 +3,6 @@ pandas
 numpy
 requests
 Pillow
-fpdf2
+fpdf          
+oandapyV20     
+pytz          
