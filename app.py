@@ -5,30 +5,12 @@ import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
 import logging
 from datetime import datetime
-from io import BytesIO
-import pytz
 
 # ==========================================
-# 1. IMPORTS ET GESTION D'ERREURS PDF (SAFE MODE)
-# ==========================================
-
-# Détection de la version de fpdf pour compatibilité
-try:
-    from fpdf import FPDF
-    from fpdf.enums import XPos, YPos
-    PDF_V2 = True
-except ImportError:
-    # Fallback si fpdf n'est pas installé
-    FPDF = None
-    XPos = None
-    YPos = None
-    PDF_V2 = False
-
-# ==========================================
-# 2. CONFIGURATION & DESIGN
+# 1. CONFIGURATION & DESIGN
 # ==========================================
 st.set_page_config(
-    page_title="Bluestar GPS V2.3 Ultimate",
+    page_title="Bluestar GPS V2.4 Stable",
     page_icon="🗺️",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -69,12 +51,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialisation de l'état de session
+# Initialisation de l'état (Sticky Results)
 if 'df' not in st.session_state:
     st.session_state['df'] = None
 
 # ==========================================
-# 3. MOTEUR TECHNIQUE
+# 2. MOTEUR TECHNIQUE
 # ==========================================
 def sma(series, length):
     return series.rolling(window=length).mean()
@@ -97,7 +79,7 @@ def rsi(close, period=14):
     return 100 - (100 / (1 + rs))
 
 # ==========================================
-# 4. LOGIQUE MTF INSTITUTIONNELLE
+# 3. LOGIQUE MTF INSTITUTIONNELLE
 # ==========================================
 def calc_institutional_trend_macro(df):
     if len(df) < 50: return 'Range', 0
@@ -223,7 +205,7 @@ def calc_institutional_trend_intraday(df, macro_trend=None):
     return "Range", 30
 
 # ==========================================
-# 5. DATA FETCHING (CORRIGÉ)
+# 4. DATA FETCHING (CORRIGÉ)
 # ==========================================
 def get_oanda_data(client, instrument, granularity, count):
     try:
@@ -251,12 +233,15 @@ def get_oanda_data(client, instrument, granularity, count):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_cached_oanda_data(access_token, environment, inst, gran, cnt):
-    """Wrapper caché qui recrée le client à l'intérieur (Fix UnhashableParamError)"""
+    """
+    Wrapper caché qui recrée le client OANDA à l'intérieur.
+    Résout le problème de 'UnhashableParamError'.
+    """
     client_instance = oandapyV20.API(access_token=access_token, environment=environment)
     return get_oanda_data(client_instance, inst, gran, cnt)
 
 # ==========================================
-# 6. LOGIQUE HEATMAP
+# 5. LOGIQUE HEATMAP
 # ==========================================
 def normalize_score(rsi_value):
     return ((rsi_value - 50) / 50 + 1) * 5
@@ -281,7 +266,7 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
         df = get_cached_oanda_data(access_token, environment, pair, gran, 100)
         if df is not None and not df.empty: prices[pair] = df['Close']
 
-    # Fetch Indices & Metaux
+    # Fetch Special Assets
     for symbol, name in special_assets.items():
         df = get_cached_oanda_data(access_token, environment, symbol, gran, 100)
         if df is not None:
@@ -303,8 +288,10 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
             pair_d = f"{curr}_{opp}"
             pair_i = f"{opp}_{curr}"
             rsi_s = None
-            if pair_d in df_prices.columns: rsi_s = rsi(df_prices[pair_d])
-            elif pair_i in df_prices.columns: rsi_s = rsi(1/df_prices[pair_i])
+            if pair_d in df_prices.columns:
+                rsi_s = rsi(df_prices[pair_d])
+            elif pair_i in df_prices.columns:
+                rsi_s = rsi(1/df_prices[pair_i])
             if rsi_s is not None:
                 total_curr += normalize_score(rsi_s.iloc[-1])
                 total_prev += normalize_score(rsi_s.iloc[-2])
@@ -315,6 +302,7 @@ def calculate_heatmap_data(access_token, environment, gran="H1"):
     return scores_forex, scores_special, df_prices, pct_special
 
 def generate_exact_map_html(df_prices, pct_special):
+    """Génère la Market Map HTML"""
     pct_changes = df_prices.pct_change().iloc[-1] * 100
     def get_bg_color(pct):
         if pct >= 0.15: return "#009900"
@@ -339,7 +327,10 @@ def generate_exact_map_html(df_prices, pct_special):
                 forex_data[base].append({'pair': quote, 'pct': pct})
     scores = {curr: sum(i['pct'] for i in items) for curr, items in forex_data.items()}
     sorted_cols = sorted(scores, key=scores.get, reverse=True)
+
     html = """<!DOCTYPE html><html><head><style>body { font-family: 'Arial', sans-serif; background-color: transparent; margin: 0; padding: 0; }.section-header { color: #aaa; font-size: 14px; font-weight: bold; text-transform: uppercase; margin: 25px 0 10px 0; display: flex; align-items: center; gap: 5px; border-bottom: 2px solid #333; padding-bottom: 5px; }.matrix-row { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 10px; }.currency-col { display: flex; flex-direction: column; min-width: 95px; gap: 1px; }.tile { display: flex; justify-content: space-between; align-items: center; padding: 3px 6px; font-size: 11px; font-weight: bold; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }.sep { background: #eee; color: #000; font-weight: 900; padding: 5px; margin: 2px 0; font-size: 13px; text-transform: uppercase; border-left: 4px solid #333; }.grid-container { display: flex; flex-wrap: wrap; gap: 10px; }.big-box { width: 140px; height: 60px; display: flex; flex-direction: column; justify-content: center; align-items: center; color: white; border-radius: 4px; box-shadow: 0 3px 5px rgba(0,0,0,0.3); text-shadow: 1px 1px 2px rgba(0,0,0,0.5); }.box-name { font-size: 11px; font-weight: bold; margin-bottom: 2px; text-transform: uppercase; }.box-val { font-size: 14px; font-weight: 900; }</style></head><body>"""
+    
+    # FOREX MAP
     html += '<div class="section-header">💱 FOREX MAP</div><div class="matrix-row">'
     for curr in sorted_cols:
         items = forex_data[curr]
@@ -351,30 +342,34 @@ def generate_exact_map_html(df_prices, pct_special):
             col, txt = get_bg_color(x['pct']), get_text_color(x['pct'])
             html += f'<div class="tile" style="background:{col}; color:{txt};"><span>{x["pair"]}</span><span>+{x["pct"]:.2f}%</span></div>'
         html += f'<div class="sep">{curr}</div>'
-        for x in flat:
-             html += f'<div class="tile" style="background:#f0f0f0; color:#333;"><span>{x["pair"]}</span><span>unch</span></div>'
+        for x in flat: html += f'<div class="tile" style="background:#f0f0f0; color:#333;"><span>{x["pair"]}</span><span>unch</span></div>'
         for x in losers:
             col, txt = get_bg_color(x['pct']), get_text_color(x['pct'])
             html += f'<div class="tile" style="background:{col}; color:{txt};"><span>{x["pair"]}</span><span>{x["pct"]:.2f}%</span></div>'
         html += '</div>'
     html += '</div>'
+
+    # INDICES
     html += '<div class="section-header">📊 INDICES</div><div class="grid-container">'
     indices_data = {k: v for k, v in pct_special.items() if v['cat'] == "INDICES"}
     for name, data in indices_data.items():
         pct = data['pct']; col = get_bg_color(pct)
         html += f'<div class="big-box" style="background:{col}"><span class="box-name">{name}</span><span class="box-val">{pct:+.2f}%</span></div>'
     html += '</div>'
+
+    # METAUX
     html += '<div class="section-header">🪙 METAUX</div><div class="grid-container">'
     metaux_data = {k: v for k, v in pct_special.items() if v['cat'] == "METAUX"}
     for name, data in metaux_data.items():
         pct = data['pct']; col = get_bg_color(pct)
         html += f'<div class="big-box" style="background:{col}"><span class="box-name">{name}</span><span class="box-val">{pct:+.2f}%</span></div>'
     html += '</div>'
+
     html += "</body></html>"
     return html
 
 # ==========================================
-# 7. CORE ANALYTICS (GPS)
+# 6. CORE ANALYTICS GPS
 # ==========================================
 def analyze_market(access_token, environment):
     results = []
@@ -412,13 +407,19 @@ def analyze_market(access_token, environment):
                 valid_pair = False
                 break
             if tf == 'M':
-                df = df.resample('ME').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+                df = df.resample('ME').agg({
+                    'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'
+                }).dropna()
                 if len(df) < 50:
                     df_temp = get_cached_oanda_data(access_token, environment, pair, 'D', 2000)
                     if not df_temp.empty:
-                        df = df_temp.resample('ME').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+                        df = df_temp.resample('ME').agg({
+                            'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'
+                        }).dropna()
             elif tf == 'W':
-                df = df.resample('W-FRI').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+                df = df.resample('W-FRI').agg({
+                    'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'
+                }).dropna()
             data_cache[tf] = df
 
         if not valid_pair: continue
@@ -456,6 +457,7 @@ def analyze_market(access_token, environment):
         w_bear = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bearish')
         w_bull += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bull')
         w_bear += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bear')
+        
         high_tf_avg = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
         quality = 'C'
         high_tf_clean = ('Retracement' not in trends_map['D'] and 'Retracement' not in trends_map['M'] and 'Retracement' not in trends_map['W'])
@@ -477,6 +479,7 @@ def analyze_market(access_token, environment):
             perc = (w_bear / TOTAL_WEIGHT) * 100
             final_trend = f"Bearish ({perc:.0f}%)"
         else: final_trend = "Range"
+
         row_data['MTF'] = final_trend
         row_data['Quality'] = quality
         results.append(row_data)
@@ -486,109 +489,47 @@ def analyze_market(access_token, environment):
     return pd.DataFrame(results)
 
 # ==========================================
-# 8. EXPORT PDF (CORRIGÉ & SANS ERREUR)
-# ==========================================
-def create_pdf(df):
-    """
-    Génère un PDF sécurisé, compatible fpdf V1 et V2.
-    Gère les erreurs de manière élégante (return bytes d'erreur si besoin).
-    """
-    try:
-        from fpdf import FPDF
-        
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(0, 10, "Bluestar GPS Report", new_x=XPos.LMARGIN if PDF_V2 else 'L', new_y=YPos.NEXT if PDF_V2 else 'N', align="C")
-        pdf.ln(5)
-        
-        cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
-        w = pdf.w / (len(cols) + 1)
-        
-        # Headers
-        pdf.set_font("Arial", "B", 6)
-        for c in cols: 
-            pdf.cell(w, 8, c.replace('_', ' '), border=1, align='C', new_x=XPos.RIGHT if PDF_V2 else 'R', new_y=YPos.TOP if PDF_V2 else 'T')
-        pdf.ln()
-        
-        # Data rows
-        pdf.set_font("Arial", "", 6)
-        for _, row in df.iterrows():
-            for c in cols:
-                val = str(row[c])
-                pdf.set_fill_color(255, 255, 255)
-                if "Bull" in val and "Retracement" not in val: pdf.set_fill_color(46, 204, 113)
-                elif "Bear" in val and "Retracement" not in val: pdf.set_fill_color(231, 76, 60)
-                elif "Retracement Bull" in val: pdf.set_fill_color(125, 206, 160)
-                elif "Retracement Bear" in val: pdf.set_fill_color(241, 148, 138)
-                elif "Range" in val: pdf.set_fill_color(149, 165, 166)
-                
-                pdf.cell(w, 8, val, border=1, align='C', fill=True, new_x=XPos.RIGHT if PDF_V2 else 'R', new_y=YPos.TOP if PDF_V2 else 'T')
-            pdf.ln()
-        
-        buffer = BytesIO()
-        # Fallback de méthode d'output pour compatibilité
-        try:
-            pdf.output(buffer, dest='S')
-        except:
-            pdf.output(buffer)
-        return buffer.getvalue()
-        
-    except Exception as e:
-        # Si erreur fpdf critique, on retourne un fichier texte simple pour ne pas planter l'app
-        logging.error(f"Erreur PDF Critique : {e}")
-        error_text = f"Erreur lors de la génération PDF:\n{str(e)}"
-        return error_text.encode()
-
-# ==========================================
-# 9. UI PRINCIPALE
+# 7. UI PRINCIPALE (STABLE CSV ONLY)
 # ==========================================
 def main():
     st.markdown("""
         <div class='main-header'>
-            <h2 style='margin:0'>🗺️ BLUESTAR GPS V2.3 ULTIMATE</h2>
-            <div style='font-size:0.9rem; color:#cbd5e1;'>Macro Heatmap & Institutional Grades</div>
+            <h2 style='margin:0'>🗺️ BLUESTAR GPS V2.4 STABLE</h2>
+            <div style='font-size:0.9rem; color:#cbd5e1;'>Heatmap & GPS - No PDF</div>
         </div>
     """, unsafe_allow_html=True)
 
-    # Connexion API
     try:
         acc = st.secrets["OANDA_ACCOUNT_ID"]
         tok = st.secrets["OANDA_ACCESS_TOKEN"]
-        # Récupérer l'env, sinon pratique par défaut
         env = st.secrets.get("OANDA_ENVIRONMENT", "practice")
     except Exception:
         st.error("❌ Secrets OANDA manquants")
         st.stop()
 
-    # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuration")
         granularity = st.selectbox("Timeframe Heatmap", ["M5", "M15", "M30", "H1", "H4", "D"], index=3)
-        st.info("Sticky Results V2.3 Activé")
+        st.success("✅ Mode Stable Activé (PDF Désactivé)")
 
-    # --- LOGIQUE D'ANALYSE ---
-    if st.button("🚀 LANCER L'ANALYSE", type="primary", use_container_width=True, key="run_scan_button"):
-        with st.spinner("⏳ Analyse GPS & Heatmap en cours..."):
-            # 1. GPS
-            df_gps = analyze_market(tok, env)
-            # 2. Heatmap
-            s_forex, s_special, df_prices, pct_special = calculate_heatmap_data(tok, env, gran=granularity)
+    if st.button("🚀 LANCER L'ANALYSE COMPLÈTE", type="primary", use_container_width=True, key="run_scan_button"):
+        with st.spinner("⏳ Analyse Multi-Timeframe & Heatmap en cours..."):
+            df = analyze_market(tok, env)
+            if not df.empty:
+                s_forex, s_special, df_prices, pct_special = calculate_heatmap_data(tok, env, gran=granularity)
         
-        # MISE A JOUR IMMÉDIATE DE LA SESSION (Sticky Results)
-        if not df_gps.empty:
-            st.session_state['df'] = df_gps
+        if not df.empty:
+            # Mise à jour session (Sticky Results)
+            st.session_state['df'] = df
             st.session_state['heatmap_data'] = (s_forex, s_special, df_prices, pct_special)
-            st.success(f"Analyse terminée : {len(df_gps)} setups détectés")
+            st.success(f"Analyse terminée : {len(df)} setups détectés")
 
-    # --- AFFICHAGE DES RÉSULTATS (PERSISTANT) ---
-    # Cette section s'exécute à chaque run et utilise st.session_state
     if st.session_state.get('df') is not None:
         df = st.session_state['df']
         data_heat = st.session_state.get('heatmap_data')
         
         # -- AFFICHAGE HEATMAP --
-        st.markdown('<div class="section-title">⚡ MARKET HEATMAP (Momentum)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">⚡ MARKET HEATMAP</div>', unsafe_allow_html=True)
         if data_heat:
             s_forex, s_special, df_prices, pct_special = data_heat
             if s_forex and df_prices is not None:
@@ -598,23 +539,20 @@ def main():
         st.markdown("---")
         
         # -- AFFICHAGE GPS --
-        st.markdown('<div class="section-title">🏛️ INSTITUTIONAL GPS (Structure)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">🏛️ INSTITUTIONAL GPS</div>', unsafe_allow_html=True)
         
-        # Metrics
         total = len(df)
         a_plus = len(df[df['Quality'] == 'A+'])
         a_grade = len(df[df['Quality'] == 'A'])
         b_grade = len(df[df['Quality'].str.startswith('B')])
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total", total)
-        c2.metric("Setups A+", a_plus)
-        c3.metric("Setups A", a_grade)
-        c4.metric("Setups B", b_grade)
+        c2.metric("Grade A+", a_plus, delta_color="inverse")
+        c3.metric("Grade A", a_grade, delta_color="inverse")
+        c4.metric("Grade B", b_grade, delta_color="inverse")
         
-        # Tableau
         cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         
-        # Styles
         def style_map(v):
             if isinstance(v, str):
                 if "Bull" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bullish']}; color:white; font-weight:bold"
@@ -629,35 +567,22 @@ def main():
                 return [f"color: black; font-weight:bold; background-color: {GRADE_COLORS.get(x, 'grey')}" for x in s]
             return [''] * len(s)
 
-        # Calcul hauteur dynamique
-        h = min(600, (len(df) + 1) * 35 + 3)
-        
+        h = (len(df) + 1) * 35 + 3
         st.dataframe(
             df[cols_order].style.apply(quality_style, axis=0).applymap(style_map), 
             height=h, 
             use_container_width=True
         )
         
-        # -- EXPORTS --
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "📄 Télécharger PDF (Safe Mode)", 
-                create_pdf(df[cols_order]), # Utilise la fonction safe
-                "Bluestar_GPS_Report.pdf", 
-                "application/pdf",
-                use_container_width=True,
-                key="download_pdf_v23" # Key unique pour empêcher le refresh
-            )
-        with c2:
-            st.download_button(
-                "📊 Télécharger CSV", 
-                df[cols_order].to_csv(index=False).encode(), 
-                "Bluestar_GPS.csv", 
-                "text/csv",
-                use_container_width=True,
-                key="download_csv_v23"
-            )
+        # -- EXPORT UNIQUEMENT CSV --
+        st.download_button(
+            "📊 Télécharger CSV (Excel Ready)", 
+            df[cols_order].to_csv(index=False).encode(), 
+            "Bluestar_GPS.csv", 
+            "text/csv",
+            use_container_width=True,
+            key="download_csv_v24"
+        )
 
 if __name__ == "__main__":
     main()
