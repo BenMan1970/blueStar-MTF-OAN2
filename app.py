@@ -493,13 +493,15 @@ def create_pdf(df, heatmap_data=None):
         
         class PDF(FPDF):
             def header(self):
-                self.set_font('Arial', 'B', 18)
-                self.cell(0, 10, 'Bluestar GPS Report', 0, 1, 'C')
-                self.set_font('Arial', 'I', 10)
-                self.set_text_color(100, 100, 100)
-                self.cell(0, 5, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 1, 'C')
-                self.set_text_color(0, 0, 0)
-                self.ln(3)
+                # Seulement sur la première page
+                if self.page_no() == 1:
+                    self.set_font('Arial', 'B', 18)
+                    self.cell(0, 10, 'Bluestar GPS Report', 0, 1, 'C')
+                    self.set_font('Arial', 'I', 10)
+                    self.set_text_color(100, 100, 100)
+                    self.cell(0, 5, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 1, 'C')
+                    self.set_text_color(0, 0, 0)
+                    self.ln(3)
         
         pdf = PDF(orientation='L')  # 'L' = Landscape (Paysage)
         pdf.add_page()
@@ -637,12 +639,18 @@ def create_pdf(df, heatmap_data=None):
         pdf.set_fill_color(30, 58, 138)
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Arial", "B", 9)  # Police légèrement plus grande en paysage
+        
+        # Vérifier s'il y a assez de place, sinon nouvelle page
+        if pdf.get_y() > 170:
+            pdf.add_page()
+        
         for col in cols:
             pdf.cell(col_widths[col], 8, col.replace('_', ' '), 1, 0, 'C', True)
         pdf.ln()
         
         # Lignes de données
         pdf.set_font("Arial", "", 8)  # Police des données
+        pdf.set_text_color(0, 0, 0)
         for idx, row in df.iterrows():
             for col in cols:
                 val = str(row[col])
