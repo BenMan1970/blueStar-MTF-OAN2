@@ -482,266 +482,133 @@ def analyze_market(access_token, environment):
     return pd.DataFrame(results)
 
 # ==========================================
-# 8. EXPORT PDF (CORRIGÉ & FONCTIONNEL)
+# 8. EXPORT PDF (VERSION REMPLACÉE)
 # ==========================================
-def create_pdf(df, heatmap_data=None):
-    """
-    Génère un PDF compatible et fonctionnel avec Heatmap et corrections de sauts de page
-    """
-    # Nettoyage rigoureux des données pour le PDF (Anti-None)
-    df = df.astype(str)
-    df = df.replace("None", "-").replace("nan", "-")
+def clean_df(df):
+    return df.fillna("").replace("None", "").replace("nan", "")
 
-    try:
-        from fpdf import FPDF
-        
-        class PDF(FPDF):
-            def header(self):
-                # Seulement sur la première page pour le titre global
-                if self.page_no() == 1:
-                    self.set_font('Arial', 'B', 18)
-                    self.cell(0, 10, 'Bluestar GPS Report', 0, 1, 'C')
-                    self.set_font('Arial', 'I', 10)
-                    self.set_text_color(100, 100, 100)
-                    self.cell(0, 5, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 1, 'C')
-                    self.set_text_color(0, 0, 0)
-                    self.ln(3)
-        
-        pdf = PDF(orientation='L')  # 'L' = Landscape (Paysage)
-        pdf.set_auto_page_break(False) # On gère manuellement les sauts de page
-        pdf.add_page()
-        
-        # ===== SECTION 1: HEATMAP FOREX =====
-        if heatmap_data:
-            s_forex, s_special, df_prices, pct_special = heatmap_data
-            if s_forex and df_prices is not None:
-                pdf.set_font("Arial", "B", 14)
-                pdf.set_fill_color(30, 58, 138)
-                pdf.set_text_color(255, 255, 255)
-                pdf.cell(0, 10, ' FOREX STRENGTH HEATMAP', 0, 1, 'L', True)
-                pdf.set_text_color(0, 0, 0)
-                pdf.ln(3)
-                
-                # Calculer les forces relatives
-                currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
-                pct_changes = df_prices.pct_change().iloc[-1] * 100
-                forex_strength = {}
-                
-                for curr in currencies:
-                    total_pct = 0
-                    count = 0
-                    for col in df_prices.columns:
-                        if curr in col:
-                            val = pct_changes[col]
-                            if col.startswith(curr):
-                                total_pct += val
-                            else:
-                                total_pct -= val
-                            count += 1
-                    if count > 0:
-                        forex_strength[curr] = total_pct / count
-                
-                # Trier par force
-                sorted_curr = sorted(forex_strength.items(), key=lambda x: x[1], reverse=True)
-                
-                # Tableau des forces
-                pdf.set_font("Arial", "B", 9)
-                col_w = 35
-                for curr, strength in sorted_curr:
-                    # Couleur selon force
-                    if strength > 0.05:
-                        pdf.set_fill_color(0, 153, 0)  # Vert foncé
-                    elif strength > 0:
-                        pdf.set_fill_color(51, 204, 51)  # Vert clair
-                    elif strength < -0.05:
-                        pdf.set_fill_color(204, 0, 0)  # Rouge foncé
-                    elif strength < 0:
-                        pdf.set_fill_color(255, 51, 0)  # Rouge clair
-                    else:
-                        pdf.set_fill_color(240, 240, 240)  # Neutre
-                    
-                    pdf.set_text_color(255, 255, 255) if abs(strength) > 0.01 else pdf.set_text_color(0, 0, 0)
-                    pdf.cell(col_w, 8, f'{curr}: {strength:+.2f}%', 1, 0, 'C', True)
-                
-                pdf.set_text_color(0, 0, 0)
-                pdf.ln(15)
-                
-                # Indices & Métaux
-                if pct_special:
-                    pdf.set_font("Arial", "B", 12)
-                    pdf.cell(100, 8, 'INDICES', 0, 0, 'L')
-                    pdf.cell(100, 8, 'METAUX', 0, 1, 'L')
-                    pdf.set_font("Arial", "", 9)
-                    
-                    indices_list = [k for k, v in pct_special.items() if v['cat'] == 'INDICES']
-                    metaux_list = [k for k, v in pct_special.items() if v['cat'] == 'METAUX']
-                    
-                    max_len = max(len(indices_list), len(metaux_list))
-                    
-                    for i in range(max_len):
-                        # Indices
-                        if i < len(indices_list):
-                            name = indices_list[i]
-                            pct = pct_special[name]['pct']
-                            if pct > 0.15:
-                                pdf.set_fill_color(0, 153, 0)
-                            elif pct > 0:
-                                pdf.set_fill_color(51, 204, 51)
-                            elif pct < -0.15:
-                                pdf.set_fill_color(204, 0, 0)
-                            elif pct < 0:
-                                pdf.set_fill_color(255, 51, 0)
-                            else:
-                                pdf.set_fill_color(240, 240, 240)
-                            
-                            pdf.set_text_color(255, 255, 255) if abs(pct) > 0.01 else pdf.set_text_color(0, 0, 0)
-                            pdf.cell(100, 7, f'{name}: {pct:+.2f}%', 1, 0, 'C', True)
-                        else:
-                            pdf.cell(100, 7, '', 0, 0)
-                        
-                        # Métaux
-                        if i < len(metaux_list):
-                            name = metaux_list[i]
-                            pct = pct_special[name]['pct']
-                            if pct > 0.15:
-                                pdf.set_fill_color(0, 153, 0)
-                            elif pct > 0:
-                                pdf.set_fill_color(51, 204, 51)
-                            elif pct < -0.15:
-                                pdf.set_fill_color(204, 0, 0)
-                            elif pct < 0:
-                                pdf.set_fill_color(255, 51, 0)
-                            else:
-                                pdf.set_fill_color(240, 240, 240)
-                            
-                            pdf.set_text_color(255, 255, 255) if abs(pct) > 0.01 else pdf.set_text_color(0, 0, 0)
-                            pdf.cell(100, 7, f'{name}: {pct:+.2f}%', 1, 1, 'C', True)
-                        else:
-                            pdf.ln()
-                
-                pdf.set_text_color(0, 0, 0)
-                pdf.ln(10)
-        
-        # ===== SECTION 2: TABLEAU GPS =====
-        if pdf.get_y() > 170:
-            pdf.add_page()
+def create_pdf(df, heatmap_data=None):
+    from fpdf import FPDF
+    from io import BytesIO
+    from datetime import datetime
+
+    df = clean_df(df).astype(str)
+    df = df.replace("", "-")
+
+    class PDF(FPDF):
+        def header(self):
+            if self.page_no() == 1:
+                self.set_font("Arial", "B", 18)
+                self.cell(0, 10, "Bluestar GPS Report", 0, 1, "C")
+                self.set_font("Arial", "I", 10)
+                self.set_text_color(100, 100, 100)
+                self.cell(0, 5, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", 0, 1, "C")
+                self.ln(4)
+                self.set_text_color(0, 0, 0)
+
+    pdf = PDF("L")
+    pdf.set_auto_page_break(False)
+    pdf.add_page()
+
+    # ================= HEATMAP =================
+    if heatmap_data:
+        s_forex, _, df_prices, pct_special = heatmap_data
 
         pdf.set_font("Arial", "B", 14)
         pdf.set_fill_color(30, 58, 138)
         pdf.set_text_color(255, 255, 255)
-        pdf.cell(0, 10, ' INSTITUTIONAL GPS ANALYSIS', 0, 1, 'L', True)
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln(3)
-        
-        # Configuration des colonnes
-        cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
-        col_widths = {
-            'Paire': 22,
-            'M': 19, 'W': 19, 'D': 19, '4H': 19, '1H': 19, '15m': 19,
-            'MTF': 30,
-            'Quality': 18,
-            'ATR_Daily': 19, 'ATR_H1': 19, 'ATR_15m': 19
-        }
-        
-        def print_table_header():
-            pdf.set_fill_color(30, 58, 138)
-            pdf.set_text_color(255, 255, 255)
-            pdf.set_font("Arial", "B", 9)
-            for col in cols:
-                pdf.cell(col_widths[col], 8, col.replace('_', ' '), 1, 0, 'C', True)
-            pdf.ln()
-            pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Arial", "", 8)
+        pdf.cell(0, 10, " MARKET HEATMAP (Momentum)", 0, 1, "L", True)
+        pdf.ln(4)
 
-        print_table_header()
-        
-        # Lignes de données
-        pdf.set_font("Arial", "", 8)
-        pdf.set_text_color(0, 0, 0)
-        
-        for idx, row in df.iterrows():
-            # Saut de page manuel
-            if pdf.get_y() > 185:
-                pdf.add_page()
-                print_table_header()
+        pdf.set_font("Arial", "B", 10)
 
-            for col in cols:
-                val = str(row[col])
-                
-                # Couleurs selon le contenu
-                if col in ['M', 'W', 'D', '4H', '1H', '15m', 'MTF']:
-                    if "Bull" in val and "Retracement" not in val:
-                        pdf.set_fill_color(46, 204, 113)  # Bullish
-                        pdf.set_text_color(255, 255, 255)
-                    elif "Bear" in val and "Retracement" not in val:
-                        pdf.set_fill_color(231, 76, 60)  # Bearish
-                        pdf.set_text_color(255, 255, 255)
-                    elif "Retracement Bull" in val:
-                        pdf.set_fill_color(125, 206, 160)
-                        pdf.set_text_color(255, 255, 255)
-                    elif "Retracement Bear" in val:
-                        pdf.set_fill_color(241, 148, 138)
-                        pdf.set_text_color(255, 255, 255)
-                    elif "Range" in val:
-                        pdf.set_fill_color(149, 165, 166)
-                        pdf.set_text_color(255, 255, 255)
-                    else:
-                        pdf.set_fill_color(255, 255, 255)
-                        pdf.set_text_color(0, 0, 0)
-                elif col == 'Quality':
-                    grade_colors = {
-                        'A+': (251, 191, 36),
-                        'A': (163, 230, 53),
-                        'B+': (96, 165, 250),
-                        'B': (59, 130, 246),
-                        'B-': (59, 130, 246),
-                        'C': (156, 163, 175)
-                    }
-                    color = grade_colors.get(val, (255, 255, 255))
-                    pdf.set_fill_color(*color)
-                    pdf.set_text_color(0, 0, 0)
-                else:
-                    pdf.set_fill_color(255, 255, 255)
-                    pdf.set_text_color(0, 0, 0)
-                
-                # Tronquer le texte si trop long
-                if len(val) > 15:
-                    val = val[:13] + '..'
-                
-                pdf.cell(col_widths[col], 7, val, 1, 0, 'C', True)
-            
-            pdf.ln()
-            pdf.set_text_color(0, 0, 0)
-        
-        # Génération du buffer
-        buffer = BytesIO()
-        pdf_output = pdf.output(dest='S')
-        
-        if isinstance(pdf_output, str):
-            buffer.write(pdf_output.encode('latin-1'))
-        else:
-            buffer.write(pdf_output)
-        
-        buffer.seek(0)
-        return buffer.getvalue()
-        
-    except Exception as e:
-        logging.error(f"Erreur critique PDF : {e}")
-        try:
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Arial", "", 12)
-            pdf.cell(0, 10, f"Erreur generation PDF: {str(e)}", 0, 1)
-            buffer = BytesIO()
-            pdf_output = pdf.output(dest='S')
-            if isinstance(pdf_output, str):
-                buffer.write(pdf_output.encode('latin-1'))
+        pct = df_prices.pct_change().iloc[-1] * 100
+        currencies = ["USD","EUR","GBP","JPY","AUD","CAD","NZD","CHF"]
+        strength = {}
+
+        for c in currencies:
+            total = 0
+            count = 0
+            for col in df_prices.columns:
+                if c in col:
+                    v = pct[col]
+                    total += v if col.startswith(c) else -v
+                    count += 1
+            if count:
+                strength[c] = total / count
+
+        for cur, val in sorted(strength.items(), key=lambda x: x[1], reverse=True):
+            if val >= 0.15:
+                pdf.set_fill_color(0,153,0)
+            elif val >= 0.01:
+                pdf.set_fill_color(51,204,51)
+            elif val <= -0.15:
+                pdf.set_fill_color(204,0,0)
+            elif val <= -0.01:
+                pdf.set_fill_color(255,51,0)
             else:
-                buffer.write(pdf_output)
-            buffer.seek(0)
-            return buffer.getvalue()
-        except:
-            return b"PDF Error"
+                pdf.set_fill_color(200,200,200)
+
+            pdf.set_text_color(255,255,255) if abs(val) > 0.01 else pdf.set_text_color(0,0,0)
+            pdf.cell(60,8,cur,1,0,"C",True)
+            pdf.cell(60,8,f"{val:+.2f} %",1,1,"C",True)
+
+        pdf.set_text_color(0,0,0)
+        pdf.ln(6)
+
+    # ================= GPS TABLE =================
+    pdf.set_font("Arial","B",14)
+    pdf.set_fill_color(30,58,138)
+    pdf.set_text_color(255,255,255)
+    pdf.cell(0,10," INSTITUTIONAL GPS ANALYSIS",0,1,"L",True)
+    pdf.ln(3)
+
+    cols = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','ATR_Daily','ATR_H1','ATR_15m']
+    widths = [22,18,18,18,18,18,18,30,16,18,18,18]
+
+    def header():
+        pdf.set_font("Arial","B",9)
+        for c,w in zip(cols,widths):
+            pdf.cell(w,8,c.replace("_"," "),1,0,"C",True)
+        pdf.ln()
+
+    header()
+    pdf.set_font("Arial","",8)
+
+    for _, row in df.iterrows():
+        if pdf.get_y() > 185:
+            pdf.add_page()
+            header()
+
+        for c,w in zip(cols,widths):
+            v = row[c]
+
+            if "Bull" in v and "Retracement" not in v:
+                pdf.set_fill_color(46,204,113)
+                pdf.set_text_color(255,255,255)
+            elif "Bear" in v and "Retracement" not in v:
+                pdf.set_fill_color(231,76,60)
+                pdf.set_text_color(255,255,255)
+            elif "Range" in v:
+                pdf.set_fill_color(149,165,166)
+                pdf.set_text_color(255,255,255)
+            elif c == "Quality":
+                qc = {"A+":(251,191,36),"A":(163,230,53),"B":(96,165,250),"B-":(59,130,246),"C":(156,163,175)}
+                pdf.set_fill_color(*qc.get(v,(255,255,255)))
+                pdf.set_text_color(0,0,0)
+            else:
+                pdf.set_fill_color(255,255,255)
+                pdf.set_text_color(0,0,0)
+
+            pdf.cell(w,7,v[:14],1,0,"C",True)
+
+        pdf.ln()
+
+    buf = BytesIO()
+    out = pdf.output(dest="S")
+    buf.write(out.encode("latin-1") if isinstance(out,str) else out)
+    buf.seek(0)
+    return buf.getvalue()
 
 # ==========================================
 # 9. UI PRINCIPALE
