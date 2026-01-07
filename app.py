@@ -581,4 +581,71 @@ def main():
         acc = st.secrets["OANDA_ACCOUNT_ID"]
         tok = st.secrets["OANDA_ACCESS_TOKEN"]
     except Exception:
-        st.error("
+        st.error("❌ Secrets OANDA manquants")
+        st.stop()
+
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        show_only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
+        st.info("Le cache dure 10 minutes pour optimiser les performances API.")
+
+    if st.button("🚀 LANCER L'ANALYSE TOUS ACTIFS", type="primary", use_container_width=True):
+        with st.spinner("Analyse Multi-Timeframe en cours..."):
+            df = analyze_market(acc, tok)
+        
+        if not df.empty:
+            # Filtrage UX
+            if show_only_best:
+                df = df[df['Quality'].isin(['A+', 'A'])]
+            
+            # Tri
+            df = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False]) 
+            st.session_state.df = df
+    
+    if "df" in st.session_state:
+        df = st.session_state.df
+        
+        # --- COMMAND CENTER ---
+        c1, c2, c3, c4 = st.columns(4)
+        total = len(df)
+        a_plus = len(df[df['Quality'] == 'A+'])
+        a_grade = len(df[df['Quality'] == 'A'])
+        b_grade = len(df[df['Quality'].str.startswith('B')])
+        
+        c1.metric("Total Analyzed", total)
+        c2.metric("Setups A+ (GOLD)", a_plus, delta_color="inverse")
+        c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
+        c4.metric("Setups B (BLUE)", b_grade, delta_color="inverse")
+        
+        # --- TABLEAU STYLE ---
+        cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
+        
+        def style_map(v):
+            if isinstance(v, str):
+                if "Bull" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bullish']}; color:white; font-weight:bold"
+                if "Bear" in v and "Retracement" not in v: return f"background-color: {TREND_COLORS['Bearish']}; color:white; font-weight:bold"
+                if "Retracement Bull" in v: return f"background-color: {TREND_COLORS['Retracement Bull']}; color:white"
+                if "Retracement Bear" in v: return f"background-color: {TREND_COLORS['Retracement Bear']}; color:white"
+                if "Range" in v: return f"background-color: {TREND_COLORS['Range']}; color:white"
+            return ""
+
+        def quality_style(s):
+            if s.name == 'Quality':
+                return [f"color: black; font-weight:bold; background-color: {GRADE_COLORS.get(x, 'grey')}" for x in s]
+            return [''] * len(s)
+
+        st.dataframe(
+            df[cols_order].style.apply(quality_style, axis=0).applymap(style_map), 
+            height=min(600, (len(df)+1)*35 + 10), 
+            use_container_width=True
+        )
+        
+        # --- EXPORTS ---
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("📄 Télécharger PDF", create_pdf(df[cols_order]), "Bluestar_GPS.pdf", "application/pdf", use_container_width=True)
+        with c2:
+            st.download_button("📊 Télécharger CSV", df[cols_order].to_csv(index=False).encode(), "Bluestar_GPS.csv", "text/csv", use_container_width=True)
+
+if __name__ == "__main__":
+    main()
