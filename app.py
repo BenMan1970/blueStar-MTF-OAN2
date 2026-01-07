@@ -11,8 +11,6 @@ import pytz
 # ==========================================
 # 1. IMPORTS ET GESTION D'ERREURS PDF (SAFE MODE)
 # ==========================================
-
-# Détection de la version de fpdf pour compatibilité
 try:
     from fpdf import FPDF
     PDF_AVAILABLE = True
@@ -65,7 +63,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialisation de l'état de session
 if 'df' not in st.session_state:
     st.session_state['df'] = None
 
@@ -491,17 +488,16 @@ def create_pdf(df, heatmap_data=None):
     """
     Génère un PDF compatible et fonctionnel avec Heatmap et corrections de sauts de page
     """
-    # Nettoyage rigoureux des données pour le PDF
-    df = df.fillna("-")
-    df = df.replace("None", "-")
-    df = df.replace("nan", "-")
+    # Nettoyage rigoureux des données pour le PDF (Anti-None)
+    df = df.astype(str)
+    df = df.replace("None", "-").replace("nan", "-")
 
     try:
         from fpdf import FPDF
         
         class PDF(FPDF):
             def header(self):
-                # Seulement sur la première page
+                # Seulement sur la première page pour le titre global
                 if self.page_no() == 1:
                     self.set_font('Arial', 'B', 18)
                     self.cell(0, 10, 'Bluestar GPS Report', 0, 1, 'C')
@@ -671,8 +667,7 @@ def create_pdf(df, heatmap_data=None):
 
             for col in cols:
                 val = str(row[col])
-                if val in ["None", "nan", ""]: val = "-"
-
+                
                 # Couleurs selon le contenu
                 if col in ['M', 'W', 'D', '4H', '1H', '15m', 'MTF']:
                     if "Bull" in val and "Retracement" not in val:
@@ -792,11 +787,10 @@ def main():
     if st.session_state.get('df') is not None:
         df = st.session_state['df']
         
-        # NETTOYAGE STRICT DES DONNÉES AVANT AFFICHAGE
-        # Remplace les NaN et les chaines de caractères "None" ou "nan" par du vide
-        df = df.fillna("") 
-        df = df.replace("None", "")
-        df = df.replace("nan", "")
+        # NETTOYAGE STRICT DES DONNÉES AVANT AFFICHAGE (Anti-None)
+        # Convertit tout en chaîne pour éviter que les objets None ou NaN ne soient affichés par défaut
+        df = df.astype(str)
+        df = df.replace("None", "").replace("nan", "")
         
         data_heat = st.session_state.get('heatmap_data')
         
