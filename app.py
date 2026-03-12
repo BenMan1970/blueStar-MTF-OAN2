@@ -130,11 +130,12 @@ def calc_institutional_trend_macro(df):
 
 def calc_institutional_trend_daily(df):
     """
-    Biais Daily — logique V14 (4 votes) :
+    Biais Daily — logique V14 + SMA200 (5 facteurs, 6 votes max) :
       1. Structure swing D1 (wing=5, 2 votes si confirmée)
       2. EMA 21/50 stack (1 vote)
       3. Weekly Open (1 vote)
       4. Close J-1 vs midpoint J-1 (1 vote)
+      5. SMA 200 institutionnelle (1 vote)
     """
     if len(df) < 60:
         return 'Range', 0
@@ -191,11 +192,17 @@ def calc_institutional_trend_daily(df):
         if float(close.iloc[-2]) > midpoint: votes_bull += 1
         else:                                votes_bear += 1
 
-    # Résolution votes → bias
-    if   votes_bull >= 4: bias = "STRONG BULLISH"
-    elif votes_bull == 3: bias = "BULLISH"
-    elif votes_bear >= 4: bias = "STRONG BEARISH"
-    elif votes_bear == 3: bias = "BEARISH"
+    # Facteur 5 : SMA 200 institutionnelle
+    if len(df) >= 200:
+        sma200 = close.rolling(window=200).mean().iloc[-1]
+        if   cur > sma200: votes_bull += 1
+        elif cur < sma200: votes_bear += 1
+
+    # Résolution votes → bias (max possible = 6)
+    if   votes_bull >= 5: bias = "STRONG BULLISH"
+    elif votes_bull >= 3: bias = "BULLISH"
+    elif votes_bear >= 5: bias = "STRONG BEARISH"
+    elif votes_bear >= 3: bias = "BEARISH"
     else:                 bias = "NEUTRAL"
 
     # Mapping vers format dashboard
