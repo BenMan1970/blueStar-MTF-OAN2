@@ -129,40 +129,80 @@ def calc_institutional_trend_macro(df):
         return "Range", 40
 
 def calc_institutional_trend_daily(df):
-    if len(df) < 200: return 'Range', 0
+    """
+    Biais Daily — logique V14 (4 votes) :
+      1. Structure swing D1 (wing=5, 2 votes si confirmée)
+      2. EMA 21/50 stack (1 vote)
+      3. Weekly Open (1 vote)
+      4. Close J-1 vs midpoint J-1 (1 vote)
+    """
+    if len(df) < 60:
+        return 'Range', 0
+
     close = df['Close']
-    curr_price = close.iloc[-1]
-    sma200 = sma(close, 200)
-    ema50 = ema(close, 50)
-    ema21 = ema(close, 21)
-    
-    curr_sma200 = sma200.iloc[-1]
-    curr_ema50 = ema50.iloc[-1]
-    curr_ema21 = ema21.iloc[-1]
-    
-    above_sma200 = curr_price > curr_sma200
-    below_sma200 = curr_price < curr_sma200
-    ema50_above_sma = curr_ema50 > curr_sma200
-    ema50_below_sma = curr_ema50 < curr_sma200
-    ema21_above_50 = curr_ema21 > curr_ema50
-    ema21_below_50 = curr_ema21 < curr_ema50
-    price_above_21 = curr_price > curr_ema21
-    price_below_21 = curr_price < curr_ema21
-    
-    if above_sma200 and ema50_above_sma and ema21_above_50 and price_above_21:
-        return "Bullish", 90
-    if below_sma200 and ema50_below_sma and ema21_below_50 and price_below_21:
-        return "Bearish", 90
-    if above_sma200 and ema50_above_sma and (ema21_above_50 or price_above_21):
-        return "Bullish", 70
-    if below_sma200 and ema50_below_sma and (ema21_below_50 or price_below_21):
-        return "Bearish", 70
-    if below_sma200 and ema50_above_sma:
-        return "Retracement Bull", 55
-    if above_sma200 and ema50_below_sma:
-        return "Retracement Bear", 55
-    if above_sma200: return "Bullish", 50
-    if below_sma200: return "Bearish", 50
+    high  = df['High']
+    low   = df['Low']
+    cur   = float(close.iloc[-1])
+
+    votes_bull = 0
+    votes_bear = 0
+
+    # Facteur 1 : Structure swing — wing=5 (11 bougies D1)
+    def _swing_pts(series, wing=5):
+        highs, lows = [], []
+        for i in range(wing, len(series) - wing):
+            w = series.iloc[i - wing: i + wing + 1]
+            if series.iloc[i] == w.max(): highs.append(i)
+            if series.iloc[i] == w.min(): lows.append(i)
+        return highs, lows
+
+    sh_idx, _      = _swing_pts(high)
+    _,      sl_idx = _swing_pts(low)
+
+    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
+        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
+        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
+        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
+        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
+        if hh and hl:   votes_bull += 2
+        elif lh and ll: votes_bear += 2
+
+    # Facteur 2 : EMA 21/50
+    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    if   cur > ema21 > ema50: votes_bull += 1
+    elif cur < ema21 < ema50: votes_bear += 1
+
+    # Facteur 3 : Weekly Open
+    try:
+        times = pd.to_datetime(df.index)
+        monday_mask = times.dayofweek.isin([0, 6])
+        wo_rows = df[monday_mask]
+        if not wo_rows.empty:
+            weekly_open = float(wo_rows['Open'].iloc[-1])
+            if cur > weekly_open: votes_bull += 1
+            else:                 votes_bear += 1
+    except Exception:
+        pass
+
+    # Facteur 4 : Close J-1 vs midpoint J-1
+    if len(df) >= 2:
+        midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
+        if float(close.iloc[-2]) > midpoint: votes_bull += 1
+        else:                                votes_bear += 1
+
+    # Résolution votes → bias
+    if   votes_bull >= 4: bias = "STRONG BULLISH"
+    elif votes_bull == 3: bias = "BULLISH"
+    elif votes_bear >= 4: bias = "STRONG BEARISH"
+    elif votes_bear == 3: bias = "BEARISH"
+    else:                 bias = "NEUTRAL"
+
+    # Mapping vers format dashboard
+    if bias == "STRONG BULLISH": return "Bullish", 90
+    if bias == "BULLISH":        return "Bullish", 70
+    if bias == "STRONG BEARISH": return "Bearish", 90
+    if bias == "BEARISH":        return "Bearish", 70
     return "Range", 35
 
 def calc_institutional_trend_4h(df):
