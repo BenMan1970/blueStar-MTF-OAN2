@@ -213,38 +213,82 @@ def calc_institutional_trend_daily(df):
     return "Range", 35
 
 def calc_institutional_trend_4h(df):
-    if len(df) < 200: return 'Range', 0
+    """
+    Biais 4H — systeme de votes (5 facteurs, 6 votes max) :
+      1. Structure swing 4H (wing=3, 2 votes)
+      2. EMA 21/50 stack + prix vs EMA21 (1 vote)
+      3. SMA 200 institutionnelle (1 vote)
+      4. RSI 14 — momentum (1 vote)
+      5. MACD — direction impulsion (1 vote)
+    """
+    if len(df) < 60: return 'Range', 0
+
     close = df['Close']
-    curr_price = close.iloc[-1]
-    sma200 = sma(close, 200)
-    ema50 = ema(close, 50)
-    ema21 = ema(close, 21)
-    
-    curr_sma200 = sma200.iloc[-1]
-    curr_ema50 = ema50.iloc[-1]
-    curr_ema21 = ema21.iloc[-1]
-    
-    above_sma200 = curr_price > curr_sma200
-    below_sma200 = curr_price < curr_sma200
-    ema21_above_50 = curr_ema21 > curr_ema50
-    ema21_below_50 = curr_ema21 < curr_ema50
-    ema50_above_sma = curr_ema50 > curr_sma200
-    price_above_21 = curr_price > curr_ema21
-    price_below_21 = curr_price < curr_ema21
-    
-    if above_sma200 and ema21_above_50 and ema50_above_sma and price_above_21:
-        return "Bullish", 80
-    if below_sma200 and ema21_below_50 and curr_ema50 < curr_sma200 and price_below_21:
-        return "Bearish", 80
-    if above_sma200 and price_above_21:
-        return "Bullish", 60
-    if below_sma200 and price_below_21:
-        return "Bearish", 60
-    if below_sma200 and ema50_above_sma:
-        return "Retracement Bull", 50
-    if above_sma200 and curr_ema50 < curr_sma200:
-        return "Retracement Bear", 50
-    return "Range", 40
+    high  = df['High']
+    low   = df['Low']
+    cur   = float(close.iloc[-1])
+
+    votes_bull = 0
+    votes_bear = 0
+
+    # Facteur 1 : Structure swing 4H — wing=3
+    def _swing_pts(series, wing=3):
+        highs, lows = [], []
+        for i in range(wing, len(series) - wing):
+            w = series.iloc[i - wing: i + wing + 1]
+            if series.iloc[i] == w.max(): highs.append(i)
+            if series.iloc[i] == w.min(): lows.append(i)
+        return highs, lows
+
+    sh_idx, _      = _swing_pts(high)
+    _,      sl_idx = _swing_pts(low)
+
+    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
+        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
+        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
+        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
+        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
+        if hh and hl:   votes_bull += 2
+        elif lh and ll: votes_bear += 2
+
+    # Facteur 2 : EMA 21/50 stack + prix vs EMA21
+    ema21_val = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema50_val = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    if   cur > ema21_val > ema50_val: votes_bull += 1
+    elif cur < ema21_val < ema50_val: votes_bear += 1
+
+    # Facteur 3 : SMA 200
+    if len(df) >= 200:
+        sma200_val = close.rolling(window=200).mean().iloc[-1]
+        if   cur > sma200_val: votes_bull += 1
+        elif cur < sma200_val: votes_bear += 1
+
+    # Facteur 4 : RSI 14 — momentum non epuise
+    rsi_val = rsi(close, 14).iloc[-1]
+    if   rsi_val > 55: votes_bull += 1
+    elif rsi_val < 45: votes_bear += 1
+
+    # Facteur 5 : MACD — direction de l'impulsion
+    macd_line   = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    if   macd_line.iloc[-1] > signal_line.iloc[-1]: votes_bull += 1
+    elif macd_line.iloc[-1] < signal_line.iloc[-1]: votes_bear += 1
+
+    # Resolution votes (max possible = 6)
+    if   votes_bull >= 5: return "Bullish", 90
+    elif votes_bull >= 4: return "Bullish", 75
+    elif votes_bull == 3: return "Bullish", 60
+    elif votes_bear >= 5: return "Bearish", 90
+    elif votes_bear >= 4: return "Bearish", 75
+    elif votes_bear == 3: return "Bearish", 60
+
+    # Retracement : structure + SMA200 en conflit
+    if len(df) >= 200:
+        sma200_val = close.rolling(window=200).mean().iloc[-1]
+        if cur < sma200_val and votes_bull >= 2: return "Retracement Bull", 45
+        if cur > sma200_val and votes_bear >= 2: return "Retracement Bear", 45
+
+    return "Range", 35
 
 def calc_institutional_trend_intraday(df, macro_trend=None):
     if len(df) < 50: return 'Range', 0
