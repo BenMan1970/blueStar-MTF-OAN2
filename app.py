@@ -102,11 +102,14 @@ def rsi(close, period=14):
 # LOGIQUE MTF INSTITUTIONNELLE (INCHANGÉE)
 # ==========================================
 
-def calc_institutional_trend_macro(df):
+def calc_institutional_trend_macro(df, tf='W'):
     """
-    M1 & W1 — croisement EMA 50 / SMA 200.
-    Lecture macro institutionnelle pure, sans redondance.
-    Croisement récent → 90% | Tendance établie → 75% | Neutre → 40%
+    M1 : position EMA50 vs SMA200 — croisements trop rares sur forex Monthly.
+         EMA50 > SMA200 → Bullish | EMA50 < SMA200 → Bearish
+         Tendance établie → 75% | Proche du croisement (écart < 0.1%) → 90%
+
+    W1 : croisement EMA50 / SMA200 — plus réactif sur Weekly.
+         Croisement récent → 90% | Tendance établie → 75%
     """
     if len(df) < 50: return 'Range', 0
     close  = df['Close']
@@ -118,18 +121,29 @@ def calc_institutional_trend_macro(df):
     curr_sma200 = sma200.iloc[-1]
     prev_sma200 = sma200.iloc[-2]
 
-    # Croisement sur la dernière bougie
-    crossed_bull = prev_ema50 <= prev_sma200 and curr_ema50 > curr_sma200
-    crossed_bear = prev_ema50 >= prev_sma200 and curr_ema50 < curr_sma200
-
-    if curr_ema50 > curr_sma200:
-        strength = 90 if crossed_bull else 75
-        return "Bullish", strength
-    elif curr_ema50 < curr_sma200:
-        strength = 90 if crossed_bear else 75
-        return "Bearish", strength
+    if tf == 'M':
+        # Position pure — pas de croisement
+        if curr_ema50 > curr_sma200:
+            # Force relative : écart faible = tendance fragile
+            gap_pct = abs(curr_ema50 - curr_sma200) / curr_sma200 * 100
+            strength = 75 if gap_pct > 0.5 else 60
+            return "Bullish", strength
+        elif curr_ema50 < curr_sma200:
+            gap_pct = abs(curr_ema50 - curr_sma200) / curr_sma200 * 100
+            strength = 75 if gap_pct > 0.5 else 60
+            return "Bearish", strength
+        else:
+            return "Range", 40
     else:
-        return "Range", 40
+        # Weekly — croisement
+        crossed_bull = prev_ema50 <= prev_sma200 and curr_ema50 > curr_sma200
+        crossed_bear = prev_ema50 >= prev_sma200 and curr_ema50 < curr_sma200
+        if curr_ema50 > curr_sma200:
+            return "Bullish", 90 if crossed_bull else 75
+        elif curr_ema50 < curr_sma200:
+            return "Bearish", 90 if crossed_bear else 75
+        else:
+            return "Range", 40
 
 def calc_institutional_trend_daily(df):
     """
@@ -430,7 +444,7 @@ def analyze_market(account_id, access_token):
 
         for tf, (_, _, mode) in tf_config.items():
             df = data_cache[tf]
-            if mode == 'Macro': t, s = calc_institutional_trend_macro(df)
+            if mode == 'Macro': t, s = calc_institutional_trend_macro(df, tf)
             elif mode == 'Daily': t, s = calc_institutional_trend_daily(df)
             elif mode == '4H': t, s = calc_institutional_trend_4h(df)
             else: t, s = calc_institutional_trend_intraday(df)
