@@ -103,28 +103,31 @@ def rsi(close, period=14):
 # ==========================================
 
 def calc_institutional_trend_macro(df):
+    """
+    M1 & W1 — croisement EMA 50 / SMA 200.
+    Lecture macro institutionnelle pure, sans redondance.
+    Croisement récent → 90% | Tendance établie → 75% | Neutre → 40%
+    """
     if len(df) < 50: return 'Range', 0
-    close = df['Close']
-    curr_price = close.iloc[-1]
-    has_200 = len(df) >= 200
-    sma200 = sma(close, 200) if has_200 else sma(close, 50)
-    ema50 = ema(close, 50)
+    close  = df['Close']
+    ema50  = close.ewm(span=50, adjust=False).mean()
+    sma200 = close.rolling(window=200).mean() if len(df) >= 200 else ema50
+
+    curr_ema50  = ema50.iloc[-1]
+    prev_ema50  = ema50.iloc[-2]
     curr_sma200 = sma200.iloc[-1]
-    curr_ema50 = ema50.iloc[-1]
-    
-    above_sma200 = curr_price > curr_sma200
-    below_sma200 = curr_price < curr_sma200
-    ema50_above_sma = curr_ema50 > curr_sma200
-    ema50_below_sma = curr_ema50 < curr_sma200
-    
-    if above_sma200 and ema50_above_sma:
-        return "Bullish", 85
-    elif below_sma200 and ema50_below_sma:
-        return "Bearish", 85
-    elif above_sma200:
-        return "Bullish", 65
-    elif below_sma200:
-        return "Bearish", 65
+    prev_sma200 = sma200.iloc[-2]
+
+    # Croisement sur la dernière bougie
+    crossed_bull = prev_ema50 <= prev_sma200 and curr_ema50 > curr_sma200
+    crossed_bear = prev_ema50 >= prev_sma200 and curr_ema50 < curr_sma200
+
+    if curr_ema50 > curr_sma200:
+        strength = 90 if crossed_bull else 75
+        return "Bullish", strength
+    elif curr_ema50 < curr_sma200:
+        strength = 90 if crossed_bear else 75
+        return "Bearish", strength
     else:
         return "Range", 40
 
@@ -214,12 +217,12 @@ def calc_institutional_trend_daily(df):
 
 def calc_institutional_trend_4h(df):
     """
-    Biais 4H — systeme de votes (5 facteurs, 6 votes max) :
-      1. Structure swing 4H (wing=3, 2 votes)
-      2. EMA 21/50 stack + prix vs EMA21 (1 vote)
-      3. SMA 200 institutionnelle (1 vote)
-      4. RSI 14 — momentum (1 vote)
-      5. MACD — direction impulsion (1 vote)
+    H4 — 3 facteurs orthogonaux (même philosophie que le Daily) :
+      1. Prix vs EMA 50          — tendance de fond
+      2. DI+ vs DI- (DMI 14)    — momentum directionnel (sans redondance RSI/MACD)
+      3. Daily Open              — référence institutionnelle de prix
+
+    Score +3 → 90% | Score ±1/±2 → 70% | Score 0 → 40%
     """
     if len(df) < 60: return 'Range', 0
 
@@ -227,68 +230,51 @@ def calc_institutional_trend_4h(df):
     high  = df['High']
     low   = df['Low']
     cur   = float(close.iloc[-1])
+    score = 0
 
-    votes_bull = 0
-    votes_bear = 0
-
-    # Facteur 1 : Structure swing 4H — wing=3
-    def _swing_pts(series, wing=3):
-        highs, lows = [], []
-        for i in range(wing, len(series) - wing):
-            w = series.iloc[i - wing: i + wing + 1]
-            if series.iloc[i] == w.max(): highs.append(i)
-            if series.iloc[i] == w.min(): lows.append(i)
-        return highs, lows
-
-    sh_idx, _      = _swing_pts(high)
-    _,      sl_idx = _swing_pts(low)
-
-    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
-        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
-        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
-        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
-        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
-        if hh and hl:   votes_bull += 2
-        elif lh and ll: votes_bear += 2
-
-    # Facteur 2 : EMA 21/50 stack + prix vs EMA21
-    ema21_val = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    # ── Facteur 1 : Tendance de fond — prix vs EMA 50 ────────────
     ema50_val = close.ewm(span=50, adjust=False).mean().iloc[-1]
-    if   cur > ema21_val > ema50_val: votes_bull += 1
-    elif cur < ema21_val < ema50_val: votes_bear += 1
+    score += 1 if cur > ema50_val else -1
 
-    # Facteur 3 : SMA 200
-    if len(df) >= 200:
-        sma200_val = close.rolling(window=200).mean().iloc[-1]
-        if   cur > sma200_val: votes_bull += 1
-        elif cur < sma200_val: votes_bear += 1
+    # ── Facteur 2 : Momentum directionnel — DI+ vs DI- ───────────
+    def _dmi(high, low, close, period=14):
+        tr  = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low  - close.shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr_s = tr.ewm(alpha=1/period, adjust=False).mean()
 
-    # Facteur 4 : RSI 14 — momentum non epuise
-    rsi_val = rsi(close, 14).iloc[-1]
-    if   rsi_val > 55: votes_bull += 1
-    elif rsi_val < 45: votes_bear += 1
+        up   = high.diff()
+        down = -low.diff()
+        pdm  = up.where((up > down) & (up > 0), 0.0)
+        mdm  = down.where((down > up) & (down > 0), 0.0)
 
-    # Facteur 5 : MACD — direction de l'impulsion
-    macd_line   = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    if   macd_line.iloc[-1] > signal_line.iloc[-1]: votes_bull += 1
-    elif macd_line.iloc[-1] < signal_line.iloc[-1]: votes_bear += 1
+        pdi = 100 * pdm.ewm(alpha=1/period, adjust=False).mean() / atr_s.replace(0, np.nan)
+        mdi = 100 * mdm.ewm(alpha=1/period, adjust=False).mean() / atr_s.replace(0, np.nan)
+        return pdi.iloc[-1], mdi.iloc[-1]
 
-    # Resolution votes (max possible = 6)
-    if   votes_bull >= 5: return "Bullish", 90
-    elif votes_bull >= 4: return "Bullish", 75
-    elif votes_bull == 3: return "Bullish", 60
-    elif votes_bear >= 5: return "Bearish", 90
-    elif votes_bear >= 4: return "Bearish", 75
-    elif votes_bear == 3: return "Bearish", 60
+    pdi_val, mdi_val = _dmi(high, low, close)
+    if not (np.isnan(pdi_val) or np.isnan(mdi_val)):
+        score += 1 if pdi_val > mdi_val else -1
 
-    # Retracement : structure + SMA200 en conflit
-    if len(df) >= 200:
-        sma200_val = close.rolling(window=200).mean().iloc[-1]
-        if cur < sma200_val and votes_bull >= 2: return "Retracement Bull", 45
-        if cur > sma200_val and votes_bear >= 2: return "Retracement Bear", 45
+    # ── Facteur 3 : Référence institutionnelle — Daily Open ───────
+    # Premier open de chaque jour dans les données H4
+    try:
+        idx = df.index
+        dates = pd.to_datetime(idx).normalize()
+        today_date = dates[-1]
+        today_mask = dates == today_date
+        daily_open = float(df[today_mask]['Open'].iloc[0])
+        score += 1 if cur > daily_open else -1
+    except Exception:
+        pass  # Facteur ignoré si données insuffisantes
 
-    return "Range", 35
+    # ── Résultante ────────────────────────────────────────────────
+    abs_score = abs(score)
+    strength  = 90 if abs_score == 3 else 70 if abs_score >= 1 else 40
+    trend     = "Bullish" if score > 0 else "Bearish" if score < 0 else "Range"
+    return trend, strength
 
 def calc_institutional_trend_intraday(df, macro_trend=None):
     if len(df) < 50: return 'Range', 0
