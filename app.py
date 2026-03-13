@@ -488,6 +488,10 @@ def analyze_market(account_id, access_token):
         
         w_bull += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bull')
         w_bear += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bear')
+
+        # Denominateur = poids TF actifs uniquement (pas Range)
+        active_weight = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] != 'Range')
+        effective_total = active_weight if active_weight > 0 else TOTAL_WEIGHT
         
         high_tf_avg = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
         quality = 'C'
@@ -505,10 +509,10 @@ def analyze_market(account_id, access_token):
         else: quality = 'C'
 
         if w_bull > w_bear:
-            perc = (w_bull / TOTAL_WEIGHT) * 100
+            perc = (w_bull / effective_total) * 100
             final_trend = f"Bullish ({perc:.0f}%)"
         elif w_bear > w_bull:
-            perc = (w_bear / TOTAL_WEIGHT) * 100
+            perc = (w_bear / effective_total) * 100
             final_trend = f"Bearish ({perc:.0f}%)"
         else: final_trend = "Range"
 
@@ -719,6 +723,8 @@ def main():
                 df = df[df['Quality'].isin(['A+', 'A'])]
             
             # Tri
+            quality_order = ['A+', 'A', 'B+', 'B', 'B-', 'C']
+            df['Quality'] = pd.Categorical(df['Quality'], categories=quality_order, ordered=True)
             df = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False]) 
             st.session_state.df = df
     
