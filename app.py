@@ -122,15 +122,18 @@ def calc_institutional_trend_macro(df, tf='W'):
     prev_sma200 = sma200.iloc[-2]
 
     if tf == 'M':
-        # Position pure — pas de croisement
-        if curr_ema50 > curr_sma200:
-            # Force relative : écart faible = tendance fragile
-            gap_pct = abs(curr_ema50 - curr_sma200) / curr_sma200 * 100
-            strength = 75 if gap_pct > 0.5 else 60
+        # Sur Monthly, on n'a jamais assez de bougies pour SMA200 (besoin de 16 ans).
+        # On utilise EMA50 vs EMA100 — cohérent institutionnellement et toujours calculable.
+        ema100 = close.ewm(span=100, adjust=False).mean()
+        curr_ema100 = ema100.iloc[-1]
+
+        if curr_ema50 > curr_ema100:
+            gap_pct = abs(curr_ema50 - curr_ema100) / curr_ema100 * 100
+            strength = 75 if gap_pct > 0.3 else 60
             return "Bullish", strength
-        elif curr_ema50 < curr_sma200:
-            gap_pct = abs(curr_ema50 - curr_sma200) / curr_sma200 * 100
-            strength = 75 if gap_pct > 0.5 else 60
+        elif curr_ema50 < curr_ema100:
+            gap_pct = abs(curr_ema50 - curr_ema100) / curr_ema100 * 100
+            strength = 75 if gap_pct > 0.3 else 60
             return "Bearish", strength
         else:
             return "Range", 40
