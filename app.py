@@ -47,6 +47,7 @@ TREND_COLORS = {
 GRADE_COLORS = {
     'A+': '#fbbf24', # Or
     'A':  '#a3e635', # Vert
+    'B+': '#34d399', # Vert menthe — grade intermédiaire
     'B':  '#60a5fa', # Bleu
     'B-': '#3b82f6',
     'C':  '#9ca3af'  # Gris
@@ -92,10 +93,13 @@ def atr(high, low, close, period=14):
     return tr.ewm(span=period, adjust=False).mean()
 
 def rsi(close, period=14):
+    """RSI standard Wilder (1978) — lissage EWM alpha=1/period.
+    Identique TradingView / MT4 / Bloomberg.
+    Rolling SMA serait non-standard et divergerait sur séries courtes."""
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    gain  = delta.where(delta > 0, 0.0).ewm(alpha=1/period, adjust=False).mean()
+    loss  = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/period, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 # ==========================================
@@ -148,14 +152,20 @@ def calc_institutional_trend_macro(df, tf='W'):
         else:
             return "Range", 40
 
+
 def calc_institutional_trend_daily(df):
     """
-    Biais Daily — logique V14 + SMA200 (5 facteurs, 6 votes max) :
-      1. Structure swing D1 (wing=5, 2 votes si confirmée)
-      2. EMA 21/50 stack (1 vote)
-      3. Weekly Open (1 vote)
-      4. Close J-1 vs midpoint J-1 (1 vote)
-      5. SMA 200 institutionnelle (1 vote)
+    Biais Daily — 5 facteurs, max 6 votes (identique Bluestar V14 + Pine Script).
+
+      Facteur 1 : Structure swing D1 (wing=5)          → 2 votes si HH/HL ou LH/LL
+      Facteur 2 : EMA 21/50 stack vs prix courant       → 1 vote
+      Facteur 3 : Weekly Open vs prix courant           → 1 vote
+      Facteur 4 : Close J-1 vs midpoint J-1             → 1 vote
+      Facteur 5 : Pente EMA50 / ATR D normalisée        → 1 vote  ← vélocité institutionnelle
+                  Seuil ±0.05 ATR sur 5 bougies D1
+                  Neutre si EMA50 trop plate (range)
+
+    Résolution : ≥5 votes → STRONG (90%) · ≥3 → normal (70%) · <3 → NEUTRAL (35%)
     """
     if len(df) < 60:
         return 'Range', 0
@@ -168,7 +178,9 @@ def calc_institutional_trend_daily(df):
     votes_bull = 0
     votes_bear = 0
 
-    # Facteur 1 : Structure swing — wing=5 (11 bougies D1)
+    # ── Facteur 1 : Structure swing D1 (wing=5) ──────────────────
+    # HH + HL = structure haussière → 2 votes bull
+    # LH + LL = structure baissière → 2 votes bear
     def _swing_pts(series, wing=5):
         highs, lows = [], []
         for i in range(wing, len(series) - wing):
@@ -177,8 +189,8 @@ def calc_institutional_trend_daily(df):
             if series.iloc[i] == w.min(): lows.append(i)
         return highs, lows
 
-    sh_idx, _      = _swing_pts(high)
-    _,      sl_idx = _swing_pts(low)
+    sh_idx, _  = _swing_pts(high)
+    _,  sl_idx = _swing_pts(low)
 
     if len(sh_idx) >= 2 and len(sl_idx) >= 2:
         hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
@@ -188,49 +200,65 @@ def calc_institutional_trend_daily(df):
         if hh and hl:   votes_bull += 2
         elif lh and ll: votes_bear += 2
 
-    # Facteur 2 : EMA 21/50
+    # ── Facteur 2 : EMA 21/50 stack vs prix courant ──────────────
     ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
-    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    ema50_series = close.ewm(span=50, adjust=False).mean()
+    ema50 = ema50_series.iloc[-1]
+
     if   cur > ema21 > ema50: votes_bull += 1
     elif cur < ema21 < ema50: votes_bear += 1
 
-    # Facteur 3 : Weekly Open
+    # ── Facteur 3 : Weekly Open vs prix courant ──────────────────
     try:
         times = pd.to_datetime(df.index)
         monday_mask = times.dayofweek.isin([0, 6])
         wo_rows = df[monday_mask]
         if not wo_rows.empty:
             weekly_open = float(wo_rows['Open'].iloc[-1])
-            if cur > weekly_open: votes_bull += 1
-            else:                 votes_bear += 1
+            if   cur > weekly_open: votes_bull += 1
+            elif cur < weekly_open: votes_bear += 1
     except Exception:
         pass
 
-    # Facteur 4 : Close J-1 vs midpoint J-1
+    # ── Facteur 4 : Close J-1 vs midpoint J-1 ────────────────────
     if len(df) >= 2:
         midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
-        if float(close.iloc[-2]) > midpoint: votes_bull += 1
-        else:                                votes_bear += 1
+        if   float(close.iloc[-2]) > midpoint: votes_bull += 1
+        else:                                  votes_bear += 1
 
-    # Facteur 5 : SMA 200 institutionnelle
-    if len(df) >= 200:
-        sma200 = close.rolling(window=200).mean().iloc[-1]
-        if   cur > sma200: votes_bull += 1
-        elif cur < sma200: votes_bear += 1
+    # ── Facteur 5 : Pente EMA50 normalisée par ATR D ─────────────
+    # Mesure la vélocité institutionnelle sur 5 bougies D1 (~1 semaine).
+    # Normalisée par ATR pour être indépendante de la magnitude du prix.
+    # Seuil ±0.05 ATR : neutre si EMA50 trop plate (pas de tendance active).
+    try:
+        if len(ema50_series) >= 6:
+            tr_d = pd.concat([
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_d_val  = float(tr_d.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+            slope_5d   = float(ema50_series.iloc[-1] - ema50_series.iloc[-6])
+            slope_norm = slope_5d / atr_d_val if atr_d_val > 0 else 0.0
 
-    # Résolution votes → bias (max possible = 6)
+            if   slope_norm >  0.05: votes_bull += 1
+            elif slope_norm < -0.05: votes_bear += 1
+    except Exception:
+        pass
+
+    # ── Résolution votes → bias (max possible = 6) ───────────────
     if   votes_bull >= 5: bias = "STRONG BULLISH"
     elif votes_bull >= 3: bias = "BULLISH"
     elif votes_bear >= 5: bias = "STRONG BEARISH"
     elif votes_bear >= 3: bias = "BEARISH"
     else:                 bias = "NEUTRAL"
 
-    # Mapping vers format dashboard
     if bias == "STRONG BULLISH": return "Bullish", 90
     if bias == "BULLISH":        return "Bullish", 70
     if bias == "STRONG BEARISH": return "Bearish", 90
     if bias == "BEARISH":        return "Bearish", 70
     return "Range", 35
+
 
 def calc_institutional_trend_4h(df):
     """
@@ -276,7 +304,6 @@ def calc_institutional_trend_4h(df):
         score += 1 if pdi_val > mdi_val else -1
 
     # ── Facteur 3 : Référence institutionnelle — Daily Open ───────
-    # Premier open de chaque jour dans les données H4
     try:
         idx = df.index
         dates = pd.to_datetime(idx).normalize()
@@ -285,16 +312,15 @@ def calc_institutional_trend_4h(df):
         daily_open = float(df[today_mask]['Open'].iloc[0])
         score += 1 if cur > daily_open else -1
     except Exception:
-        pass  # Facteur ignoré si données insuffisantes
+        pass
 
-    # ── Résultante ────────────────────────────────────────────────
     abs_score = abs(score)
     strength  = 90 if abs_score == 3 else 70 if abs_score >= 1 else 40
     trend     = "Bullish" if score > 0 else "Bearish" if score < 0 else "Range"
     return trend, strength
 
-def calc_institutional_trend_intraday(df, macro_trend=None):
-    if len(df) < 50: return 'Range', 0
+def calc_institutional_trend_intraday(df):
+    if len(df) < 70: return 'Range', 0   # 70 bougies minimum : 50 EWM + 17 lag ZLEMA + marge
     close = df['Close']
     high = df['High']
     low = df['Low']
@@ -481,38 +507,55 @@ def analyze_market(account_id, access_token):
         row_data['15m'] = trends_map['15m']
 
         MTF_WEIGHTS = {'M': 5.0, 'W': 4.0, 'D': 4.0, '4H': 2.5, '1H': 1.5, '15m': 1.0}
-        TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())
+        TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())  # 18.0 — dénominateur toujours fixe
 
+        # ── Score pondéré MTF ─────────────────────────────────────────────────
+        # FIX S1 : dénominateur = TOTAL_WEIGHT fixe (18.0), jamais active_weight.
+        # L'ancien code utilisait le poids des TF actifs seulement → gonflait le %
+        # quand les TF courts étaient Range : M/W/D=Bull + 4H/1H/15m=Range → 73%
+        # affiché au lieu de 53% réel. Un TF Range = NON-CONFIRMATION, pas absent.
         w_bull = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bullish')
         w_bear = sum(MTF_WEIGHTS[tf] * (scores_map[tf]/100) for tf in trends_map if trends_map[tf] == 'Bearish')
-        
+
+        # Retracements = signal partiel (30% du poids, pas 0 ni 100%)
         w_bull += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bull')
         w_bear += sum(MTF_WEIGHTS[tf] * 0.3 for tf in trends_map if trends_map[tf] == 'Retracement Bear')
 
-        # Denominateur = poids TF actifs uniquement (pas Range)
-        active_weight = sum(MTF_WEIGHTS[tf] for tf in trends_map if trends_map[tf] != 'Range')
-        effective_total = active_weight if active_weight > 0 else TOTAL_WEIGHT
-        
-        high_tf_avg = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
-        quality = 'C'
-        high_tf_clean = ('Retracement' not in trends_map['D'] and 'Retracement' not in trends_map['M'] and 'Retracement' not in trends_map['W'])
-        
-        if trends_map['D'] == trends_map['M'] == trends_map['W'] and high_tf_clean:
-            if high_tf_avg >= 80: quality = 'A+'
+        # ── Grading qualité — FIX M4 : le 4H intégré ────────────────────────
+        # Le 4H est le premier TF d'entrée réel. Un A+ avec 4H contre-tendance
+        # n'est pas actionnable — dégradation d'un cran obligatoire.
+        high_tf_avg   = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
+        dominant      = 'Bullish' if w_bull > w_bear else 'Bearish'
+        h4_aligned    = trends_map['4H'] == dominant
+        high_tf_clean = (
+            'Retracement' not in trends_map['D'] and
+            'Retracement' not in trends_map['M'] and
+            'Retracement' not in trends_map['W']
+        )
+        macro_aligned = trends_map['D'] == trends_map['M'] == trends_map['W'] and high_tf_clean
+
+        if macro_aligned and h4_aligned:
+            # Structure macro propre + 4H confirme → grades supérieurs accessibles
+            if   high_tf_avg >= 80: quality = 'A+'
             elif high_tf_avg >= 70: quality = 'A'
-            else: quality = 'B'
-        elif trends_map['D'] == trends_map['M'] and high_tf_clean:
-            if high_tf_avg >= 75: quality = 'B+'
-            else: quality = 'B'
-        elif trends_map['D'] == trends_map['W'] and high_tf_clean:
+            else:                   quality = 'B+'
+        elif macro_aligned and not h4_aligned:
+            # Macro propre mais 4H diverge → dégradation d'un cran
+            if   high_tf_avg >= 80: quality = 'A'
+            elif high_tf_avg >= 70: quality = 'B+'
+            else:                   quality = 'B'
+        elif (trends_map['D'] == trends_map['M'] or trends_map['D'] == trends_map['W']) and high_tf_clean:
+            quality = 'B+' if h4_aligned else 'B'
+        elif (trends_map['D'] == trends_map['M'] or trends_map['D'] == trends_map['W']) and not high_tf_clean:
             quality = 'B-'
-        else: quality = 'C'
+        else:
+            quality = 'C'
 
         if w_bull > w_bear:
-            perc = (w_bull / effective_total) * 100
+            perc = (w_bull / TOTAL_WEIGHT) * 100
             final_trend = f"Bullish ({perc:.0f}%)"
         elif w_bear > w_bull:
-            perc = (w_bear / effective_total) * 100
+            perc = (w_bear / TOTAL_WEIGHT) * 100
             final_trend = f"Bearish ({perc:.0f}%)"
         else: final_trend = "Range"
 
@@ -536,100 +579,84 @@ def create_pdf(df):
         pdf = FPDF(orientation='L', unit='mm', format='A4')  # MODE PAYSAGE
         pdf.add_page()
         
-        # --- CONFIGURATION DES MARGES ET COULEURS ---
         margin_left = 10
         margin_top = 10
         pdf.set_margins(left=margin_left, top=margin_top, right=10)
         
-        # En-tête document
         pdf.set_font("Helvetica", "B", 16)
         pdf.cell(0, 10, "BLUESTAR HEDGE FUND GPS V2.1", ln=True, align="C")
         pdf.set_font("Helvetica", "", 9)
         pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
         pdf.ln(5)
         
-        # --- DÉFINITION DES COLONNES ET LARGEURS OPTIMISÉES (Total ~277mm utilisable) ---
         cols = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         
-        # Largeurs ajustées pour éviter la troncature du texte
         col_widths = {
-            'Paire': 24,       # Ticker
-            'M': 22, 'W': 22, 'D': 22, '4H': 22, '1H': 22, '15m': 22, # Tendance (espace pour "Retracement Bear")
-            'MTF': 35,         # Pourcentage long
-            'Quality': 15,     # Grade court
-            'ATR_Daily': 20, 'ATR_H1': 20, 'ATR_15m': 20  # Chiffres
+            'Paire': 24,
+            'M': 22, 'W': 22, 'D': 22, '4H': 22, '1H': 22, '15m': 22,
+            'MTF': 35,
+            'Quality': 15,
+            'ATR_Daily': 20, 'ATR_H1': 20, 'ATR_15m': 20
         }
-        # Total largeur : 24 + (22*6) + 35 + 15 + (20*3) = 261mm (Fait dans les 277mm dispo)
         
-        row_height = 6  # Hauteur de ligne réduite pour tenir plus de lignes
+        row_height = 6
         
-        # --- FONCTION INTERNE POUR IMPRIMER L'EN-TÊTE DU TABLEAU ---
         def print_table_header():
             pdf.set_y(pdf.get_y() + 2)
             pdf.set_font("Helvetica", "B", 8)
-            pdf.set_fill_color(30, 58, 138)  # Bleu foncé
+            pdf.set_fill_color(30, 58, 138)
             pdf.set_text_color(255, 255, 255)
             
             for c in cols:
                 pdf.cell(col_widths[c], 8, c.replace('_', ' '), border=1, align='C', fill=True)
             pdf.ln()
-            pdf.set_font("Helvetica", "", 7) # Retour police normale pour les données
+            pdf.set_font("Helvetica", "", 7)
 
-        # Impression du premier en-tête
         print_table_header()
         
-        # --- IMPRESSION DES DONNÉES ---
-        page_height = 297 # Hauteur page A4 Landscape
-        bottom_margin = 20 # Espace en bas pour la légende
+        page_height = 297
+        bottom_margin = 20
         
         for _, row in df.iterrows():
-            # VÉRIFICATION PAGINATION
-            # Si la position Y actuelle + hauteur ligne dépasse la limite
             if pdf.get_y() + row_height > page_height - bottom_margin:
                 pdf.add_page()
-                print_table_header() # On réimprime les titres sur la nouvelle page
+                print_table_header()
             
             for c in cols:
                 val = str(row[c])
                 
-                # --- GESTION DES COULEURS ---
                 fill_color = (255, 255, 255)
                 text_color = (0, 0, 0)
                 
                 if "Bull" in val and "Retracement" not in val:
-                    fill_color = (46, 204, 113) # Vert
+                    fill_color = (46, 204, 113)
                     text_color = (255, 255, 255)
                 elif "Bear" in val and "Retracement" not in val:
-                    fill_color = (231, 76, 60) # Rouge
+                    fill_color = (231, 76, 60)
                     text_color = (255, 255, 255)
                 elif "Retracement Bull" in val:
-                    fill_color = (125, 206, 160) # Vert clair
+                    fill_color = (125, 206, 160)
                     text_color = (255, 255, 255)
                 elif "Retracement Bear" in val:
-                    fill_color = (241, 148, 138) # Rouge clair
+                    fill_color = (241, 148, 138)
                     text_color = (255, 255, 255)
                 elif "Range" in val:
-                    fill_color = (149, 165, 166) # Gris
+                    fill_color = (149, 165, 166)
                     text_color = (255, 255, 255)
                 elif c == 'Quality':
-                    if val == 'A+': fill_color = (251, 191, 36) # Or
-                    elif val == 'A': fill_color = (163, 230, 53) # Vert
-                    elif val.startswith('B'): fill_color = (96, 165, 250) # Bleu
-                    else: fill_color = (156, 163, 175) # Gris
+                    if val == 'A+': fill_color = (251, 191, 36)
+                    elif val == 'A': fill_color = (163, 230, 53)
+                    elif val.startswith('B'): fill_color = (96, 165, 250)
+                    else: fill_color = (156, 163, 175)
                     text_color = (0, 0, 0)
                 
                 pdf.set_fill_color(*fill_color)
                 pdf.set_text_color(*text_color)
-                
-                # IMPRESSION CELLULE (SANS TRONCATURE)
-                # Largeur colonne suffisante pour contenir le texte
                 pdf.cell(col_widths[c], row_height, val, border=1, align='C', fill=True)
             
             pdf.ln()
 
-        # --- LÉGENDE (En bas de la dernière page) ---
         pdf.ln(4)
-        # Vérifier si la légende tient, sinon nouvelle page
         if pdf.get_y() > page_height - 40:
             pdf.add_page()
             
@@ -658,16 +685,14 @@ def create_pdf(df):
             pdf.set_text_color(0,0,0)
             pdf.cell(35, 4, legend)
             x_start += 40
-            if x_start > 250: # Retour à la ligne si trop large
+            if x_start > 250:
                 x_start = 10
                 y_pos += 5
                 pdf.set_xy(x_start, y_pos)
         
-        # --- GÉNÉRATION BUFFER ---
         buffer = BytesIO()
         pdf_output = pdf.output(dest='S')
         
-        # Gestion compatibilité Python
         if isinstance(pdf_output, str):
             buffer.write(pdf_output.encode('latin-1'))
         else:
@@ -677,7 +702,6 @@ def create_pdf(df):
         return buffer.getvalue()
         
     except Exception as e:
-        # En cas d'erreur critique, PDF d'erreur
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 12)
@@ -718,11 +742,9 @@ def main():
             df = analyze_market(acc, tok)
         
         if not df.empty:
-            # Filtrage UX
             if show_only_best:
                 df = df[df['Quality'].isin(['A+', 'A'])]
             
-            # Tri
             quality_order = ['A+', 'A', 'B+', 'B', 'B-', 'C']
             df['Quality'] = pd.Categorical(df['Quality'], categories=quality_order, ordered=True)
             df = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False]) 
@@ -731,7 +753,6 @@ def main():
     if "df" in st.session_state:
         df = st.session_state.df
         
-        # --- COMMAND CENTER ---
         c1, c2, c3, c4 = st.columns(4)
         total = len(df)
         a_plus = len(df[df['Quality'] == 'A+'])
@@ -743,7 +764,6 @@ def main():
         c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
         c4.metric("Setups B (BLUE)", b_grade, delta_color="inverse")
         
-        # --- TABLEAU STYLE ---
         cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
         
         def style_map(v):
@@ -766,7 +786,6 @@ def main():
             use_container_width=True
         )
         
-        # --- EXPORTS ---
         c1, c2 = st.columns(2)
         with c1:
             st.download_button("📄 Télécharger PDF", create_pdf(df[cols_order]), "Bluestar_GPS.pdf", "application/pdf", use_container_width=True)
