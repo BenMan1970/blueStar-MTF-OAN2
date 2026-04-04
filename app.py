@@ -735,7 +735,7 @@ def main():
             return [''] * len(s)
 
         st.dataframe(
-            df[cols_order].style.apply(quality_style, axis=0).applymap(style_map),
+            df[cols_order].style.apply(quality_style, axis=0).map(style_map),
             height=min(600, (len(df) + 1) * 35 + 10),
             use_container_width=True
         )
