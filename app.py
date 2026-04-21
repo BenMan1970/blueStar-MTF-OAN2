@@ -24,12 +24,14 @@ st.set_page_config(
 OANDA_API_URL = "https://api-fxpractice.oanda.com"
 
 FOREX_PAIRS_EXTENDED = [
-    'EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'USD_CHF', 'NZD_USD',
-    'EUR_GBP', 'EUR_JPY', 'EUR_AUD', 'EUR_CAD', 'EUR_CHF', 'EUR_NZD',
-    'GBP_JPY', 'GBP_AUD', 'GBP_CAD', 'GBP_CHF', 'GBP_NZD',
-    'AUD_JPY', 'AUD_CAD', 'AUD_CHF', 'AUD_NZD',
-    'CAD_JPY', 'CAD_CHF', 'NZD_JPY', 'NZD_CAD', 'NZD_CHF', 'CHF_JPY',
-    'XAU_USD', 'XPT_USD', 'US30_USD', 'SPX500_USD', 'NAS100_USD'
+    # 28 paires Forex
+    'EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'USD_CAD', 'AUD_USD', 'NZD_USD',
+    'EUR_GBP', 'EUR_JPY', 'EUR_CHF', 'EUR_AUD', 'EUR_CAD', 'EUR_NZD',
+    'GBP_JPY', 'GBP_CHF', 'GBP_AUD', 'GBP_CAD', 'GBP_NZD',
+    'AUD_JPY', 'AUD_CAD', 'AUD_CHF', 'AUD_NZD', 'CAD_JPY', 'CAD_CHF', 'CHF_JPY',
+    'NZD_JPY', 'NZD_CAD', 'NZD_CHF',
+    # 6 indices et métaux
+    'DE30_EUR', 'XAU_USD', 'XAG_USD', 'SPX500_USD', 'NAS100_USD', 'US30_USD',
 ]
 
 TREND_COLORS = {
@@ -80,12 +82,6 @@ def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
 def atr(high, low, close, period=14):
-    """
-    ATR Wilder — ewm(alpha=1/period) uniformisé sur toute la codebase.
-    FIX AUDIT : l'ancien code utilisait ewm(span=period) → alpha=2/(N+1)≈0.133
-    au lieu de ewm(alpha=1/period)≈0.071 (Wilder). Les deux ATR n'étaient
-    pas comparables. Uniformisé sur Wilder partout.
-    """
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
     tr3 = abs(low - close.shift(1))
@@ -93,7 +89,6 @@ def atr(high, low, close, period=14):
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def rsi(close, period=14):
-    """RSI standard Wilder (1978) — lissage EWM alpha=1/period."""
     delta = close.diff()
     gain  = delta.where(delta > 0, 0.0).ewm(alpha=1/period, adjust=False).mean()
     loss  = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/period, adjust=False).mean()
@@ -140,13 +135,6 @@ def calc_institutional_trend_macro(df, tf='W'):
 
 
 def calc_institutional_trend_daily(df):
-    """
-    Biais Daily — 5 facteurs, max 6 votes.
-    FIX AUDIT : Facteur 5 uniformisé sur ewm(alpha=1/14) — même formule
-    Wilder que la fonction atr() globale. Suppression du recalcul local
-    divergent qui utilisait aussi alpha=1/14 mais sur une série TR
-    différemment construite.
-    """
     if len(df) < 60:
         return 'Range', 0
 
@@ -158,7 +146,6 @@ def calc_institutional_trend_daily(df):
     votes_bull = 0
     votes_bear = 0
 
-    # ── Facteur 1 : Structure swing D1 (wing=5) ──────────────
     def _swing_pts(series, wing=5):
         highs, lows = [], []
         for i in range(wing, len(series) - wing):
@@ -178,15 +165,13 @@ def calc_institutional_trend_daily(df):
         if hh and hl:   votes_bull += 2
         elif lh and ll: votes_bear += 2
 
-    # ── Facteur 2 : EMA 21/50 stack vs prix courant ──────────
-    ema21       = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema21        = close.ewm(span=21, adjust=False).mean().iloc[-1]
     ema50_series = close.ewm(span=50, adjust=False).mean()
-    ema50       = ema50_series.iloc[-1]
+    ema50        = ema50_series.iloc[-1]
 
     if   cur > ema21 > ema50: votes_bull += 1
     elif cur < ema21 < ema50: votes_bear += 1
 
-    # ── Facteur 3 : Weekly Open vs prix courant ───────────────
     try:
         times       = pd.to_datetime(df.index)
         monday_mask = times.dayofweek.isin([0, 6])
@@ -198,16 +183,11 @@ def calc_institutional_trend_daily(df):
     except Exception:
         pass
 
-    # ── Facteur 4 : Close J-1 vs midpoint J-1 ────────────────
     if len(df) >= 2:
         midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
         if   float(close.iloc[-2]) > midpoint: votes_bull += 1
-        else:                                  votes_bear += 1
+        else:                                   votes_bear += 1
 
-    # ── Facteur 5 : Pente EMA50 normalisée par ATR Wilder ────
-    # FIX AUDIT : utilisation de la fonction atr() globale (Wilder uniforme)
-    # au lieu du recalcul local avec ewm(alpha=1/14) sur une série TR
-    # construite différemment — cohérence garantie avec le reste du code.
     try:
         if len(ema50_series) >= 6:
             atr_d_val  = float(atr(high, low, close, 14).iloc[-1])
@@ -218,7 +198,6 @@ def calc_institutional_trend_daily(df):
     except Exception:
         pass
 
-    # ── Résolution votes → bias ───────────────────────────────
     if   votes_bull >= 5: bias = "STRONG BULLISH"
     elif votes_bull >= 3: bias = "BULLISH"
     elif votes_bear >= 5: bias = "STRONG BEARISH"
@@ -241,11 +220,9 @@ def calc_institutional_trend_4h(df):
     cur   = float(close.iloc[-1])
     score = 0
 
-    # ── Facteur 1 : Prix vs EMA 50 ───────────────────────────
     ema50_val = close.ewm(span=50, adjust=False).mean().iloc[-1]
     score += 1 if cur > ema50_val else -1
 
-    # ── Facteur 2 : DI+ vs DI- ───────────────────────────────
     def _dmi(high, low, close, period=14):
         tr   = pd.concat([
             high - low,
@@ -265,7 +242,6 @@ def calc_institutional_trend_4h(df):
     if not (np.isnan(pdi_val) or np.isnan(mdi_val)):
         score += 1 if pdi_val > mdi_val else -1
 
-    # ── Facteur 3 : Daily Open ────────────────────────────────
     try:
         idx        = df.index
         dates      = pd.to_datetime(idx).normalize()
@@ -283,12 +259,6 @@ def calc_institutional_trend_4h(df):
 
 
 def calc_institutional_trend_intraday(df):
-    """
-    FIX AUDIT : ZLEMA lag corrigé de 17 → 24.
-    Formule standard Zero-Lag EMA : lag = (period - 1) / 2 = (50-1)/2 ≈ 24.
-    L'ancien lag=17 sous-compensait le décalage de l'EMA, faisant arriver
-    les signaux intraday plus tard que nécessaire.
-    """
     if len(df) < 70: return 'Range', 0
 
     close       = df['Close']
@@ -305,14 +275,13 @@ def calc_institutional_trend_intraday(df):
     curr_ema21 = ema21.iloc[-1]
     curr_ema9  = ema9.iloc[-1]
 
-    # FIX AUDIT : lag = (50-1)//2 = 24 (standard Zero-Lag EMA)
-    lag        = (50 - 1) // 2   # = 24
+    lag        = (50 - 1) // 2
     src_adj    = close + (close - close.shift(lag))
     zlema_val  = src_adj.ewm(span=50, adjust=False).mean()
     curr_zlema = zlema_val.iloc[-1]
 
-    has_baseline = len(df) >= 200
-    baseline     = sma(close, 200) if has_baseline else curr_ema50
+    has_baseline  = len(df) >= 200
+    baseline      = sma(close, 200) if has_baseline else curr_ema50
     curr_baseline = baseline.iloc[-1] if has_baseline else curr_ema50
 
     rsi_val     = rsi(close, 14).iloc[-1]
@@ -449,17 +418,15 @@ def analyze_market(account_id, access_token):
             elif mode == '4H':    t, s = calc_institutional_trend_4h(df)
             else:                 t, s = calc_institutional_trend_intraday(df)
 
-            trends_map[tf]  = t
-            scores_map[tf]  = s
-            row_data[tf]    = t
+            trends_map[tf] = t
+            scores_map[tf] = s
+            row_data[tf]   = t
 
-        # ── ATR export ───────────────────────────────────────────
         for tf_key, col_name in [('D', 'ATR_Daily'), ('1H', 'ATR_H1'), ('15m', 'ATR_15m')]:
             df_ref  = data_cache[tf_key]
             atr_val = atr(df_ref['High'], df_ref['Low'], df_ref['Close'], 14).iloc[-1]
             row_data[col_name] = f"{atr_val:.5f}" if atr_val < 1 else f"{atr_val:.2f}"
 
-        # ── Filtre macro ─────────────────────────────────────────
         macro_trend = (
             trends_map['M'] if trends_map['M'] != 'Range'
             else trends_map['W'] if trends_map['W'] != 'Range'
@@ -475,9 +442,8 @@ def analyze_market(account_id, access_token):
         row_data['1H']  = trends_map['1H']
         row_data['15m'] = trends_map['15m']
 
-        # ── Score pondéré MTF ─────────────────────────────────────
         MTF_WEIGHTS  = {'M': 5.0, 'W': 4.0, 'D': 4.0, '4H': 2.5, '1H': 1.5, '15m': 1.0}
-        TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())  # 18.0 — fixe
+        TOTAL_WEIGHT = sum(MTF_WEIGHTS.values())
 
         w_bull = sum(
             MTF_WEIGHTS[tf] * (scores_map[tf] / 100)
@@ -487,10 +453,6 @@ def analyze_market(account_id, access_token):
             MTF_WEIGHTS[tf] * (scores_map[tf] / 100)
             for tf in trends_map if trends_map[tf] == 'Bearish'
         )
-
-        # FIX AUDIT : Retracements — utilisation de scores_map[tf] réel
-        # au lieu du poids fixe 30%. scores_map[tf]=45 → contribution = 45/100 * poids.
-        # Cela exploite le score réel retourné par calc_institutional_trend_intraday.
         w_bull += sum(
             MTF_WEIGHTS[tf] * (scores_map[tf] / 100)
             for tf in trends_map if trends_map[tf] == 'Retracement Bull'
@@ -500,7 +462,6 @@ def analyze_market(account_id, access_token):
             for tf in trends_map if trends_map[tf] == 'Retracement Bear'
         )
 
-        # ── Grading qualité ───────────────────────────────────────
         high_tf_avg   = (scores_map['M'] + scores_map['W'] + scores_map['D']) / 3
         dominant      = 'Bullish' if w_bull > w_bear else 'Bearish'
         h4_aligned    = trends_map['4H'] == dominant
@@ -529,10 +490,10 @@ def analyze_market(account_id, access_token):
             quality = 'C'
 
         if w_bull > w_bear:
-            perc       = (w_bull / TOTAL_WEIGHT) * 100
+            perc        = (w_bull / TOTAL_WEIGHT) * 100
             final_trend = f"Bullish ({perc:.0f}%)"
         elif w_bear > w_bull:
-            perc       = (w_bear / TOTAL_WEIGHT) * 100
+            perc        = (w_bear / TOTAL_WEIGHT) * 100
             final_trend = f"Bearish ({perc:.0f}%)"
         else:
             final_trend = "Range"
@@ -699,9 +660,9 @@ def main():
             if show_only_best:
                 df = df[df['Quality'].isin(['A+', 'A'])]
 
-            quality_order  = ['A+', 'A', 'B+', 'B', 'B-', 'C']
-            df['Quality']  = pd.Categorical(df['Quality'], categories=quality_order, ordered=True)
-            df             = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False])
+            quality_order = ['A+', 'A', 'B+', 'B', 'B-', 'C']
+            df['Quality'] = pd.Categorical(df['Quality'], categories=quality_order, ordered=True)
+            df            = df.sort_values(by=['Quality', 'MTF'], ascending=[True, False])
             st.session_state.df = df
 
     if "df" in st.session_state:
@@ -713,10 +674,10 @@ def main():
         a_grade = len(df[df['Quality'] == 'A'])
         b_grade = len(df[df['Quality'].str.startswith('B')])
 
-        c1.metric("Total Analyzed",    total)
-        c2.metric("Setups A+ (GOLD)",  a_plus,  delta_color="inverse")
-        c3.metric("Setups A (GREEN)",  a_grade, delta_color="inverse")
-        c4.metric("Setups B (BLUE)",   b_grade, delta_color="inverse")
+        c1.metric("Total Analyzed",   total)
+        c2.metric("Setups A+ (GOLD)", a_plus,  delta_color="inverse")
+        c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
+        c4.metric("Setups B (BLUE)",  b_grade, delta_color="inverse")
 
         cols_order = ['Paire', 'M', 'W', 'D', '4H', '1H', '15m', 'MTF', 'Quality', 'ATR_Daily', 'ATR_H1', 'ATR_15m']
 
