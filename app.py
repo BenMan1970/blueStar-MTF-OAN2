@@ -519,7 +519,12 @@ def analyze_pair(pair, account_id, access_token):
     atr_vals = {}
     for tf_key, col in [('D', 'ATR Daily'), ('1H', 'ATR H1'), ('15m', 'ATR 15m')]:
         v = float(_atr(cache[tf_key]['High'], cache[tf_key]['Low'], cache[tf_key]['Close'], 14).iloc[-1])
-        atr_vals[col] = f"{v:.5f}" if v < 1 else f"{v:.2f}"
+        if v >= 10:
+            atr_vals[col] = f"{v:.2f}"       # indices, or, argent
+        elif v >= 0.1:
+            atr_vals[col] = f"{v:.4f}"       # JPY pairs, métaux légers
+        else:
+            atr_vals[col] = f"{v:.5f}"       # paires forex standard
 
     row = {
         'Paire':     pair.replace('_', '/'),
@@ -637,9 +642,17 @@ def create_pdf(df):
         out = pdf.output(dest='S')
         buf.write(out.encode('latin-1') if isinstance(out, str) else out)
         buf.seek(0)
-        return buf.getvalue()
+        return buf
     except Exception as e:
-        return b""
+        # fallback minimal
+        pdf2 = FPDF(); pdf2.add_page()
+        pdf2.set_font("Helvetica","B",12)
+        pdf2.cell(0,10,"PDF Generation Error",ln=True)
+        buf2 = BytesIO()
+        out2 = pdf2.output(dest='S')
+        buf2.write(out2.encode('latin-1') if isinstance(out2, str) else out2)
+        buf2.seek(0)
+        return buf2
 
 # ===================== UI =====================
 
@@ -713,18 +726,28 @@ def main():
     styled = df[cols_present].style.apply(style_quality, axis=0).map(style_trend)
     st.dataframe(
         styled,
-        height=min(600, (len(df) + 1) * 35 + 10),
+        height=min(800, max(400, (len(df) + 1) * 38 + 10)),
         use_container_width=True
     )
 
-    r1, r2 = st.columns(2)
+    c1, c2 = st.columns(2)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    with r1:
-        st.download_button("📄 PDF", create_pdf(df[cols_present]),
-                           f"Bluestar_GPS_{ts}.pdf", "application/pdf", use_container_width=True)
-    with r2:
-        st.download_button("📊 CSV", df[cols_present].to_csv(index=False).encode(),
-                           f"Bluestar_GPS_{ts}.csv", "text/csv", use_container_width=True)
+    with c1:
+        st.download_button(
+            "📄 Télécharger PDF",
+            data=create_pdf(df[cols_present]),
+            file_name=f"Bluestar_GPS_{ts}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+    with c2:
+        st.download_button(
+            "📊 Télécharger CSV",
+            data=df[cols_present].to_csv(index=False).encode(),
+            file_name=f"Bluestar_GPS_{ts}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
 if __name__ == "__main__":
     main()
