@@ -1,5 +1,5 @@
 # app.py — BLUESTAR GPS V3.0
-# Refonte propre : parallélisation · grades percentiles · Conflit · Âge D1 · Divergence RSI
+# Refonte propre : parallélisation · grades hybrides · Âge D1 · ATR adaptatif
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -26,12 +26,11 @@ INSTRUMENTS = [
     'AUD_JPY', 'AUD_CAD', 'AUD_CHF', 'AUD_NZD', 'CAD_JPY', 'CAD_CHF', 'CHF_JPY',
     'NZD_JPY', 'NZD_CAD', 'NZD_CHF',
     # 6 indices et métaux
-    'DE30_EUR', 'XAU_USD', 'XAG_USD', 'SPX500_USD', 'NAS100_USD', 'US30_USD',
+    'DE30_EUR', 'XAU_USD', 'SPX500_USD', 'NAS100_USD', 'US30_USD',
 ]
 
 # Instruments sans volume fiable sur OANDA — volume ignoré en intraday
-INDICES = {'DE30_EUR', 'SPX500_USD', 'NAS100_USD', 'US30_USD',
-           'XAU_USD', 'XAG_USD'}
+INDICES = {'DE30_EUR', 'SPX500_USD', 'NAS100_USD', 'US30_USD', 'XAU_USD'}
 
 TREND_COLORS = {
     'Bullish':          '#2ecc71',
@@ -313,15 +312,6 @@ def trend_age_daily(df):
     return str(len(above))
 
 
-def rsi_divergence_daily(df):
-    """
-    Divergence cachée simple sur D1 :
-    Prix HH mais RSI LH → divergence baissière
-    Prix LL mais RSI HL → divergence haussière
-    Fenêtre : 20 dernières bougies.
-    """
-    if len(df) < 25:
-        return ''
     c    = df['Close'].iloc[-20:]
     rsi_ = _rsi(df['Close'], 14).iloc[-20:]
     ph   = df['High'].iloc[-20:]
@@ -514,32 +504,27 @@ def analyze_pair(pair, account_id, access_token):
     mtf_dir, mtf_score = score_mtf(trends, scores)
     conflict            = conflict_flag(trends)
     age                 = trend_age_daily(cache['D'])
-    divergence          = rsi_divergence_daily(cache['D'])
 
     atr_vals = {}
     for tf_key, col in [('D', 'ATR Daily'), ('1H', 'ATR H1'), ('15m', 'ATR 15m')]:
         v = float(_atr(cache[tf_key]['High'], cache[tf_key]['Low'], cache[tf_key]['Close'], 14).iloc[-1])
-        if v >= 10:
-            atr_vals[col] = f"{v:.2f}"       # indices, or, argent
-        elif v >= 0.1:
-            atr_vals[col] = f"{v:.4f}"       # JPY pairs, métaux légers
+        if v >= 1:
+            atr_vals[col] = f"{v:.2f}"    # indices, XAU, JPY pairs
         else:
-            atr_vals[col] = f"{v:.5f}"       # paires forex standard
+            atr_vals[col] = f"{v:.4f}"    # forex standard (0.0013 = lisible, pip visible)
 
     row = {
-        'Paire':     pair.replace('_', '/'),
-        'M':         trends['M'],
-        'W':         trends['W'],
-        'D':         trends['D'],
-        '4H':        trends['4H'],
-        '1H':        trends['1H'],
-        '15m':       trends['15m'],
-        'MTF':       f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != 'Range' else 'Range',
+        'Paire':      pair.replace('_', '/'),
+        'M':          trends['M'],
+        'W':          trends['W'],
+        'D':          trends['D'],
+        '4H':         trends['4H'],
+        '1H':         trends['1H'],
+        '15m':        trends['15m'],
+        'MTF':        f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != 'Range' else 'Range',
         '_mtf_score': mtf_score,
         '_mtf_dir':   mtf_dir,
-        'Conflit':   conflict,
-        'Âge D1':   age,
-        'Div RSI':   divergence,
+        'Âge D1':    age,
     }
     row.update(atr_vals)
     return row
@@ -599,9 +584,9 @@ def create_pdf(df):
         pdf.cell(0, 5, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
         pdf.ln(4)
 
-        COLS = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Conflit','Âge D1','Div RSI','ATR Daily','ATR H1','ATR 15m']
-        WIDTHS = {'Paire':20,'M':18,'W':18,'D':18,'4H':18,'1H':18,'15m':18,'MTF':30,'Quality':13,
-                  'Conflit':22,'Âge D1':14,'Div RSI':18,'ATR Daily':18,'ATR H1':16,'ATR 15m':16}
+        COLS = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Âge D1','ATR Daily','ATR H1','ATR 15m']
+        WIDTHS = {'Paire':24,'M':20,'W':20,'D':20,'4H':20,'1H':20,'15m':20,'MTF':34,'Quality':14,
+                  'Âge D1':16,'ATR Daily':20,'ATR H1':18,'ATR 15m':18}
         RH = 5.5
 
         def header():
@@ -668,7 +653,6 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration")
         only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
-        hide_conflict = st.checkbox("Masquer les conflits macro/intra", value=False)
         st.info("Le cache dure 10 minutes pour optimiser les performances API.")
 
     if st.button("🚀 LANCER L'ANALYSE TOUS ACTIFS", type="primary", use_container_width=True):
@@ -684,28 +668,24 @@ def main():
 
     if only_best:
         df = df[df['Quality'].isin(['A+','A'])]
-    if hide_conflict:
-        df = df[df['Conflit'] == '']
 
     GRADE_ORDER = ['A+','A','B+','B']
     df['Quality'] = pd.Categorical(df['Quality'], categories=GRADE_ORDER, ordered=True)
     df = df.sort_values(['Quality','MTF'], ascending=[True, False])
 
     # Métriques — style V2.1
-    c1, c2, c3, c4, c5 = st.columns(5)
-    total      = len(df)
-    a_plus     = len(df[df['Quality'] == 'A+'])
-    a_grade    = len(df[df['Quality'] == 'A'])
-    b_grade    = len(df[df['Quality'].isin(['B+','B'])])
-    conflits   = len(df[df['Conflit'] != ''])
+    c1, c2, c3, c4 = st.columns(4)
+    total   = len(df)
+    a_plus  = len(df[df['Quality'] == 'A+'])
+    a_grade = len(df[df['Quality'] == 'A'])
+    b_grade = len(df[df['Quality'].isin(['B+','B'])])
 
-    c1.metric("Total Analyzed",    total)
-    c2.metric("Setups A+ (GOLD)",  a_plus,  delta_color="inverse")
-    c3.metric("Setups A (GREEN)",  a_grade, delta_color="inverse")
-    c4.metric("Setups B (BLUE)",   b_grade, delta_color="inverse")
-    c5.metric("Conflits MTF",      conflits)
+    c1.metric("Total Analyzed",   total)
+    c2.metric("Setups A+ (GOLD)", a_plus,  delta_color="inverse")
+    c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
+    c4.metric("Setups B (BLUE)",  b_grade, delta_color="inverse")
 
-    DISPLAY = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Conflit','Âge D1','Div RSI','ATR Daily','ATR H1','ATR 15m']
+    DISPLAY = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Âge D1','ATR Daily','ATR H1','ATR 15m']
     GRADE_CSS = {'A+':'#fbbf24','A':'#a3e635','B+':'#34d399','B':'#60a5fa'}
 
     def style_trend(v):
