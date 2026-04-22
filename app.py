@@ -667,7 +667,8 @@ def main():
     st.dataframe(
         styled,
         height=min(800, max(400, (len(df) + 1) * 38 + 10)),
-        use_container_width=True
+        use_container_width=True,
+        hide_index=True
     )
 
     c1, c2 = st.columns(2)
