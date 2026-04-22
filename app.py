@@ -1,4 +1,4 @@
-# app.py — BLUESTAR GPS V3.0
+# app.py — BLUESTAR GPS V3.1
 # Refonte propre : parallélisation · grades hybrides · Âge D1 · ATR adaptatif
 import streamlit as st
 import pandas as pd
@@ -312,27 +312,6 @@ def trend_age_daily(df):
     return str(len(above))
 
 
-    c    = df['Close'].iloc[-20:]
-    rsi_ = _rsi(df['Close'], 14).iloc[-20:]
-    ph   = df['High'].iloc[-20:]
-
-    # Comparer les 5 premières vs 5 dernières bougies de la fenêtre
-    price_hi_early = ph.iloc[:5].max()
-    price_hi_late  = ph.iloc[-5:].max()
-    rsi_hi_early   = rsi_.iloc[:5].max()
-    rsi_hi_late    = rsi_.iloc[-5:].max()
-
-    price_lo_early = c.iloc[:5].min()
-    price_lo_late  = c.iloc[-5:].min()
-    rsi_lo_early   = rsi_.iloc[:5].min()
-    rsi_lo_late    = rsi_.iloc[-5:].min()
-
-    if price_hi_late > price_hi_early and rsi_hi_late < rsi_hi_early:
-        return '⚠️ Div Bear'
-    if price_lo_late < price_lo_early and rsi_lo_late > rsi_lo_early:
-        return '⚠️ Div Bull'
-    return ''
-
 # ===================== API =====================
 
 def fetch_candles(instrument, granularity, count, account_id, access_token):
@@ -436,24 +415,6 @@ def score_mtf(trends, scores):
     return direction, min(100, raw_score + bonus)
 
 
-def conflict_flag(trends):
-    """
-    Détecte les conflits macro vs intraday sans écraser les signaux.
-    M/W/D = biais macro, 1H/15m = intraday.
-    """
-    macro_votes = [trends.get(tf) for tf in ('M', 'W', 'D')]
-    bull_macro  = macro_votes.count('Bullish')
-    bear_macro  = macro_votes.count('Bearish')
-
-    intra = [trends.get(tf) for tf in ('1H', '15m')]
-    bull_intra = sum(1 for t in intra if t and t.startswith('Bullish'))
-    bear_intra = sum(1 for t in intra if t and t.startswith('Bearish'))
-
-    if bull_macro >= 2 and bear_intra >= 1:
-        return 'Macro↑/Intra↓'
-    if bear_macro >= 2 and bull_intra >= 1:
-        return 'Macro↓/Intra↑'
-    return ''
 
 
 def grade_hybrid(scores_list):
@@ -502,8 +463,7 @@ def analyze_pair(pair, account_id, access_token):
     trends['15m'], scores['15m'] = trend_intraday(cache['15m'], pair)
 
     mtf_dir, mtf_score = score_mtf(trends, scores)
-    conflict            = conflict_flag(trends)
-    age                 = trend_age_daily(cache['D'])
+    age = trend_age_daily(cache['D'])
 
     atr_vals = {}
     for tf_key, col in [('D', 'ATR Daily'), ('1H', 'ATR H1'), ('15m', 'ATR 15m')]:
