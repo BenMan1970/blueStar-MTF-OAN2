@@ -43,11 +43,20 @@ TREND_COLORS = {
 
 st.markdown("""
 <style>
-.main-header {
-    text-align:center; padding:18px;
-    background:linear-gradient(135deg,#1e3a8a,#172554);
-    color:white; border-radius:10px; margin-bottom:18px;
-}
+    .main-header {
+        text-align: center; padding: 20px;
+        background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%);
+        color: white; border-radius: 12px; margin-bottom: 20px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+    }
+    .metric-card {
+        background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.1); text-align: center;
+    }
+    .metric-value { font-size: 1.5em; font-weight: bold; margin-top: 5px; }
+    .metric-label { font-size: 0.9em; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+    .stDataFrame { width: 100%; }
+    div[data-testid="stMarkdown"] { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -635,22 +644,23 @@ def create_pdf(df):
 # ===================== UI =====================
 
 def main():
-    st.markdown("<div class='main-header'><h1>🧭 BLUESTAR GPS V3.1</h1></div>", unsafe_allow_html=True)
+    st.markdown("<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V3.1</h1></div>", unsafe_allow_html=True)
 
     try:
         acc = st.secrets["OANDA_ACCOUNT_ID"]
         tok = st.secrets["OANDA_ACCESS_TOKEN"]
     except Exception:
-        st.error("Secrets OANDA manquants"); st.stop()
+        st.error("❌ Secrets OANDA manquants"); st.stop()
 
     with st.sidebar:
-        st.header("Filtres")
-        only_best = st.checkbox("Grades A+ / A uniquement", False)
-        hide_conflict = st.checkbox("Masquer les conflits macro/intra", False)
-        st.caption("Cache 10 min — données rafraîchies automatiquement.")
+        st.header("⚙️ Configuration")
+        only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
+        hide_conflict = st.checkbox("Masquer les conflits macro/intra", value=False)
+        st.info("Le cache dure 10 minutes pour optimiser les performances API.")
 
-    if st.button("🚀 LANCER L'ANALYSE", type="primary", use_container_width=True):
-        df = analyze_all(acc, tok)
+    if st.button("🚀 LANCER L'ANALYSE TOUS ACTIFS", type="primary", use_container_width=True):
+        with st.spinner("Analyse Multi-Timeframe en cours..."):
+            df = analyze_all(acc, tok)
         if not df.empty:
             st.session_state.df = df
 
@@ -668,34 +678,44 @@ def main():
     df['Quality'] = pd.Categorical(df['Quality'], categories=GRADE_ORDER, ordered=True)
     df = df.sort_values(['Quality','MTF'], ascending=[True, False])
 
-    # Métriques
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Total",       len(df))
-    c2.metric("A+",          len(df[df['Quality']=='A+']))
-    c3.metric("A",           len(df[df['Quality']=='A']))
-    c4.metric("B+/B",        len(df[df['Quality'].isin(['B+','B'])]))
-    c5.metric("Conflits",    len(df[df['Conflit'] != '']))
+    # Métriques — style V2.1
+    c1, c2, c3, c4, c5 = st.columns(5)
+    total      = len(df)
+    a_plus     = len(df[df['Quality'] == 'A+'])
+    a_grade    = len(df[df['Quality'] == 'A'])
+    b_grade    = len(df[df['Quality'].isin(['B+','B'])])
+    conflits   = len(df[df['Conflit'] != ''])
+
+    c1.metric("Total Analyzed",    total)
+    c2.metric("Setups A+ (GOLD)",  a_plus,  delta_color="inverse")
+    c3.metric("Setups A (GREEN)",  a_grade, delta_color="inverse")
+    c4.metric("Setups B (BLUE)",   b_grade, delta_color="inverse")
+    c5.metric("Conflits MTF",      conflits)
 
     DISPLAY = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Conflit','Âge D1','Div RSI','ATR Daily','ATR H1','ATR 15m']
     GRADE_CSS = {'A+':'#fbbf24','A':'#a3e635','B+':'#34d399','B':'#60a5fa'}
 
     def style_trend(v):
         if not isinstance(v, str): return ''
-        if 'Bull' in v and 'Ret' not in v:  return f'background:{TREND_COLORS["Bullish"]};color:white;font-weight:bold'
-        if 'Bear' in v and 'Ret' not in v:  return f'background:{TREND_COLORS["Bearish"]};color:white;font-weight:bold'
-        if 'Retracement Bull' in v:          return f'background:{TREND_COLORS["Retracement Bull"]};color:white'
-        if 'Retracement Bear' in v:          return f'background:{TREND_COLORS["Retracement Bear"]};color:white'
-        if 'Range' in v:                     return f'background:{TREND_COLORS["Range"]};color:white'
-        if 'Macro' in v:                     return 'background:#fef3c7;color:#92400e;font-weight:bold'
+        if 'Bull' in v and 'Ret' not in v:  return f'background-color:{TREND_COLORS["Bullish"]};color:white;font-weight:bold'
+        if 'Bear' in v and 'Ret' not in v:  return f'background-color:{TREND_COLORS["Bearish"]};color:white;font-weight:bold'
+        if 'Retracement Bull' in v:          return f'background-color:{TREND_COLORS["Retracement Bull"]};color:white'
+        if 'Retracement Bear' in v:          return f'background-color:{TREND_COLORS["Retracement Bear"]};color:white'
+        if 'Range' in v:                     return f'background-color:{TREND_COLORS["Range"]};color:white'
+        if 'Macro' in v:                     return 'background-color:#fef3c7;color:#92400e;font-weight:bold'
         return ''
 
     def style_quality(s):
         if s.name != 'Quality': return [''] * len(s)
-        return [f'color:black;font-weight:bold;background:{GRADE_CSS.get(x,"#9ca3af")}' for x in s]
+        return [f'color:black;font-weight:bold;background-color:{GRADE_CSS.get(x,"#9ca3af")}' for x in s]
 
     cols_present = [c for c in DISPLAY if c in df.columns]
     styled = df[cols_present].style.apply(style_quality, axis=0).map(style_trend)
-    st.dataframe(styled, height=min(700, (len(df)+1)*36+10), use_container_width=True)
+    st.dataframe(
+        styled,
+        height=min(600, (len(df) + 1) * 35 + 10),
+        use_container_width=True
+    )
 
     r1, r2 = st.columns(2)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -708,4 +728,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-       
