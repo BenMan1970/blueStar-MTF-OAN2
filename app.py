@@ -1,13 +1,3 @@
-# app.py — BLUESTAR GPS V3.2
-# [v3.2] ATR H4 pré-calculé directement depuis les bougies H4
-#         → élimine la substitution ATR Daily/2.5 dans le prompt Cascade
-#         → colonne "ATR H4" ajoutée après "ATR Daily" dans PDF et UI
-# [v3.2] Correction commentaire : "6 indices" → "5 indices + 1 métal"
-# [v3.2] ATR H4 aligné avec CHoCH : même granularité H4, même période 14
-#         Note : GPS utilise Wilder EWM (ewm alpha=1/n) — légèrement différent
-#         du simple mean du CHoCH (np.mean tr[-14]), écart < 5%, non bloquant.
-# Tout le reste est identique à v3.1.
-
 import streamlit as st
 import pandas as pd
 import numpy as np
