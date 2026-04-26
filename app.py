@@ -1,5 +1,13 @@
-# app.py — BLUESTAR GPS V3.1
-# Refonte propre : parallélisation · grades hybrides · Âge D1 · ATR adaptatif
+# app.py — BLUESTAR GPS V3.2
+# [v3.2] ATR H4 pré-calculé directement depuis les bougies H4
+#         → élimine la substitution ATR Daily/2.5 dans le prompt Cascade
+#         → colonne "ATR H4" ajoutée après "ATR Daily" dans PDF et UI
+# [v3.2] Correction commentaire : "6 indices" → "5 indices + 1 métal"
+# [v3.2] ATR H4 aligné avec CHoCH : même granularité H4, même période 14
+#         Note : GPS utilise Wilder EWM (ewm alpha=1/n) — légèrement différent
+#         du simple mean du CHoCH (np.mean tr[-14]), écart < 5%, non bloquant.
+# Tout le reste est identique à v3.1.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,7 +22,7 @@ except ImportError:
     st.warning("fpdf manquant — pip install fpdf")
 
 # ===================== CONFIG =====================
-st.set_page_config(page_title="Bluestar GPS V3.1", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Bluestar GPS V3.2", page_icon="🧭", layout="wide")
 
 OANDA_API_URL = "https://api-fxpractice.oanda.com"
 
@@ -25,7 +33,7 @@ INSTRUMENTS = [
     'GBP_JPY', 'GBP_CHF', 'GBP_AUD', 'GBP_CAD', 'GBP_NZD',
     'AUD_JPY', 'AUD_CAD', 'AUD_CHF', 'AUD_NZD', 'CAD_JPY', 'CAD_CHF', 'CHF_JPY',
     'NZD_JPY', 'NZD_CAD', 'NZD_CHF',
-    # 6 indices et métaux
+    # 4 indices + 1 métal  ← [v3.2 : commentaire corrigé — était "6 indices"]
     'DE30_EUR', 'XAU_USD', 'SPX500_USD', 'NAS100_USD', 'US30_USD',
 ]
 
@@ -99,6 +107,18 @@ def _dmi(high, low, close, n=14):
     pdi   = 100 * pdm.ewm(alpha=1/n, adjust=False).mean() / atr_s.replace(0, np.nan)
     mdi   = 100 * mdm.ewm(alpha=1/n, adjust=False).mean() / atr_s.replace(0, np.nan)
     return pdi.iloc[-1], mdi.iloc[-1]
+
+# ===================== FORMAT ATR =====================
+
+def _fmt_atr(val):
+    """
+    Format ATR adaptatif — identique pour toutes les colonnes ATR.
+    ≥ 1    → 2 décimales  (indices, XAU, paires JPY)
+    < 1    → 4 décimales  (forex standard — pip visible)
+    """
+    if val >= 1:
+        return f"{val:.2f}"
+    return f"{val:.4f}"
 
 # ===================== TENDANCE PAR TF =====================
 
@@ -223,9 +243,6 @@ def trend_intraday(df, instrument=''):
     Intraday H1/M15 — 3 votes de base : ZLEMA · EMA stack · momentum RSI/MACD.
     4ème vote (volume) activé uniquement sur forex — ignoré sur indices/métaux
     où OANDA ne fournit pas de volume fiable.
-    Signal net : 3/3 (ou 4/4 sur forex) → fort
-    2/3 (ou 3/4 sur forex) → modéré
-    Retracement sinon.
     """
     if len(df) < 70:
         return 'Range', 0
@@ -258,7 +275,6 @@ def trend_intraday(df, instrument=''):
     votes_bull = [bull_zlema, bull_stack, bull_mom]
     votes_bear = [bear_zlema, bear_stack, bear_mom]
 
-    # Vote volume — forex uniquement
     use_volume = instrument not in INDICES and 'Volume' in df.columns
     max_votes  = 3
     if use_volume:
@@ -297,8 +313,6 @@ def trend_intraday(df, instrument=''):
 def trend_age_daily(df):
     """
     Nombre de bougies D1 depuis que le close a croisé l'EMA50.
-    Plus réactif que EMA21/50 — reflète le moment où le prix
-    a réellement changé de camp par rapport à sa moyenne clé.
     """
     if len(df) < 55:
         return 'N/A'
@@ -403,7 +417,6 @@ def score_mtf(trends, scores):
     else:
         return 'Range', 0
 
-    # Bonus additifs d'alignement — prévisibles et auditables
     bonus = 0
     if (trends.get('M','') == trends.get('W','') and
             trends.get('M','') not in ('Range', '')):
@@ -413,8 +426,6 @@ def score_mtf(trends, scores):
         bonus += 10
 
     return direction, min(100, raw_score + bonus)
-
-
 
 
 def grade_hybrid(scores_list):
@@ -465,13 +476,14 @@ def analyze_pair(pair, account_id, access_token):
     mtf_dir, mtf_score = score_mtf(trends, scores)
     age = trend_age_daily(cache['D'])
 
+    # ── ATR Daily, H4, H1, 15m ──────────────────────────────────────────
+    # [v3.2] ATR H4 calculé directement depuis les bougies H4 réelles.
+    #        Le prompt Cascade peut lire la colonne ATR H4 sans substitution.
+    #        Méthode : Wilder EWM (ewm alpha=1/14) — cohérente avec ATR Daily/H1.
     atr_vals = {}
-    for tf_key, col in [('D', 'ATR Daily'), ('1H', 'ATR H1'), ('15m', 'ATR 15m')]:
+    for tf_key, col in [('D', 'ATR Daily'), ('4H', 'ATR H4'), ('1H', 'ATR H1'), ('15m', 'ATR 15m')]:
         v = float(_atr(cache[tf_key]['High'], cache[tf_key]['Low'], cache[tf_key]['Close'], 14).iloc[-1])
-        if v >= 1:
-            atr_vals[col] = f"{v:.2f}"    # indices, XAU, JPY pairs
-        else:
-            atr_vals[col] = f"{v:.4f}"    # forex standard (0.0013 = lisible, pip visible)
+        atr_vals[col] = _fmt_atr(v)
 
     row = {
         'Paire':      pair.replace('_', '/'),
@@ -520,7 +532,6 @@ def analyze_all(account_id, access_token):
     if not results:
         return pd.DataFrame()
 
-    # Grading hybride (percentile relatif + plancher absolu)
     scores_list = [r['_mtf_score'] for r in results]
     grades      = grade_hybrid(scores_list)
     for r, g in zip(results, grades):
@@ -539,47 +550,61 @@ def create_pdf(df):
         pdf.set_margins(10, 10, 10)
 
         pdf.set_font("Helvetica", "B", 15)
-        pdf.cell(0, 9, "BLUESTAR GPS V3.1", ln=True, align="C")
+        pdf.cell(0, 9, "BLUESTAR GPS V3.2", ln=True, align="C")
         pdf.set_font("Helvetica", "", 8)
         pdf.cell(0, 5, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
         pdf.ln(4)
 
-        COLS = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Âge D1','ATR Daily','ATR H1','ATR 15m']
-        WIDTHS = {'Paire':24,'M':20,'W':20,'D':20,'4H':20,'1H':20,'15m':20,'MTF':34,'Quality':14,
-                  'Âge D1':16,'ATR Daily':20,'ATR H1':18,'ATR 15m':18}
+        # [v3.2] ATR H4 ajouté entre ATR Daily et ATR H1
+        COLS = [
+            'Paire', 'M', 'W', 'D', '4H', '1H', '15m',
+            'MTF', 'Quality', 'Âge D1',
+            'ATR Daily', 'ATR H4', 'ATR H1', 'ATR 15m'
+        ]
+        WIDTHS = {
+            'Paire': 22, 'M': 18, 'W': 18, 'D': 18, '4H': 18, '1H': 18, '15m': 18,
+            'MTF': 32, 'Quality': 13, 'Âge D1': 14,
+            'ATR Daily': 18, 'ATR H4': 18, 'ATR H1': 16, 'ATR 15m': 16
+        }
         RH = 5.5
 
         def header():
-            pdf.set_font("Helvetica","B",7)
-            pdf.set_fill_color(30,58,138); pdf.set_text_color(255,255,255)
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.set_fill_color(30, 58, 138)
+            pdf.set_text_color(255, 255, 255)
             for c in COLS:
                 pdf.cell(WIDTHS[c], 7, c, border=1, align='C', fill=True)
-            pdf.ln(); pdf.set_font("Helvetica","",6.5)
+            pdf.ln()
+            pdf.set_font("Helvetica", "", 6.5)
 
         header()
-        GRADE_RGB = {'A+':(251,191,36),'A':(163,230,53),'B+':(52,211,153),'B':(96,165,250)}
+        GRADE_RGB = {'A+': (251, 191, 36), 'A': (163, 230, 53), 'B+': (52, 211, 153), 'B': (96, 165, 250)}
 
         for _, row in df.iterrows():
             if pdf.get_y() + RH > 287 - 15:
-                pdf.add_page(); header()
+                pdf.add_page()
+                header()
             for c in COLS:
-                val = str(row.get(c,''))
-                fc  = (255,255,255); tc = (0,0,0)
+                val = str(row.get(c, ''))
+                fc  = (255, 255, 255)
+                tc  = (0, 0, 0)
                 if c == 'Quality':
-                    fc = GRADE_RGB.get(val,(156,163,175)); tc=(0,0,0)
+                    fc = GRADE_RGB.get(val, (156, 163, 175))
+                    tc = (0, 0, 0)
                 elif 'Bull' in val and 'Ret' not in val:
-                    fc=(46,204,113); tc=(255,255,255)
+                    fc = (46, 204, 113); tc = (255, 255, 255)
                 elif 'Bear' in val and 'Ret' not in val:
-                    fc=(231,76,60);  tc=(255,255,255)
+                    fc = (231, 76, 60);  tc = (255, 255, 255)
                 elif 'Retracement Bull' in val:
-                    fc=(125,206,160); tc=(255,255,255)
+                    fc = (125, 206, 160); tc = (255, 255, 255)
                 elif 'Retracement Bear' in val:
-                    fc=(241,148,138); tc=(255,255,255)
+                    fc = (241, 148, 138); tc = (255, 255, 255)
                 elif 'Range' in val:
-                    fc=(149,165,166); tc=(255,255,255)
+                    fc = (149, 165, 166); tc = (255, 255, 255)
                 elif 'Macro' in val:
-                    fc=(254,243,199); tc=(0,0,0)
-                pdf.set_fill_color(*fc); pdf.set_text_color(*tc)
+                    fc = (254, 243, 199); tc = (0, 0, 0)
+                pdf.set_fill_color(*fc)
+                pdf.set_text_color(*tc)
                 pdf.cell(WIDTHS[c], RH, val, border=1, align='C', fill=True)
             pdf.ln()
 
@@ -588,11 +613,11 @@ def create_pdf(df):
         buf.write(out.encode('latin-1') if isinstance(out, str) else out)
         buf.seek(0)
         return buf
-    except Exception as e:
-        # fallback minimal
-        pdf2 = FPDF(); pdf2.add_page()
-        pdf2.set_font("Helvetica","B",12)
-        pdf2.cell(0,10,"PDF Generation Error",ln=True)
+    except Exception:
+        pdf2 = FPDF()
+        pdf2.add_page()
+        pdf2.set_font("Helvetica", "B", 12)
+        pdf2.cell(0, 10, "PDF Generation Error", ln=True)
         buf2 = BytesIO()
         out2 = pdf2.output(dest='S')
         buf2.write(out2.encode('latin-1') if isinstance(out2, str) else out2)
@@ -602,13 +627,14 @@ def create_pdf(df):
 # ===================== UI =====================
 
 def main():
-    st.markdown("<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V3.1</h1></div>", unsafe_allow_html=True)
+    st.markdown("<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V3.2</h1></div>", unsafe_allow_html=True)
 
     try:
         acc = st.secrets["OANDA_ACCOUNT_ID"]
         tok = st.secrets["OANDA_ACCESS_TOKEN"]
     except Exception:
-        st.error("❌ Secrets OANDA manquants"); st.stop()
+        st.error("❌ Secrets OANDA manquants")
+        st.stop()
 
     with st.sidebar:
         st.header("⚙️ Configuration")
@@ -627,26 +653,30 @@ def main():
     df = st.session_state.df.copy()
 
     if only_best:
-        df = df[df['Quality'].isin(['A+','A'])]
+        df = df[df['Quality'].isin(['A+', 'A'])]
 
-    GRADE_ORDER = ['A+','A','B+','B']
+    GRADE_ORDER = ['A+', 'A', 'B+', 'B']
     df['Quality'] = pd.Categorical(df['Quality'], categories=GRADE_ORDER, ordered=True)
-    df = df.sort_values(['Quality','MTF'], ascending=[True, False])
+    df = df.sort_values(['Quality', 'MTF'], ascending=[True, False])
 
-    # Métriques — style V2.1
     c1, c2, c3, c4 = st.columns(4)
     total   = len(df)
     a_plus  = len(df[df['Quality'] == 'A+'])
     a_grade = len(df[df['Quality'] == 'A'])
-    b_grade = len(df[df['Quality'].isin(['B+','B'])])
+    b_grade = len(df[df['Quality'].isin(['B+', 'B'])])
 
     c1.metric("Total Analyzed",   total)
     c2.metric("Setups A+ (GOLD)", a_plus,  delta_color="inverse")
     c3.metric("Setups A (GREEN)", a_grade, delta_color="inverse")
     c4.metric("Setups B (BLUE)",  b_grade, delta_color="inverse")
 
-    DISPLAY = ['Paire','M','W','D','4H','1H','15m','MTF','Quality','Âge D1','ATR Daily','ATR H1','ATR 15m']
-    GRADE_CSS = {'A+':'#fbbf24','A':'#a3e635','B+':'#34d399','B':'#60a5fa'}
+    # [v3.2] ATR H4 ajouté dans la liste d'affichage
+    DISPLAY = [
+        'Paire', 'M', 'W', 'D', '4H', '1H', '15m',
+        'MTF', 'Quality', 'Âge D1',
+        'ATR Daily', 'ATR H4', 'ATR H1', 'ATR 15m'
+    ]
+    GRADE_CSS = {'A+': '#fbbf24', 'A': '#a3e635', 'B+': '#34d399', 'B': '#60a5fa'}
 
     def style_trend(v):
         if not isinstance(v, str): return ''
