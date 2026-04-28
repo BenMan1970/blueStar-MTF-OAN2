@@ -691,7 +691,8 @@ def main():
         hide_index=True
     )
 
-    c1, c2 = st.columns(2)
+    # ── Boutons de téléchargement ──────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     with c1:
         st.download_button(
@@ -707,6 +708,14 @@ def main():
             data=df[cols_present].to_csv(index=False).encode(),
             file_name=f"Bluestar_GPS_{ts}.csv",
             mime="text/csv",
+            use_container_width=True
+        )
+    with c3:
+        st.download_button(
+            "🗂️ Télécharger JSON",
+            data=df[cols_present].to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"Bluestar_GPS_{ts}.json",
+            mime="application/json",
             use_container_width=True
         )
 
