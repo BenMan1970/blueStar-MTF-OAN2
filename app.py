@@ -1,23 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          BLUESTAR HEDGE FUND GPS  —  V4.1  (Signal-Accurate Edition)       ║
+║       BLUESTAR HEDGE FUND GPS  —  V4.1.1  (Bi-Dimensional Grading)        ║
 ║                                                                              ║
 ║  Patches V4.0 (P1–P15) conservés intégralement.                            ║
+║  Corrections V4.1 (C1–C13) conservées intégralement.                       ║
 ║                                                                              ║
-║  Corrections V4.1 :                                                         ║
-║   [C1]  Cache thread-safe custom (Lock+TTL) — remplace @st.cache_data      ║
-║   [C2]  trend_age_daily off-by-one corrigé + retour '>N' si aucun flip     ║
-║   [C3]  RSI fillna(100.0) — marché purement directionnel (loss=0)           ║
-║   [C4]  Vote 3 typed except + NaN guard explicite sur wo_price              ║
-║   [C5]  Daily Open 4H depuis cache D OANDA (était normalize() UTC)          ║
-║   [C6]  Weekly Open depuis cache W natif (était resample sur Daily)         ║
-║   [C7]  SMA200 fallback Weekly → Range si <200 bougies (était Bearish)      ║
-║   [C8]  Grades absolus reproductibles (remplace percentiles relatifs)        ║
-║   [C9]  Recency filter pivots swing D1 (MAX_PIVOT_AGE = 50 bougies)        ║
-║   [C10] Strength intraday normalisé ATR (était /cur*1000 quasi-constant)    ║
-║   [C11] Zone neutre ±0.1×ATR sur comparaisons EMA Macro (anti flip-flop)   ║
-║   [C12] Bonus MTF sur tendances pures uniquement (pas Retracement)          ║
-║   [C13] Protection double-clic bouton analyse (session_state lock)          ║
+║  Corrections V4.1.1 :                                                       ║
+║   [C14] Grading bi-dimensionnel score × cohérence nette (nc)               ║
+║         adj = mtf_score + (nc − 3) × 5                                     ║
+║         A+ ≥ 80 · A ≥ 55 · B+ ≥ 38 · B < 38                              ║
+║         Élimine les A+ sur signaux macro-only (D+4H en opposition)         ║
+║   [C15] Colonne NC visible (cohérence nette −6…+6) avec code couleur       ║
+║         Tri secondaire NC desc à l'intérieur de chaque grade                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -52,7 +46,7 @@ logging.basicConfig(
 _log = logging.getLogger('bluestar_gps')
 
 # ===================== CONFIG =====================
-st.set_page_config(page_title="Bluestar GPS V4.1", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Bluestar GPS V4.1.1", page_icon="🧭", layout="wide")
 
 OANDA_API_URL = "https://api-fxpractice.oanda.com"
 
@@ -651,37 +645,41 @@ def score_mtf(trends: dict, scores: dict):
     return direction, min(100, raw_score + bonus)
 
 
-def grade_hybrid(scores_list: list) -> list:
+def grade_hybrid(scores_list: list, nc_list: list = None) -> list:
     """
-    [C8] Grading par seuils ABSOLUS — reproductible entre sessions.
+    [C14] Grading bi-dimensionnel : score MTF × cohérence nette (nc).
 
-    Remplace les percentiles relatifs qui rendaient les grades instables :
-    un même score pouvait être A+ ou B+ selon combien de paires avaient
-    échoué à l'API (population variable).
+    Problème C8 résolu : un score élevé sur M+W uniquement (avec D+4H activement
+    opposés) produisait des A+ trompeurs. Le grade doit refléter à la fois la
+    conviction directionnelle (score) ET la cohérence interne (nc).
 
-    Seuils :
-      A+ : ≥ 68 (marché plat std<10) ou ≥ 55 (marché normal)
-      A  : ≥ 48
-      B+ : ≥ 35
-      B  : < 35
+    Formule :
+        nc_bonus    = (nc − 3) × 5          # nc=6→+15 · nc=3→0 · nc=0→−15 · nc=−1→−20
+        adj_score   = min(100, score + nc_bonus)
 
-    Le filtre std<10 (marché globalement plat) conserve l'exigence renforcée
-    pour éviter les A+ en contexte de Range généralisé.
+    Seuils absolus :
+        A+  adj ≥ 80  — conviction forte, timeframes alignés         (~30 % des paires)
+        A   adj ≥ 55  — biais solide, bruit LTF acceptable           (~33 %)
+        B+  adj ≥ 38  — biais macro uniquement, D+4H divergents      (~27 %)
+        B   adj < 38  — ambigu, range ou macro contradictoire        (~10 %)
+
+    nc_list : liste de cohérences nettes parallèle à scores_list.
+              Si absent, nc=3 pour tous (neutre, rétrocompatible).
     """
     if not scores_list:
         return []
 
-    arr     = np.array(scores_list, dtype=float)
-    std_dev = float(np.std(arr))
-
-    min_aplus = 68 if std_dev < 10 else 55
+    if nc_list is None:
+        nc_list = [3] * len(scores_list)
 
     grades = []
-    for s in arr:
-        if   s >= min_aplus: grades.append('A+')
-        elif s >= 48:        grades.append('A')
-        elif s >= 35:        grades.append('B+')
-        else:                grades.append('B')
+    for score, nc in zip(scores_list, nc_list):
+        nc_bonus  = (int(nc) - 3) * 5
+        adj       = min(100.0, float(score) + nc_bonus)
+        if   adj >= 80: grades.append('A+')
+        elif adj >= 55: grades.append('A')
+        elif adj >= 38: grades.append('B+')
+        else:           grades.append('B')
     return grades
 
 # ===================== ANALYSE PRINCIPALE =====================
@@ -722,6 +720,16 @@ def analyze_pair(pair: str, account_id: str, access_token: str):
         mtf_dir, mtf_score = score_mtf(trends, scores)
         age = trend_age_daily(cache['D'])
 
+        # [C14] Cohérence nette : TF confirmant le biais MTF − TF s'y opposant.
+        # Retracement et Range = neutres (0). Plage théorique : −6 … +6.
+        if mtf_dir in ('Bullish', 'Bearish'):
+            oppose  = 'Bearish' if mtf_dir == 'Bullish' else 'Bullish'
+            aligned = sum(1 for t in trends.values() if t == mtf_dir)
+            opposed = sum(1 for t in trends.values() if t == oppose)
+            nc      = aligned - opposed
+        else:
+            nc = 0
+
         row = {
             'Paire':      pair.replace('_', '/'),
             'M':          trends['M'],
@@ -733,6 +741,7 @@ def analyze_pair(pair: str, account_id: str, access_token: str):
             'MTF':        f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != 'Range' else 'Range',
             '_mtf_score': mtf_score,
             '_mtf_dir':   mtf_dir,
+            'NC':         nc,
             'Age D1':     age,
             'ATR Daily':  _fmt_atr(atrs['D']),
             'ATR H4':     _fmt_atr(atrs['4H']),
@@ -791,7 +800,8 @@ def analyze_all(account_id: str, access_token: str):
         return pd.DataFrame()
 
     scores_list = [r['_mtf_score'] for r in results]
-    grades      = grade_hybrid(scores_list)
+    nc_list     = [r['NC']         for r in results]   # [C14] cohérence nette
+    grades      = grade_hybrid(scores_list, nc_list)
     for r, g in zip(results, grades):
         r['Quality'] = g
 
@@ -808,15 +818,32 @@ def _safe_str(s: str) -> str:
 def create_pdf(df: pd.DataFrame) -> BytesIO:
     COLS = [
         'Paire', 'M', 'W', 'D', '4H', '1H', '15m',
-        'MTF', 'Quality', 'Age D1',
+        'MTF', 'Quality', 'NC', 'Age D1',
         'ATR Daily', 'ATR H4', 'ATR H1', 'ATR 15m'
     ]
     WIDTHS = {
-        'Paire': 22, 'M': 18, 'W': 18, 'D': 18, '4H': 18, '1H': 18, '15m': 18,
-        'MTF': 32, 'Quality': 13, 'Age D1': 14,
-        'ATR Daily': 18, 'ATR H4': 18, 'ATR H1': 16, 'ATR 15m': 16,
+        'Paire': 22, 'M': 16, 'W': 16, 'D': 16, '4H': 16, '1H': 16, '15m': 16,
+        'MTF': 30, 'Quality': 12, 'NC': 10, 'Age D1': 13,
+        'ATR Daily': 17, 'ATR H4': 17, 'ATR H1': 15, 'ATR 15m': 15,
+    }
+    # Couleurs NC : vert fort → ambre → orange → rouge
+    NC_RGB = {
+        (5, 99):  (46,  204, 113, 255, 255, 255),
+        (3,  4):  (39,  174,  96, 255, 255, 255),
+        (1,  2):  (241, 196,  15,   0,   0,   0),
+        (-99, 0): (231,  76,  60, 255, 255, 255),
     }
     RH = 5.5
+
+    def _nc_colors(val: str):
+        try:
+            n = int(val)
+            for (lo, hi), rgba in NC_RGB.items():
+                if lo <= n <= hi:
+                    return rgba[:3], rgba[3:]
+        except (ValueError, TypeError):
+            pass
+        return (200, 200, 200), (0, 0, 0)
 
     def _cell_text(val: str) -> str:
         return val if _FPDF2 else _safe_str(val)
@@ -830,7 +857,7 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
         pdf.set_margins(10, 10, 10)
 
         pdf.set_font("Helvetica", "B", 15)
-        pdf.cell(0, 9, _cell_text("BLUESTAR GPS V4.1"), ln=True, align="C")
+        pdf.cell(0, 9, _cell_text("BLUESTAR GPS V4.1.1"), ln=True, align="C")
         pdf.set_font("Helvetica", "", 8)
         pdf.cell(0, 5, _cell_text(
             f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
@@ -865,6 +892,8 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
                 tc  = (0,   0,   0)
                 if col == 'Quality':
                     fc = GRADE_RGB.get(val, (156, 163, 175))
+                elif col == 'NC':                           # [C15] couleur NC
+                    fc, tc = _nc_colors(val)
                 elif 'Bull' in val and 'Ret' not in val:
                     fc = (46,  204, 113); tc = (255, 255, 255)
                 elif 'Bear' in val and 'Ret' not in val:
@@ -903,9 +932,9 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
 
 def main():
     st.markdown(
-        "<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V4.1</h1>"
+        "<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V4.1.1</h1>"
         "<p style='margin:0;font-size:0.85em;opacity:0.8'>"
-        "Signal-Accurate Edition · P1–P15 + 13 corrections V4.1"
+        "Bi-Dimensional Grading · P1–P15 + C1–C15"
         "</p></div>",
         unsafe_allow_html=True,
     )
@@ -922,14 +951,14 @@ def main():
         only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
         st.info(
             "Cache : 10 min (thread-safe) · Workers : 5 · "
-            "Retry : 4× backoff · Grades absolus"
+            "Retry : 4× backoff · Grading score × NC"
         )
         st.markdown("---")
         if st.button("🗑️ Vider le cache", use_container_width=True):
             _cache_clear()
             st.success("Cache vidé — prochain lancement refetchera toutes les données.")
         st.markdown("---")
-        st.caption("Bluestar GPS V4.1 — 15 patches P + 13 corrections C")
+        st.caption("Bluestar GPS V4.1.1 — NC = cohérence nette TF (−6 … +6)")
 
     # [C13] Protection double-clic : bouton désactivé pendant l'analyse
     is_running = st.session_state.get('_analysis_running', False)
@@ -971,7 +1000,8 @@ def main():
 
     GRADE_ORDER = ['A+', 'A', 'B+', 'B']
     df['Quality'] = pd.Categorical(df['Quality'], categories=GRADE_ORDER, ordered=True)
-    df = df.sort_values(['Quality', 'MTF'], ascending=[True, False])
+    # [C15] Tri : Grade ASC → NC DESC (le plus cohérent en tête) → MTF DESC
+    df = df.sort_values(['Quality', 'NC', 'MTF'], ascending=[True, False, False])
 
     c1, c2, c3, c4 = st.columns(4)
     total   = len(df)
@@ -986,7 +1016,7 @@ def main():
 
     DISPLAY = [
         'Paire', 'M', 'W', 'D', '4H', '1H', '15m',
-        'MTF', 'Quality', 'Age D1',
+        'MTF', 'Quality', 'NC', 'Age D1',
         'ATR Daily', 'ATR H4', 'ATR H1', 'ATR 15m',
     ]
     GRADE_CSS = {'A+': '#fbbf24', 'A': '#a3e635', 'B+': '#34d399', 'B': '#60a5fa'}
@@ -1007,8 +1037,29 @@ def main():
             for x in s
         ]
 
+    # [C15] Couleur colonne NC : vert fort → ambre → orange → rouge
+    def style_nc(s):
+        if s.name != 'NC': return [''] * len(s)
+        out = []
+        for v in s:
+            try:
+                n = int(v)
+                if   n >= 5: out.append('background-color:#1D9E75;color:white;font-weight:bold')
+                elif n >= 3: out.append('background-color:#27ae60;color:white;font-weight:bold')
+                elif n >= 1: out.append('background-color:#f39c12;color:white;font-weight:bold')
+                elif n == 0: out.append('background-color:#e67e22;color:white')
+                else:        out.append('background-color:#e74c3c;color:white;font-weight:bold')
+            except (ValueError, TypeError):
+                out.append('')
+        return out
+
     cols_present = [col for col in DISPLAY if col in df.columns]
-    styled = df[cols_present].style.apply(style_quality, axis=0).map(style_trend)
+    styled = (
+        df[cols_present].style
+        .apply(style_quality, axis=0)
+        .apply(style_nc,      axis=0)
+        .map(style_trend)
+    )
     st.dataframe(
         styled,
         height=min(800, max(400, (len(df) + 1) * 38 + 10)),
