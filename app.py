@@ -152,7 +152,7 @@ def _close_pool_sessions() -> None:
         for s in _pool_sessions:
             try:
                 s.close()
-            except Exception as exc:  # noqa: BLE001
+            except OSError as exc:
                 _log.debug("Session close error (ignoré) : %s", exc)
         _pool_sessions.clear()
 
@@ -594,7 +594,8 @@ def trend_daily(df: pd.DataFrame, df_weekly: Optional[pd.DataFrame] = None,
     for fn in DAILY_VOTE_REGISTRY:
         try:
             v = fn(h, lo, c, ctx)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # Filet de sécurité : un vote ne doit jamais planter l'analyse globale
             _log.error("Vote %s — erreur : %s", fn.__name__, exc, exc_info=True)
             v = VoteSignal(name=fn.__name__, direction=Direction.RANGE,
                            weight=0.0, reliability=0.0, fired=False, reason=str(exc))
@@ -839,7 +840,8 @@ def fetch_candles(instrument: str, granularity: str, count: int,
     except requests.exceptions.RequestException as e:
         _log.warning("RequestException %s %s: %s", instrument, granularity, e)
         return pd.DataFrame()
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # Catch-all : évite qu'une erreur réseau imprévue plante le thread worker
         _log.error("Unexpected error %s %s: %s", instrument, granularity, e, exc_info=True)
         return pd.DataFrame()
 
@@ -1068,7 +1070,8 @@ def analyze_pair(pair: str, account_id: str, access_token: str) -> Optional[dict
         }
         return row
 
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # Catch-all top-level : garantit qu'une paire en erreur ne bloque pas les autres
         _log.error("analyze_pair %s : %s", pair, e, exc_info=True)
         return None
 
@@ -1107,7 +1110,8 @@ def analyze_all_core(account_id: str, access_token: str,
                         results.append(row)
                     else:
                         errors.append(inst)
-                except Exception as e:
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    # Un future en erreur ne doit pas interrompre les autres
                     errors.append(inst)
                     _log.error("Future %s: %s", inst, e)
         except FutureTimeoutError:
@@ -1143,8 +1147,8 @@ def analyze_all(account_id: str, access_token: str) -> pd.DataFrame:
 
     df, errors = analyze_all_core(
         account_id, access_token,
-        progress_cb=lambda v: progress.progress(v),
-        status_cb=lambda s: status.text(s),
+        progress_cb=progress.progress,
+        status_cb=status.text,
     )
 
     progress.empty()
@@ -1272,7 +1276,8 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
         buf.seek(0)
         return buf
 
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # PDF peut lever des erreurs fpdf imprévisibles — on retourne un fallback
         _log.error("PDF error: %s", e, exc_info=True)
         buf2 = BytesIO()
         if FPDF:
@@ -1300,7 +1305,7 @@ def main():
     try:
         acc = st.secrets["OANDA_ACCOUNT_ID"]
         tok = st.secrets["OANDA_ACCESS_TOKEN"]
-    except (KeyError, Exception):
+    except KeyError:
         st.error("❌ Secrets OANDA manquants — configurez OANDA_ACCOUNT_ID et OANDA_ACCESS_TOKEN")
         st.stop()
 
