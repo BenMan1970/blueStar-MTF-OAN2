@@ -89,9 +89,11 @@ _CACHE_TTL       = 600   # 10 minutes
 DATA_MAX_AGE_MIN = 10    # minutes — doit rester <= _CACHE_TTL / 60
 MAX_PIVOT_AGE    = 50    # [C9]
 
-assert DATA_MAX_AGE_MIN <= _CACHE_TTL / 60, (
-    f"DATA_MAX_AGE_MIN ({DATA_MAX_AGE_MIN}) > CACHE_TTL ({_CACHE_TTL/60:.0f} min)"
-)
+if DATA_MAX_AGE_MIN > _CACHE_TTL / 60:
+    raise ValueError(
+        f"DATA_MAX_AGE_MIN ({DATA_MAX_AGE_MIN}) > CACHE_TTL ({_CACHE_TTL/60:.0f} min) — "
+        "l'alerte données périmées apparaîtrait après l'expiration du cache."
+    )
 
 # ===================== CSS — identique V5.0 =====================
 st.markdown("""
@@ -150,8 +152,8 @@ def _close_pool_sessions() -> None:
         for s in _pool_sessions:
             try:
                 s.close()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("Session close error (ignoré) : %s", exc)
         _pool_sessions.clear()
 
 
@@ -884,20 +886,82 @@ def fetch_all_data(instrument: str, account_id: str, access_token: str) -> Optio
 
 # ===================== SCORING MTF =====================
 
-def score_mtf(trends: dict, scores: dict) -> Tuple[str, float]:
-    """
-    [A7] Bonus M+W étendu aux Retracements compatibles (était ignoré en V5).
-    Retracement Bull dans direction Bullish = conviction similaire à Bullish pur.
-    """
+def _bull_compat(t: str) -> bool:
+    """Retourne True si la tendance est compatible avec une direction haussière."""
+    return t in ('Bullish', 'Retracement Bull')
+
+
+def _bear_compat(t: str) -> bool:
+    """Retourne True si la tendance est compatible avec une direction baissière."""
+    return t in ('Bearish', 'Retracement Bear')
+
+
+def _mtf_weighted_score(trends: dict, scores: dict) -> tuple:
+    """Calcule les scores pondérés bull/bear et retourne (w_bull, w_bear, total)."""
     weights = {'M': 5.0, 'W': 4.0, 'D': 4.0, '4H': 2.5, '1H': 1.5, '15m': 1.0}
     total   = sum(weights.values())
 
-    def weighted(prefix: str) -> float:
-        return sum(weights[tf] * (scores[tf] / 100)
-                   for tf in trends if trends[tf].startswith(prefix))
+    w_bull = sum(
+        weights[tf] * (scores[tf] / 100)
+        for tf in trends
+        if trends[tf].startswith('Bullish')
+    ) + sum(
+        weights[tf] * (scores[tf] / 100) * 0.5
+        for tf in trends
+        if trends[tf].startswith('Retracement Bull')
+    )
 
-    w_bull = weighted('Bullish') + weighted('Retracement Bull') * 0.5
-    w_bear = weighted('Bearish') + weighted('Retracement Bear') * 0.5
+    w_bear = sum(
+        weights[tf] * (scores[tf] / 100)
+        for tf in trends
+        if trends[tf].startswith('Bearish')
+    ) + sum(
+        weights[tf] * (scores[tf] / 100) * 0.5
+        for tf in trends
+        if trends[tf].startswith('Retracement Bear')
+    )
+
+    return w_bull, w_bear, total
+
+
+def _mtf_alignment_bonus(trends: dict, direction: str) -> int:
+    """
+    Calcule le bonus d'alignement inter-TF.
+    [A7] Bonus étendu aux Retracements compatibles (était limité aux purs en V5).
+    """
+    bonus = 0
+    m,  w  = trends.get('M', ''),  trends.get('W', '')
+    d,  h4 = trends.get('D', ''),  trends.get('4H', '')
+
+    if direction == 'Bullish':
+        if m == 'Bullish' and w == 'Bullish':
+            bonus += 15
+        elif _bull_compat(m) and _bull_compat(w):
+            bonus += 12
+        if d == 'Bullish' and h4 == 'Bullish':
+            bonus += 10
+        elif _bull_compat(d) and _bull_compat(h4):
+            bonus += 7
+    else:  # Bearish
+        if m == 'Bearish' and w == 'Bearish':
+            bonus += 15
+        elif _bear_compat(m) and _bear_compat(w):
+            bonus += 12
+        if d == 'Bearish' and h4 == 'Bearish':
+            bonus += 10
+        elif _bear_compat(d) and _bear_compat(h4):
+            bonus += 7
+
+    return bonus
+
+
+def score_mtf(trends: dict, scores: dict) -> Tuple[str, float]:
+    """
+    Score MTF pondéré par timeframe et conviction.
+    Décomposé en sous-fonctions pour réduire la complexité cyclomatique.
+    [A7] Bonus M+W étendu aux Retracements compatibles.
+    """
+    w_bull, w_bear, total = _mtf_weighted_score(trends, scores)
 
     if w_bull > w_bear:
         raw_score, direction = (w_bull / total) * 100, 'Bullish'
@@ -906,34 +970,7 @@ def score_mtf(trends: dict, scores: dict) -> Tuple[str, float]:
     else:
         return 'Range', 0.0
 
-    def _bull_compat(t: str) -> bool:
-        return t in ('Bullish', 'Retracement Bull')
-
-    def _bear_compat(t: str) -> bool:
-        return t in ('Bearish', 'Retracement Bear')
-
-    bonus = 0
-    m, w  = trends.get('M', ''), trends.get('W', '')
-    d, h4 = trends.get('D', ''), trends.get('4H', '')
-
-    if m == 'Bullish' and w == 'Bullish':
-        bonus += 15
-    elif _bull_compat(m) and _bull_compat(w) and direction == 'Bullish':
-        bonus += 12
-    elif m == 'Bearish' and w == 'Bearish':
-        bonus += 15
-    elif _bear_compat(m) and _bear_compat(w) and direction == 'Bearish':
-        bonus += 12
-
-    if d == 'Bullish' and h4 == 'Bullish':
-        bonus += 10
-    elif _bull_compat(d) and _bull_compat(h4) and direction == 'Bullish':
-        bonus += 7
-    elif d == 'Bearish' and h4 == 'Bearish':
-        bonus += 10
-    elif _bear_compat(d) and _bear_compat(h4) and direction == 'Bearish':
-        bonus += 7
-
+    bonus = _mtf_alignment_bonus(trends, direction)
     return direction, min(100.0, raw_score + bonus)
 
 
@@ -970,10 +1007,14 @@ def _compute_nc(trends: dict, mtf_dir: str) -> int:
     opposed_dir = 'Bearish'          if mtf_dir == 'Bullish' else 'Bullish'
     score = 0.0
     for t in trends.values():
-        if t == mtf_dir:      score += 1.0
-        elif t == ret_aligned: score += 0.5
-        elif t == opposed_dir: score -= 1.0
-        elif t == ret_opposed: score -= 0.5
+        if t == mtf_dir:
+            score += 1.0
+        elif t == ret_aligned:
+            score += 0.5
+        elif t == opposed_dir:
+            score -= 1.0
+        elif t == ret_opposed:
+            score -= 0.5
     return round(score)
 
 
@@ -1056,8 +1097,10 @@ def analyze_all_core(account_id: str, access_token: str,
             for future in as_completed(futures, timeout=120):  # [A14]
                 inst = futures[future]
                 done += 1
-                if progress_cb: progress_cb(done / total)
-                if status_cb:   status_cb(f"GPS ({done}/{total}) — {inst.replace('_','/')} ✓")
+                if progress_cb:
+                    progress_cb(done / total)
+                if status_cb:
+                    status_cb(f"GPS ({done}/{total}) — {inst.replace('_', '/')} ✓")
                 try:
                     row = future.result()
                     if row:
@@ -1204,15 +1247,20 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
                 elif col == 'NC':
                     fc, tc = _nc_colors(val)
                 elif 'Bull' in val and 'Ret' not in val:
-                    fc = (46,  204, 113); tc = (255, 255, 255)
+                    fc = (46,  204, 113)
+                    tc = (255, 255, 255)
                 elif 'Bear' in val and 'Ret' not in val:
-                    fc = (231,  76,  60); tc = (255, 255, 255)
+                    fc = (231,  76,  60)
+                    tc = (255, 255, 255)
                 elif 'Retracement Bull' in val:
-                    fc = (125, 206, 160); tc = (255, 255, 255)
+                    fc = (125, 206, 160)
+                    tc = (255, 255, 255)
                 elif 'Retracement Bear' in val:
-                    fc = (241, 148, 138); tc = (255, 255, 255)
+                    fc = (241, 148, 138)
+                    tc = (255, 255, 255)
                 elif 'Range' in val:
-                    fc = (149, 165, 166); tc = (255, 255, 255)
+                    fc = (149, 165, 166)
+                    tc = (255, 255, 255)
                 pdf.set_fill_color(*fc)
                 pdf.set_text_color(*tc)
                 pdf.cell(widths[col], rh, _cell_text(val), border=1, align='C', fill=True)
