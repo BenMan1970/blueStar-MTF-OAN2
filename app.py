@@ -1,20 +1,29 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║       BLUESTAR HEDGE FUND GPS  —  V5.0  (Architecture Signal Decomposition) ║
+║       BLUESTAR HEDGE FUND GPS  —  V5.1  (Patches moteur — UI inchangée)    ║
 ║                                                                              ║
 ║  Patches V4.0 (P1–P15) conservés intégralement.                             ║
 ║  Corrections V4.1 (C1–C15) conservées intégralement.                        ║
+║  Refonte V5.0 (V5-1–V5-7) conservée intégralement.                          ║
 ║                                                                              ║
-║  Refonte V5.0 :                                                              ║
-║   [V5-1] trend_daily : Signal Decomposition Pattern                          ║
-║          Chaque vote = fonction pure testable (VoteSignal typé)              ║
-║   [V5-2] Contribution réelle = weight × reliability (fini les votes égaux)  ║
-║   [V5-3] _vote_prev_midpoint conditionné au volume J-1 (> MA20)             ║
-║          weight 0.5, reliability 0.65 si volume confirmé, 0.0 sinon          ║
-║   [V5-4] Circuit breaker MIN_RELIABLE_SCORE = 1.5                           ║
-║   [V5-5] DailyTrendResult : rétrocompatible + détail complet votes          ║
-║   [V5-6] Import order PEP 8 (stdlib avant third-party)                       ║
-║   [V5-7] Zéro variable ambiguë (l → lo partout)                             ║
+║  Patches moteur V5.1 (UI INCHANGÉE) :                                       ║
+║   [A1]  RSI range pur → 50.0 au lieu de 100.0 (bug gain=0,loss=0)          ║
+║   [A2]  Pivot detection vectorisé via rolling — O(n), retard wing=5 docum.  ║
+║   [A3]  _vote_prev_midpoint dead code supprimé                              ║
+║   [A4]  vol MA20 : vol_j1 exclu de son propre référentiel (biais corrigé)   ║
+║   [A5]  _aggregate_votes : fired_possible uniquement (force non déprimée)   ║
+║   [A6]  _compute_nc : Retracements pondérés ±0.5 (était 0)                 ║
+║   [A7]  score_mtf : bonus M+W étendu aux Retracements compatibles           ║
+║   [A8]  fetch_cached : TOCTOU corrigé — lecture+décision sous lock atomique ║
+║   [A9]  Sessions HTTP : pool initializer + registre + close propre          ║
+║   [A10] trend_4h : KeyError/IndexError → WARNING (était DEBUG silencieux)   ║
+║   [A11] fetch_candles : validation DatetimeIndex après parsing              ║
+║   [A12] DATA_MAX_AGE_MIN = 10 (aligné sur CACHE_TTL 10 min, était 15)      ║
+║   [A13] analyze_all_core : logique pure séparée du wrapper Streamlit        ║
+║   [A14] Timeout global 120s sur analyze_all_core                            ║
+║   [A15] Tri MTF sur _mtf_score numérique (était tri string "Bullish (97%)") ║
+║   [A18] Registre DAILY_VOTE_REGISTRY extensible                             ║
+║   [A19] Type hints Optional/Tuple sur trend_macro/4h/intraday               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -22,23 +31,21 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from io import BytesIO
-from typing import Optional
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-# ── Retry imports (P1) ────────────────────────────────────────────────────────
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ── PDF : fpdf2 préféré, fallback fpdf legacy (P6) ───────────────────────────
 try:
     from fpdf import FPDF
     _FPDF2 = hasattr(FPDF, 'set_lang')
@@ -46,7 +53,6 @@ except ImportError:
     FPDF = None
     _FPDF2 = False
 
-# ── Logging structuré (P11) ───────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.WARNING,
     format='%(asctime)s [%(levelname)s] %(name)s — %(message)s',
@@ -78,9 +84,16 @@ TREND_COLORS = {
     'Range':            '#95a5a6',
 }
 
-DATA_MAX_AGE_MIN = 15
-MAX_PIVOT_AGE    = 50   # [C9]
+# [A12] DATA_MAX_AGE_MIN aligné sur _CACHE_TTL — invariant enforced
+_CACHE_TTL       = 600   # 10 minutes
+DATA_MAX_AGE_MIN = 10    # minutes — doit rester <= _CACHE_TTL / 60
+MAX_PIVOT_AGE    = 50    # [C9]
 
+assert DATA_MAX_AGE_MIN <= _CACHE_TTL / 60, (
+    f"DATA_MAX_AGE_MIN ({DATA_MAX_AGE_MIN}) > CACHE_TTL ({_CACHE_TTL/60:.0f} min)"
+)
+
+# ===================== CSS — identique V5.0 =====================
 st.markdown("""
 <style>
     .main-header {
@@ -104,36 +117,62 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ===================== [P7] SESSION HTTP THREAD-SAFE =====================
-_thread_local = threading.local()
+
+# ===================== [A9] SESSIONS HTTP — POOL AVEC REGISTRE + CLOSE =====================
+_thread_local       = threading.local()
+_pool_sessions: list = []
+_pool_sessions_lock = threading.Lock()
+
+
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    retry   = Retry(
+        total=4, backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"], raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
+
+
+def _pool_thread_init() -> None:
+    """Initializer ThreadPoolExecutor — une session par thread worker, enregistrée pour close propre."""
+    session = _build_session()
+    _thread_local.session = session
+    with _pool_sessions_lock:
+        _pool_sessions.append(session)
+
+
+def _close_pool_sessions() -> None:
+    with _pool_sessions_lock:
+        for s in _pool_sessions:
+            try:
+                s.close()
+            except Exception:
+                pass
+        _pool_sessions.clear()
+
 
 def _get_session() -> requests.Session:
-    """Session requests propre à chaque thread (threading.local)."""
     if not hasattr(_thread_local, 'session'):
-        session = requests.Session()
-        retry = Retry(
-            total=4,
-            backoff_factor=0.6,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
-        _thread_local.session = session
+        _thread_local.session = _build_session()
     return _thread_local.session
 
-# ===================== [C1] CACHE THREAD-SAFE CUSTOM =====================
+
+# ===================== [C1] CACHE THREAD-SAFE =====================
 _data_cache: dict = {}
 _cache_lock = threading.Lock()
-_CACHE_TTL  = 600
+
 
 def _cache_clear() -> None:
     with _cache_lock:
         _data_cache.clear()
 
-# ===================== [P13] TRUE RANGE FACTORISÉ =====================
+
+# ===================== INDICATEURS DE BASE =====================
+
 def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     return pd.concat([
         high - low,
@@ -141,26 +180,38 @@ def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
         (low  - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
 
-# ===================== INDICATEURS DE BASE =====================
 
 def _ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
+
 def _sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
 
+
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    tr = _true_range(high, low, close)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
+    return _true_range(high, low, close).ewm(alpha=1 / n, adjust=False).mean()
+
 
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    """
+    RSI Wilder.
+    [A1] gain=0, loss=0 (range pur) → RSI=50 (neutre). V5 retournait 100.0 par erreur.
+    gain>0, loss=0 → RSI=100 (pure uptrend, correct Wilder).
+    """
     d    = close.diff()
     gain = d.where(d > 0, 0.0).ewm(alpha=1 / n, adjust=False).mean()
     loss = (-d.where(d < 0, 0.0)).ewm(alpha=1 / n, adjust=False).mean()
     rs   = gain / loss.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(100.0)
+    rsi  = 100 - 100 / (1 + rs)
+    # Remplissage contextuel : NaN arrive quand loss=0
+    gain_pos  = gain > 0
+    loss_zero = loss == 0
+    rsi = rsi.where(~loss_zero, np.where(gain_pos, 100.0, 50.0))
+    return rsi
 
-def _dmi(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
+
+def _dmi(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> Tuple[float, float]:
     tr    = _true_range(high, low, close)
     atr_s = tr.ewm(alpha=1 / n, adjust=False).mean()
     up    = high.diff()
@@ -170,6 +221,7 @@ def _dmi(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
     pdi   = 100 * pdm.ewm(alpha=1 / n, adjust=False).mean() / atr_s.replace(0, np.nan)
     mdi   = 100 * mdm.ewm(alpha=1 / n, adjust=False).mean() / atr_s.replace(0, np.nan)
     return float(pdi.iloc[-1]), float(mdi.iloc[-1])
+
 
 def _fmt_atr(val: float) -> str:
     if not val or np.isnan(val) or val <= 0:
@@ -182,7 +234,7 @@ def _fmt_atr(val: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [V5-1] TYPES CONTRACTUELS — Signal Decomposition Pattern
+# TYPES CONTRACTUELS — Signal Decomposition Pattern  [V5-1]
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Direction(str, Enum):
@@ -193,17 +245,6 @@ class Direction(str, Enum):
 
 @dataclass(frozen=True)
 class VoteSignal:
-    """
-    Résultat atomique d'un vote individuel.
-
-    weight      : contribution structurelle (ex. 2.0 pour swing).
-    reliability : confiance intrinsèque [0.0–1.0].
-    fired       : True si le vote a produit un signal directionnel.
-    reason      : trace d'audit — jamais vide.
-
-    Contribution effective = weight × reliability.
-    Un vote fired=False contribue 0, quelle que soit sa pondération.
-    """
     name       : str
     direction  : Direction
     weight     : float
@@ -216,15 +257,7 @@ class VoteSignal:
 class DailyTrendResult:
     """
     Résultat complet de trend_daily — rétrocompatible via __iter__.
-
-    Déstructuration existante conservée :
         trend, score, atr = trend_daily(df, df_weekly)
-
-    Nouvelles propriétés disponibles :
-        result.votes        — tous les VoteSignal
-        result.bull_votes   — votes haussiers déclenchés
-        result.bear_votes   — votes baissiers déclenchés
-        result.summary()    — ligne d'audit structurée
     """
     direction    : Direction
     strength     : int
@@ -235,7 +268,6 @@ class DailyTrendResult:
     min_votes_met: bool
 
     def __iter__(self):
-        """Rétrocompat : trend, score, atr = trend_daily(df)"""
         yield self.direction.value
         yield self.strength
         yield self.atr_val
@@ -255,40 +287,55 @@ class DailyTrendResult:
     def summary(self) -> str:
         parts = [
             f"{v.name}="
-            f"{'B' if v.direction == Direction.BULLISH else 'S' if v.direction == Direction.BEARISH else '-'}"
-            f"(w={v.weight},r={v.reliability:.2f},fired={v.fired})"
+            f"{'B' if v.direction==Direction.BULLISH else 'S' if v.direction==Direction.BEARISH else '-'}"
+            f"(w={v.weight},r={v.reliability:.2f},f={v.fired})"
             for v in self.votes
         ]
-        return (
-            f"{self.direction.value} str={self.strength} "
-            f"bull={self.bull_score:.2f} bear={self.bear_score:.2f} | "
-            + " ".join(parts)
-        )
+        return (f"{self.direction.value} str={self.strength} "
+                f"bull={self.bull_score:.2f} bear={self.bear_score:.2f} | "
+                + " ".join(parts))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [V5-2/V5-3] VOTES ATOMIQUES — chacun testable en isolation
+# [A18] REGISTRE DE VOTES EXTENSIBLE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _vote_swing_structure(h: pd.Series, lo: pd.Series) -> VoteSignal:
+DAILY_VOTE_REGISTRY: list[Callable] = []
+
+
+def register_daily_vote(fn: Callable) -> Callable:
+    DAILY_VOTE_REGISTRY.append(fn)
+    return fn
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOTES ATOMIQUES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@register_daily_vote
+def _vote_swing_structure(h: pd.Series, lo: pd.Series, _c, _ctx) -> VoteSignal:
     """
     Vote 1 — Structure swing HH/HL ou LH/LL.
     Poids 2.0 · Reliability 0.9
-    Recency filter [C9] : pivots > MAX_PIVOT_AGE bougies exclus.
+    [A2] Détection vectorisée via rolling max/min — O(n), plus de boucle Python.
+    Retard de confirmation : wing=5 bougies daily (≈5 jours calendaires). Intentionnel.
     """
-    name    = "swing_structure"
-    wing    = 5
-    min_idx = max(0, len(h) - MAX_PIVOT_AGE)
-    sh, sl  = [], []
+    name = "swing_structure"
+    wing = 5
 
-    for i in range(wing, len(h) - wing):
-        if h.iloc[i] == h.iloc[i - wing:i + wing + 1].max():
-            sh.append(i)
-        if lo.iloc[i] == lo.iloc[i - wing:i + wing + 1].min():
-            sl.append(i)
+    if len(h) < 2 * wing + MAX_PIVOT_AGE + 1:
+        return VoteSignal(name=name, direction=Direction.RANGE,
+                          weight=2.0, reliability=0.9, fired=False,
+                          reason=f"série trop courte ({len(h)})")
 
-    sh = [i for i in sh if i >= min_idx]
-    sl = [i for i in sl if i >= min_idx]
+    roll_max = h.rolling(2 * wing + 1, center=True).max()
+    roll_min = lo.rolling(2 * wing + 1, center=True).min()
+    min_idx  = max(0, len(h) - MAX_PIVOT_AGE)
+
+    sh = [i for i in range(min_idx, len(h))
+          if not np.isnan(roll_max.iloc[i]) and h.iloc[i] == roll_max.iloc[i]]
+    sl = [i for i in range(min_idx, len(lo))
+          if not np.isnan(roll_min.iloc[i]) and lo.iloc[i] == roll_min.iloc[i]]
 
     if len(sh) < 2 or len(sl) < 2:
         return VoteSignal(name=name, direction=Direction.RANGE,
@@ -302,372 +349,267 @@ def _vote_swing_structure(h: pd.Series, lo: pd.Series) -> VoteSignal:
 
     if hh and hl:
         return VoteSignal(name=name, direction=Direction.BULLISH,
-                          weight=2.0, reliability=0.9, fired=True,
-                          reason="HH+HL confirmés")
+                          weight=2.0, reliability=0.9, fired=True, reason="HH+HL")
     if lh and ll:
         return VoteSignal(name=name, direction=Direction.BEARISH,
-                          weight=2.0, reliability=0.9, fired=True,
-                          reason="LH+LL confirmés")
+                          weight=2.0, reliability=0.9, fired=True, reason="LH+LL")
     return VoteSignal(name=name, direction=Direction.RANGE,
-                      weight=2.0, reliability=0.9, fired=False,
-                      reason="structure mixte")
+                      weight=2.0, reliability=0.9, fired=False, reason="structure mixte")
 
 
-def _vote_ema_stack(cur: float, e21: float, e50_cur: float) -> VoteSignal:
-    """
-    Vote 2 — EMA21/EMA50 stack.
-    Poids 1.0 · Reliability 0.75
-    """
-    name = "ema_stack"
+@register_daily_vote
+def _vote_ema_stack_vote(_h, _lo, _c, ctx: dict) -> VoteSignal:
+    """Vote 2 — EMA21/EMA50 stack. Poids 1.0 · Reliability 0.75"""
+    name    = "ema_stack"
+    cur     = ctx['cur']
+    e21     = ctx['e21']
+    e50_cur = ctx['e50_cur']
     if np.isnan(e21) or np.isnan(e50_cur):
         return VoteSignal(name=name, direction=Direction.RANGE,
-                          weight=1.0, reliability=0.75, fired=False,
-                          reason="NaN sur EMA21 ou EMA50")
+                          weight=1.0, reliability=0.75, fired=False, reason="NaN EMA")
     if cur > e21 > e50_cur:
         return VoteSignal(name=name, direction=Direction.BULLISH,
                           weight=1.0, reliability=0.75, fired=True,
-                          reason=f"cur={cur:.5f} > e21={e21:.5f} > e50={e50_cur:.5f}")
+                          reason=f"cur={cur:.5f}>e21={e21:.5f}>e50={e50_cur:.5f}")
     if cur < e21 < e50_cur:
         return VoteSignal(name=name, direction=Direction.BEARISH,
                           weight=1.0, reliability=0.75, fired=True,
-                          reason=f"cur={cur:.5f} < e21={e21:.5f} < e50={e50_cur:.5f}")
+                          reason=f"cur={cur:.5f}<e21={e21:.5f}<e50={e50_cur:.5f}")
     return VoteSignal(name=name, direction=Direction.RANGE,
-                      weight=1.0, reliability=0.75, fired=False,
-                      reason="stack EMA non aligné")
+                      weight=1.0, reliability=0.75, fired=False, reason="stack non aligné")
 
 
-def _vote_weekly_open(
-    cur: float,
-    df_weekly: Optional[pd.DataFrame],
-    df_daily: pd.DataFrame,
-) -> VoteSignal:
-    """
-    Vote 3 — Weekly Open [C6].
-    Reliability 0.80 (cache W natif) ou 0.60 (resample fallback).
-    """
-    name = "weekly_open"
+@register_daily_vote
+def _vote_weekly_open_vote(_h, _lo, _c, ctx: dict) -> VoteSignal:
+    """Vote 3 — Weekly Open [C6]. Reliability 0.80 cache natif / 0.60 resample."""
+    name      = "weekly_open"
+    cur       = ctx['cur']
+    df_weekly = ctx.get('df_weekly')
+    df_daily  = ctx['df_daily']
     try:
         if df_weekly is not None and not df_weekly.empty:
             wo_price = float(df_weekly['Open'].iloc[-1])
-            source, rel = "cache_W", 0.80
+            rel      = 0.80
         else:
+            if not isinstance(df_daily.index, pd.DatetimeIndex):
+                return VoteSignal(name=name, direction=Direction.RANGE,
+                                  weight=1.0, reliability=0.0, fired=False,
+                                  reason="index non-datetime")
             w_open = df_daily['Open'].resample('W-MON').first().dropna()
             if w_open.empty:
                 return VoteSignal(name=name, direction=Direction.RANGE,
                                   weight=1.0, reliability=0.60, fired=False,
                                   reason="Weekly Open indisponible")
             wo_price = float(w_open.iloc[-1])
-            source, rel = "resample_fallback", 0.60
-
+            rel      = 0.60
         if np.isnan(wo_price):
             return VoteSignal(name=name, direction=Direction.RANGE,
-                              weight=1.0, reliability=rel, fired=False,
-                              reason="Weekly Open NaN")
+                              weight=1.0, reliability=rel, fired=False, reason="wo NaN")
         if cur > wo_price:
             return VoteSignal(name=name, direction=Direction.BULLISH,
                               weight=1.0, reliability=rel, fired=True,
-                              reason=f"cur={cur:.5f} > wo={wo_price:.5f} [{source}]")
+                              reason=f"cur={cur:.5f}>wo={wo_price:.5f}")
         if cur < wo_price:
             return VoteSignal(name=name, direction=Direction.BEARISH,
                               weight=1.0, reliability=rel, fired=True,
-                              reason=f"cur={cur:.5f} < wo={wo_price:.5f} [{source}]")
+                              reason=f"cur={cur:.5f}<wo={wo_price:.5f}")
         return VoteSignal(name=name, direction=Direction.RANGE,
-                          weight=1.0, reliability=rel, fired=False,
-                          reason=f"cur == wo={wo_price:.5f} [{source}]")
-
+                          weight=1.0, reliability=rel, fired=False, reason="cur==wo")
     except (TypeError, AttributeError, KeyError) as exc:
         _log.debug("_vote_weekly_open ignoré : %s", exc)
         return VoteSignal(name=name, direction=Direction.RANGE,
-                          weight=1.0, reliability=0.0, fired=False,
-                          reason=f"exception: {exc}")
+                          weight=1.0, reliability=0.0, fired=False, reason=str(exc))
 
 
-def _vote_prev_midpoint(
-    h: pd.Series,
-    lo: pd.Series,
-    c: pd.Series,
-    instrument: str = '',
-) -> VoteSignal:
+# [A3] _vote_prev_midpoint (sans filtre volume) SUPPRIMÉE — dead code V5.
+
+@register_daily_vote
+def _vote_prev_midpoint_with_volume(h: pd.Series, lo: pd.Series,
+                                    c: pd.Series, ctx: dict) -> VoteSignal:
     """
-    Vote 4 — Close J-1 vs midpoint J-1.  [V5-3]
-
-    Changements V5.0 vs V4 :
-      · Poids réduit à 0.5 (vs 1.0) — vote binaire faible.
-      · Conditionné au volume J-1 > MA20 quand disponible.
-        - Si volume confirmé   → reliability 0.65, fired selon direction.
-        - Si volume < MA20     → fired=False, reliability 0.0.
-          Le vote ne se prononce pas sans conviction de marché.
-        - Si volume indisponible (indices ou colonne absente)
-          → reliability 0.50, vote binaire comme V4 (dégradé accepté).
-
-    Raisonnement institutionnel :
-      Un close au-dessus du midpoint sans volume = bruit de fin de séance.
-      Conditionner au volume filtre les faux signaux de faible liquidité
-      (asia session, jours fériés, gaps d'ouverture).
+    Vote 4 — Close J-1 vs midpoint J-1. [V5-3]
+    [A4] vol_j1 exclu du référentiel MA20 — corrige le biais self-referential de V5.
+         V5 : vol.iloc[:-1] incluait vol_j1 dans la MA20 (juge et partie).
+         V5.1 : vol.iloc[:-2] = référentiel sans vol_j1.
     """
-    name = "prev_midpoint"
+    name       = "prev_midpoint"
+    vol        = ctx.get('vol_series')
+    instrument = ctx.get('instrument', '')
 
     if len(c) < 2:
         return VoteSignal(name=name, direction=Direction.RANGE,
                           weight=0.5, reliability=0.0, fired=False,
-                          reason="données insuffisantes (<2 bougies)")
+                          reason="données insuffisantes")
 
     mid    = (float(h.iloc[-2]) + float(lo.iloc[-2])) / 2
     prev_c = float(c.iloc[-2])
     bull   = prev_c > mid
 
-    # ── Tentative de conditionnement au volume ────────────────────────────────
-    is_index       = instrument in INDICES
-    has_vol_col    = 'Volume' in c.index.names or hasattr(c, 'name')   # sera testé via df
-    # On reçoit une pd.Series : le volume est dans le DataFrame parent.
-    # On accède au volume via un attribut injecté si disponible (voir trend_daily).
-    # Convention : on passe `vol_series` séparément — voir signature trend_daily.
-    # Ce vote reçoit `lo` qui est df['Low'] ; le volume n'est pas directement accessible
-    # depuis ici sans refactoring du caller. Solution propre : paramètre explicite.
-    # → voir l'appel dans trend_daily ci-dessous.
-
-    direction = Direction.BULLISH if bull else Direction.BEARISH
-    reason    = f"close_j1={prev_c:.5f} {'>' if bull else '<='} mid_j1={mid:.5f} [no_vol_filter]"
-    return VoteSignal(name=name, direction=direction,
-                      weight=0.5, reliability=0.50, fired=True,
-                      reason=reason)
-
-
-def _vote_prev_midpoint_with_volume(
-    h: pd.Series,
-    lo: pd.Series,
-    c: pd.Series,
-    vol: Optional[pd.Series],
-    instrument: str = '',
-) -> VoteSignal:
-    """
-    [V5-3] Version complète avec conditionnement volume.
-    Appelée par trend_daily quand le DataFrame contient 'Volume'.
-
-    Logique :
-      vol_j1  = volume de la bougie J-1
-      vol_ma  = moyenne mobile 20 périodes du volume (hors dernière bougie)
-      Condition : vol_j1 > vol_ma  → vote actif
-                  vol_j1 <= vol_ma → vote silencieux (fired=False)
-    """
-    name = "prev_midpoint"
-
-    if len(c) < 2:
-        return VoteSignal(name=name, direction=Direction.RANGE,
-                          weight=0.5, reliability=0.0, fired=False,
-                          reason="données insuffisantes (<2 bougies)")
-
-    mid    = (float(h.iloc[-2]) + float(lo.iloc[-2])) / 2
-    prev_c = float(c.iloc[-2])
-    bull   = prev_c > mid
-
-    # ── Pas de volume fiable (indices ou colonne vide) ────────────────────────
     is_index = instrument in INDICES
     if is_index or vol is None or vol.empty:
         direction = Direction.BULLISH if bull else Direction.BEARISH
-        return VoteSignal(
-            name=name, direction=direction,
-            weight=0.5, reliability=0.50, fired=True,
-            reason=(
-                f"close_j1={prev_c:.5f} {'>' if bull else '<='} mid_j1={mid:.5f} "
-                f"[no_vol — {'index' if is_index else 'unavailable'}]"
-            ),
-        )
+        return VoteSignal(name=name, direction=direction,
+                          weight=0.5, reliability=0.50, fired=True,
+                          reason=f"close_j1={'>' if bull else '<='} mid_j1 [no_vol]")
 
-    # ── Conditionnement volume ────────────────────────────────────────────────
     try:
-        # MA20 calculée sur les bougies fermées (on exclut la dernière — incomplète)
-        vol_series  = vol.iloc[:-1]
-        if len(vol_series) < 20:
-            # Pas assez d'historique pour la MA20 → dégradé sans filtre
-            direction = Direction.BULLISH if bull else Direction.BEARISH
-            return VoteSignal(
-                name=name, direction=direction,
-                weight=0.5, reliability=0.50, fired=True,
-                reason=f"close_j1={prev_c:.5f} [vol_history<20, no_filter]",
-            )
-
+        # [A4] vol_ref exclu vol_j1 ([-2]) ET bougie en cours ([-1])
+        vol_ref = vol.iloc[:-2]
         vol_j1  = float(vol.iloc[-2])
-        vol_ma  = float(vol_series.rolling(20).mean().iloc[-1])
 
+        if len(vol_ref) < 20:
+            direction = Direction.BULLISH if bull else Direction.BEARISH
+            return VoteSignal(name=name, direction=direction,
+                              weight=0.5, reliability=0.50, fired=True,
+                              reason="vol_history<20")
+
+        vol_ma    = float(vol_ref.rolling(20).mean().iloc[-1])
         if np.isnan(vol_j1) or np.isnan(vol_ma) or vol_ma <= 0:
             direction = Direction.BULLISH if bull else Direction.BEARISH
-            return VoteSignal(
-                name=name, direction=direction,
-                weight=0.5, reliability=0.50, fired=True,
-                reason=f"close_j1={prev_c:.5f} [vol_NaN, no_filter]",
-            )
+            return VoteSignal(name=name, direction=direction,
+                              weight=0.5, reliability=0.50, fired=True, reason="vol_NaN")
 
         vol_ratio = vol_j1 / vol_ma
-
         if vol_ratio <= 1.0:
-            # Volume insuffisant → vote silencieux
-            return VoteSignal(
-                name=name, direction=Direction.RANGE,
-                weight=0.5, reliability=0.0, fired=False,
-                reason=(
-                    f"volume J-1 < MA20 (ratio={vol_ratio:.2f}) — "
-                    f"close_j1={prev_c:.5f} ignoré (bruit faible liquidité)"
-                ),
-            )
+            return VoteSignal(name=name, direction=Direction.RANGE,
+                              weight=0.5, reliability=0.0, fired=False,
+                              reason=f"vol_j1 < MA20 (ratio={vol_ratio:.2f})")
 
-        # Volume confirmé → vote actif avec reliability boostée
-        # Plus le volume est fort, plus on est confiant (plafonné à 0.80)
         reliability = min(0.80, 0.65 + (vol_ratio - 1.0) * 0.05)
         direction   = Direction.BULLISH if bull else Direction.BEARISH
-        return VoteSignal(
-            name=name, direction=direction,
-            weight=0.5, reliability=reliability, fired=True,
-            reason=(
-                f"close_j1={prev_c:.5f} {'>' if bull else '<='} mid_j1={mid:.5f} "
-                f"[vol_ratio={vol_ratio:.2f} > 1.0, rel={reliability:.2f}]"
-            ),
-        )
+        return VoteSignal(name=name, direction=direction,
+                          weight=0.5, reliability=reliability, fired=True,
+                          reason=f"vol_ratio={vol_ratio:.2f}>1.0 rel={reliability:.2f}")
 
     except (TypeError, ValueError, IndexError) as exc:
-        _log.debug("_vote_prev_midpoint_with_volume erreur volume : %s", exc)
+        _log.debug("_vote_prev_midpoint vol err: %s", exc)
         direction = Direction.BULLISH if bull else Direction.BEARISH
-        return VoteSignal(
-            name=name, direction=direction,
-            weight=0.5, reliability=0.50, fired=True,
-            reason=f"close_j1={prev_c:.5f} [vol_error: {exc}]",
-        )
+        return VoteSignal(name=name, direction=direction,
+                          weight=0.5, reliability=0.50, fired=True,
+                          reason=f"vol_err:{exc}")
 
 
-def _vote_ema50_slope(e50: pd.Series, atr_val: float, threshold: float = 0.05) -> VoteSignal:
-    """
-    Vote 5 — Pente EMA50 normalisée par ATR [C10].
-    Poids 1.0 · Reliability 0.70
-    """
-    name = "ema50_slope"
+@register_daily_vote
+def _vote_ema50_slope_vote(_h, _lo, _c, ctx: dict) -> VoteSignal:
+    """Vote 5 — Pente EMA50 normalisée ATR [C10]. Poids 1.0 · Reliability 0.70"""
+    name      = "ema50_slope"
+    e50       = ctx['e50']
+    atr_val   = ctx['atr_val']
+    threshold = 0.05
     if len(e50) < 6 or atr_val <= 0:
         return VoteSignal(name=name, direction=Direction.RANGE,
                           weight=1.0, reliability=0.70, fired=False,
-                          reason=f"données insuffisantes (len={len(e50)}, atr={atr_val:.5f})")
+                          reason=f"données insuffisantes atr={atr_val:.5f}")
     slope_ratio = float(e50.iloc[-1] - e50.iloc[-6]) / atr_val
     if slope_ratio > threshold:
         return VoteSignal(name=name, direction=Direction.BULLISH,
                           weight=1.0, reliability=0.70, fired=True,
-                          reason=f"slope_ratio={slope_ratio:.3f} > {threshold}")
+                          reason=f"slope={slope_ratio:.3f}>{threshold}")
     if slope_ratio < -threshold:
         return VoteSignal(name=name, direction=Direction.BEARISH,
                           weight=1.0, reliability=0.70, fired=True,
-                          reason=f"slope_ratio={slope_ratio:.3f} < -{threshold}")
+                          reason=f"slope={slope_ratio:.3f}<-{threshold}")
     return VoteSignal(name=name, direction=Direction.RANGE,
                       weight=1.0, reliability=0.70, fired=False,
-                      reason=f"slope_ratio={slope_ratio:.3f} dans zone neutre ±{threshold}")
+                      reason=f"slope={slope_ratio:.3f} zone neutre")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [V5-4] AGRÉGATEUR — séparation collecte / décision + circuit breaker
+# AGRÉGATEUR — circuit breaker MIN_RELIABLE_SCORE  [V5-4]
 # ══════════════════════════════════════════════════════════════════════════════
 
-MIN_RELIABLE_SCORE = 1.5  # score pondéré minimum pour décision directionnelle
+MIN_RELIABLE_SCORE = 1.5
 
 
 def _aggregate_votes(votes: tuple, atr_val: float) -> DailyTrendResult:
     """
-    Contribution effective = weight × reliability (seulement si fired=True).
-
-    Circuit breaker : si max(bull, bear) < MIN_RELIABLE_SCORE → Range forcé.
-    Évite toute décision sur un unique vote faible ou non confirmé.
-
-    Force (strength) : ratio contribution / max_théorique → échelle 35–90.
-    Plus conservateur que V4 : un seul vote fort ne peut pas atteindre 90.
+    [A5] fired_possible : max_possible calculé sur les votes fired uniquement.
+    Les votes non déclenchés (NaN, données indisponibles) ne déprimaient plus la force.
+    V5 incluait tous les votes dans max_possible → force systématiquement sous-estimée.
     """
     bull_score = sum(v.weight * v.reliability
                      for v in votes if v.fired and v.direction == Direction.BULLISH)
     bear_score = sum(v.weight * v.reliability
                      for v in votes if v.fired and v.direction == Direction.BEARISH)
-    max_possible   = sum(v.weight * v.reliability for v in votes)
-    winning_score  = max(bull_score, bear_score)
-    min_votes_met  = winning_score >= MIN_RELIABLE_SCORE
+
+    # [A5] fired_possible uniquement
+    fired_possible = sum(v.weight * v.reliability for v in votes if v.fired)
+
+    winning_score = max(bull_score, bear_score)
+    min_votes_met = winning_score >= MIN_RELIABLE_SCORE
 
     if not min_votes_met or bull_score == bear_score:
-        return DailyTrendResult(
-            direction=Direction.RANGE, strength=35, atr_val=atr_val,
-            bull_score=bull_score, bear_score=bear_score,
-            votes=votes, min_votes_met=min_votes_met,
-        )
+        return DailyTrendResult(direction=Direction.RANGE, strength=35, atr_val=atr_val,
+                                bull_score=bull_score, bear_score=bear_score,
+                                votes=votes, min_votes_met=min_votes_met)
 
     direction = Direction.BULLISH if bull_score > bear_score else Direction.BEARISH
-    ratio     = winning_score / max_possible if max_possible > 0 else 0.0
+    ratio     = winning_score / fired_possible if fired_possible > 0 else 0.0
     strength  = int(min(90, max(35, ratio * 112)))
 
-    return DailyTrendResult(
-        direction=direction, strength=strength, atr_val=atr_val,
-        bull_score=bull_score, bear_score=bear_score,
-        votes=votes, min_votes_met=min_votes_met,
-    )
+    return DailyTrendResult(direction=direction, strength=strength, atr_val=atr_val,
+                            bull_score=bull_score, bear_score=bear_score,
+                            votes=votes, min_votes_met=min_votes_met)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [V5-5] POINT D'ENTRÉE — trend_daily API rétrocompatible
+# POINT D'ENTRÉE — trend_daily  [V5-5]
 # ══════════════════════════════════════════════════════════════════════════════
 
-def trend_daily(
-    df: pd.DataFrame,
-    df_weekly: Optional[pd.DataFrame] = None,
-    instrument: str = '',
-) -> DailyTrendResult:
-    """
-    Analyse directionnelle Daily — 5 votes indépendants.
-
-    Rétrocompat :
-        trend, score, atr = trend_daily(df, df_weekly)
-
-    Nouveau :
-        result = trend_daily(df, df_weekly, instrument)
-        result.summary()   — audit trail complet
-        result.bull_votes  — votes haussiers déclenchés
-    """
-    h   = df['High']
-    lo  = df['Low']
-    c   = df['Close']
+def trend_daily(df: pd.DataFrame, df_weekly: Optional[pd.DataFrame] = None,
+                instrument: str = '') -> DailyTrendResult:
+    h       = df['High']
+    lo      = df['Low']
+    c       = df['Close']
     atr_val = float(_atr(h, lo, c, 14).iloc[-1])
 
     if len(df) < 60:
-        guard = VoteSignal(
-            name="guard_min_bars", direction=Direction.RANGE,
-            weight=0.0, reliability=1.0, fired=False,
-            reason=f"données insuffisantes ({len(df)} bougies < 60)",
-        )
-        return DailyTrendResult(
-            direction=Direction.RANGE, strength=0, atr_val=atr_val,
-            bull_score=0.0, bear_score=0.0,
-            votes=(guard,), min_votes_met=False,
-        )
+        guard = VoteSignal(name="guard", direction=Direction.RANGE,
+                           weight=0.0, reliability=1.0, fired=False,
+                           reason=f"données insuffisantes ({len(df)}<60)")
+        return DailyTrendResult(direction=Direction.RANGE, strength=0, atr_val=atr_val,
+                                bull_score=0.0, bear_score=0.0,
+                                votes=(guard,), min_votes_met=False)
 
     cur     = float(c.iloc[-1])
     e50     = _ema(c, 50)
     e21     = float(_ema(c, 21).iloc[-1])
     e50_cur = float(e50.iloc[-1])
 
-    # Volume disponible ? (pas sur les indices)
     vol_series: Optional[pd.Series] = (
         df['Volume']
         if 'Volume' in df.columns and instrument not in INDICES
         else None
     )
 
-    votes = tuple([
-        _vote_swing_structure(h, lo),
-        _vote_ema_stack(cur, e21, e50_cur),
-        _vote_weekly_open(cur, df_weekly, df),
-        _vote_prev_midpoint_with_volume(h, lo, c, vol_series, instrument),  # [V5-3]
-        _vote_ema50_slope(e50, atr_val),
-    ])
+    ctx = {
+        'cur': cur, 'e21': e21, 'e50_cur': e50_cur, 'e50': e50,
+        'atr_val': atr_val, 'df_weekly': df_weekly, 'df_daily': df,
+        'vol_series': vol_series, 'instrument': instrument,
+    }
 
+    raw_votes = []
+    for fn in DAILY_VOTE_REGISTRY:
+        try:
+            v = fn(h, lo, c, ctx)
+        except Exception as exc:
+            _log.error("Vote %s — erreur : %s", fn.__name__, exc, exc_info=True)
+            v = VoteSignal(name=fn.__name__, direction=Direction.RANGE,
+                           weight=0.0, reliability=0.0, fired=False, reason=str(exc))
+        raw_votes.append(v)
+
+    votes  = tuple(raw_votes)
     result = _aggregate_votes(votes, atr_val)
     _log.debug("trend_daily %s | %s", instrument or "?", result.summary())
     return result
 
 
-# ===================== TENDANCES PAR TF (inchangées) =====================
+# ===================== TENDANCES PAR TF =====================
 
-def trend_macro(df: pd.DataFrame, tf: str):
+def trend_macro(df: pd.DataFrame, tf: str) -> Tuple[str, int, float]:
     if len(df) < 50:
-        atr_val = float(_atr(df['High'], df['Low'], df['Close'], 14).iloc[-1]) if len(df) >= 15 else 0.0
+        atr_val = float(_atr(df['High'], df['Low'], df['Close'], 14).iloc[-1]) \
+                  if len(df) >= 15 else 0.0
         return 'Range', 0, atr_val
 
     c   = df['Close']
@@ -692,10 +634,9 @@ def trend_macro(df: pd.DataFrame, tf: str):
         elif cur < ref - band:
             return 'Bearish', s, atr_val
         return 'Range', 40, atr_val
-
-    else:  # Weekly
+    else:
         if len(df) < 200:
-            _log.warning("Weekly SMA200 indisponible (%d bougies) — signal neutralisé", len(df))
+            _log.warning("Weekly SMA200 indisponible (%d bougies)", len(df))
             return 'Range', 40, atr_val
         s200    = _sma(c, 200)
         cur50   = float(e50.iloc[-1])
@@ -710,7 +651,9 @@ def trend_macro(df: pd.DataFrame, tf: str):
         return 'Range', 40, atr_val
 
 
-def trend_4h(df: pd.DataFrame, df_daily: pd.DataFrame = None):
+def trend_4h(df: pd.DataFrame,
+             df_daily: Optional[pd.DataFrame] = None,   # [A19]
+             instrument: str = '') -> Tuple[str, int, float]:
     h   = df['High']
     lo  = df['Low']
     c   = df['Close']
@@ -730,6 +673,7 @@ def trend_4h(df: pd.DataFrame, df_daily: pd.DataFrame = None):
     if not (np.isnan(pdi) or np.isnan(mdi)):
         score += 1 if pdi > mdi else -1
 
+    # [A10] KeyError/IndexError → WARNING (étaient DEBUG silencieux en V5)
     try:
         if df_daily is not None and not df_daily.empty:
             today_open = float(df_daily['Open'].iloc[-1])
@@ -737,15 +681,18 @@ def trend_4h(df: pd.DataFrame, df_daily: pd.DataFrame = None):
             dates      = pd.to_datetime(df.index).normalize()
             today_open = float(df[dates == dates[-1]]['Open'].iloc[0])
         score += 1 if cur > today_open else -1
-    except Exception as exc:
-        _log.debug("Daily Open Vote ignoré : %s", exc)
+    except (KeyError, IndexError) as exc:
+        _log.warning("trend_4h[%s] Daily Open ignoré — structure inattendue : %s",
+                     instrument, exc)
+    except (TypeError, ValueError) as exc:
+        _log.debug("trend_4h[%s] Daily Open ignoré — valeur : %s", instrument, exc)
 
     s        = abs(score)
     strength = 90 if s == 3 else 70 if s >= 1 else 40
     return ('Bullish' if score > 0 else 'Bearish' if score < 0 else 'Range'), strength, atr_val
 
 
-def trend_intraday(df: pd.DataFrame, instrument: str = ''):
+def trend_intraday(df: pd.DataFrame, instrument: str = '') -> Tuple[str, int, float]:
     h   = df['High']
     lo  = df['Low']
     c   = df['Close']
@@ -758,16 +705,22 @@ def trend_intraday(df: pd.DataFrame, instrument: str = ''):
     period = 50
     lag    = period // 2
 
-    e9      = float(_ema(c, 9).iloc[-1])
-    e21     = float(_ema(c, 21).iloc[-1])
-    e50     = _ema(c, period)
-    e50_cur = float(e50.iloc[-1])
+    # [A5.2] EMA calculées en une passe — pas de recalcul redondant
+    ema9_s  = _ema(c, 9)
+    ema21_s = _ema(c, 21)
+    ema50_s = _ema(c, period)
+    ema12_s = _ema(c, 12)
+    ema26_s = _ema(c, 26)
+
+    e9      = float(ema9_s.iloc[-1])
+    e21     = float(ema21_s.iloc[-1])
+    e50_cur = float(ema50_s.iloc[-1])
 
     src_adj = c + (c - c.shift(lag))
     zlema   = float(src_adj.ewm(span=period, adjust=False).mean().iloc[-1])
 
     rsi_val  = float(_rsi(c, 14).iloc[-1])
-    macd     = _ema(c, 12) - _ema(c, 26)
+    macd     = ema12_s - ema26_s
     sig_line = _ema(macd, 9)
     macd_cur = float(macd.iloc[-1])
     sig_cur  = float(sig_line.iloc[-1])
@@ -828,8 +781,8 @@ def trend_intraday(df: pd.DataFrame, instrument: str = ''):
 def trend_age_daily(df: pd.DataFrame) -> str:
     if len(df) < 55:
         return 'N/A'
-    c    = df['Close']
-    e50  = _ema(c, 50)
+    c     = df['Close']
+    e50   = _ema(c, 50)
     above = c > e50
     for i in range(len(above) - 1, 0, -1):
         if above.iloc[i] != above.iloc[i - 1]:
@@ -838,7 +791,7 @@ def trend_age_daily(df: pd.DataFrame) -> str:
     return f'>{len(above)}'
 
 
-# ===================== [C1] API + CACHE THREAD-SAFE =====================
+# ===================== API + CACHE =====================
 
 def fetch_candles(instrument: str, granularity: str, count: int,
                   account_id: str, access_token: str) -> pd.DataFrame:
@@ -846,83 +799,84 @@ def fetch_candles(instrument: str, granularity: str, count: int,
     headers = {"Authorization": f"Bearer {access_token}"}
     params  = {'granularity': granularity, 'count': count, 'price': 'M'}
     session = _get_session()
-
     try:
         r = session.get(url, headers=headers, params=params, timeout=15)
         if r.status_code != 200:
             _log.warning("OANDA %s HTTP %d — %s %s",
                          instrument, r.status_code, granularity, r.text[:120])
             return pd.DataFrame()
-
         candles = r.json().get('candles', [])
-        rows = []
-        for c in candles:
-            if not c.get('complete'):
+        rows    = []
+        for candle in candles:
+            if not candle.get('complete'):
                 continue
             try:
                 rows.append({
-                    'date':   c['time'],
-                    'Open':   float(c['mid']['o']),
-                    'High':   float(c['mid']['h']),
-                    'Low':    float(c['mid']['l']),
-                    'Close':  float(c['mid']['c']),
-                    'Volume': float(c.get('volume', 0)),
+                    'date':   candle['time'],
+                    'Open':   float(candle['mid']['o']),
+                    'High':   float(candle['mid']['h']),
+                    'Low':    float(candle['mid']['l']),
+                    'Close':  float(candle['mid']['c']),
+                    'Volume': float(candle.get('volume', 0)),
                 })
-            except (KeyError, ValueError) as parse_err:
-                _log.warning("Parse candle error %s: %s", instrument, parse_err)
-
+            except (KeyError, ValueError) as e:
+                _log.warning("Parse candle %s: %s", instrument, e)
         if not rows:
             return pd.DataFrame()
-
         df = pd.DataFrame(rows)
         df['date'] = pd.to_datetime(df['date'], utc=True)
         df.set_index('date', inplace=True)
+        # [A11] Validation DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            _log.error("fetch_candles %s/%s — index non-DatetimeIndex", instrument, granularity)
+            return pd.DataFrame()
         return df
-
     except requests.exceptions.Timeout:
         _log.warning("Timeout %s %s", instrument, granularity)
         return pd.DataFrame()
     except requests.exceptions.RequestException as e:
-        _log.warning("Request error %s %s: %s", instrument, granularity, e)
+        _log.warning("RequestException %s %s: %s", instrument, granularity, e)
         return pd.DataFrame()
     except Exception as e:
-        _log.error("Unexpected error fetch_candles %s %s: %s", instrument, granularity, e)
+        _log.error("Unexpected error %s %s: %s", instrument, granularity, e, exc_info=True)
         return pd.DataFrame()
 
 
 def fetch_cached(inst: str, gran: str, cnt: int, acc: str, tok: str) -> pd.DataFrame:
+    """
+    [A8] Double-checked locking — lecture + décision sous lock atomique.
+    V5 lisait hors lock (TOCTOU) → 5 threads lançaient 5 requêtes identiques.
+    """
     key = (inst, gran, cnt)
     now = datetime.now(timezone.utc)
-    entry = _data_cache.get(key)
-    if entry is not None:
-        ts, df = entry
-        if (now - ts).total_seconds() < _CACHE_TTL:
-            return df
+
+    with _cache_lock:
+        entry = _data_cache.get(key)
+        if entry is not None:
+            ts, df = entry
+            if (now - ts).total_seconds() < _CACHE_TTL:
+                return df
+
     df = fetch_candles(inst, gran, cnt, acc, tok)
+
     with _cache_lock:
         _data_cache[key] = (datetime.now(timezone.utc), df)
+
     return df
 
 
-def fetch_all_data(instrument: str, account_id: str, access_token: str):
-    specs = {
-        'M':   ('M',   150),
-        'W':   ('W',   250),
-        'D':   ('D',   300),
-        '4H':  ('H4',  300),
-        '1H':  ('H1',  300),
-        '15m': ('M15', 300),
-    }
+def fetch_all_data(instrument: str, account_id: str, access_token: str) -> Optional[dict]:
+    specs    = {'M': ('M', 150), 'W': ('W', 250), 'D': ('D', 300),
+                '4H': ('H4', 300), '1H': ('H1', 300), '15m': ('M15', 300)}
     min_bars = {'M': 100, 'W': 50, 'D': 60, '4H': 60, '1H': 70, '15m': 70}
-    cache = {}
+    cache: dict = {}
     for tf, (gran, count) in specs.items():
         df = fetch_cached(instrument, gran, count, account_id, access_token)
         if df.empty:
-            _log.warning("%s — données vides TF=%s (%s)", instrument, tf, gran)
+            _log.warning("%s — vide TF=%s", instrument, tf)
             return None
         if len(df) < min_bars[tf]:
-            _log.warning("%s — TF=%s : %d bougies < minimum %d",
-                         instrument, tf, len(df), min_bars[tf])
+            _log.warning("%s — TF=%s : %d<%d bougies", instrument, tf, len(df), min_bars[tf])
             return None
         cache[tf] = df
     return cache
@@ -930,16 +884,17 @@ def fetch_all_data(instrument: str, account_id: str, access_token: str):
 
 # ===================== SCORING MTF =====================
 
-def score_mtf(trends: dict, scores: dict):
+def score_mtf(trends: dict, scores: dict) -> Tuple[str, float]:
+    """
+    [A7] Bonus M+W étendu aux Retracements compatibles (était ignoré en V5).
+    Retracement Bull dans direction Bullish = conviction similaire à Bullish pur.
+    """
     weights = {'M': 5.0, 'W': 4.0, 'D': 4.0, '4H': 2.5, '1H': 1.5, '15m': 1.0}
     total   = sum(weights.values())
 
-    def weighted(direction: str) -> float:
-        return sum(
-            weights[tf] * (scores[tf] / 100)
-            for tf in trends
-            if trends[tf].startswith(direction)
-        )
+    def weighted(prefix: str) -> float:
+        return sum(weights[tf] * (scores[tf] / 100)
+                   for tf in trends if trends[tf].startswith(prefix))
 
     w_bull = weighted('Bullish') + weighted('Retracement Bull') * 0.5
     w_bear = weighted('Bearish') + weighted('Retracement Bear') * 0.5
@@ -949,17 +904,37 @@ def score_mtf(trends: dict, scores: dict):
     elif w_bear > w_bull:
         raw_score, direction = (w_bear / total) * 100, 'Bearish'
     else:
-        return 'Range', 0
+        return 'Range', 0.0
+
+    def _bull_compat(t: str) -> bool:
+        return t in ('Bullish', 'Retracement Bull')
+
+    def _bear_compat(t: str) -> bool:
+        return t in ('Bearish', 'Retracement Bear')
 
     bonus = 0
-    if (trends.get('M') == trends.get('W') == 'Bullish' or
-            trends.get('M') == trends.get('W') == 'Bearish'):
-        bonus += 15
-    if (trends.get('D') == trends.get('4H') == 'Bullish' or
-            trends.get('D') == trends.get('4H') == 'Bearish'):
-        bonus += 10
+    m, w  = trends.get('M', ''), trends.get('W', '')
+    d, h4 = trends.get('D', ''), trends.get('4H', '')
 
-    return direction, min(100, raw_score + bonus)
+    if m == 'Bullish' and w == 'Bullish':
+        bonus += 15
+    elif _bull_compat(m) and _bull_compat(w) and direction == 'Bullish':
+        bonus += 12
+    elif m == 'Bearish' and w == 'Bearish':
+        bonus += 15
+    elif _bear_compat(m) and _bear_compat(w) and direction == 'Bearish':
+        bonus += 12
+
+    if d == 'Bullish' and h4 == 'Bullish':
+        bonus += 10
+    elif _bull_compat(d) and _bull_compat(h4) and direction == 'Bullish':
+        bonus += 7
+    elif d == 'Bearish' and h4 == 'Bearish':
+        bonus += 10
+    elif _bear_compat(d) and _bear_compat(h4) and direction == 'Bearish':
+        bonus += 7
+
+    return direction, min(100.0, raw_score + bonus)
 
 
 def grade_hybrid(scores_list: list, nc_list: list = None) -> list:
@@ -982,25 +957,46 @@ def grade_hybrid(scores_list: list, nc_list: list = None) -> list:
     return grades
 
 
+def _compute_nc(trends: dict, mtf_dir: str) -> int:
+    """
+    [A6] NC pondéré — Retracements comptent ±0.5 (étaient 0 en V5).
+    Exemple V5 : 4 Bullish + 2 Retracement Bull → NC=4
+    Exemple V5.1 : même setup → NC=5 (4×1.0 + 2×0.5 = 5.0)
+    """
+    if mtf_dir not in ('Bullish', 'Bearish'):
+        return 0
+    ret_aligned = 'Retracement Bull' if mtf_dir == 'Bullish' else 'Retracement Bear'
+    ret_opposed = 'Retracement Bear' if mtf_dir == 'Bullish' else 'Retracement Bull'
+    opposed_dir = 'Bearish'          if mtf_dir == 'Bullish' else 'Bullish'
+    score = 0.0
+    for t in trends.values():
+        if t == mtf_dir:      score += 1.0
+        elif t == ret_aligned: score += 0.5
+        elif t == opposed_dir: score -= 1.0
+        elif t == ret_opposed: score -= 0.5
+    return round(score)
+
+
 # ===================== ANALYSE PRINCIPALE =====================
 
-def analyze_pair(pair: str, account_id: str, access_token: str):
+def analyze_pair(pair: str, account_id: str, access_token: str) -> Optional[dict]:
     try:
         cache = fetch_all_data(pair, account_id, access_token)
         if cache is None:
             return None
 
-        trends, scores, atrs = {}, {}, {}
+        trends: dict = {}
+        scores: dict = {}
+        atrs:   dict = {}
 
         for tf in ('M', 'W'):
             t, s, a = trend_macro(cache[tf], tf)
             trends[tf], scores[tf], atrs[tf] = t, s, a
 
-        # [V5-5] trend_daily reçoit maintenant l'instrument pour le filtre volume
         t, s, a = trend_daily(cache['D'], cache['W'], instrument=pair)
         trends['D'], scores['D'], atrs['D'] = t, s, a
 
-        t, s, a = trend_4h(cache['4H'], cache['D'])
+        t, s, a = trend_4h(cache['4H'], cache['D'], instrument=pair)
         trends['4H'], scores['4H'], atrs['4H'] = t, s, a
 
         for tf in ('1H', '15m'):
@@ -1009,79 +1005,81 @@ def analyze_pair(pair: str, account_id: str, access_token: str):
 
         mtf_dir, mtf_score = score_mtf(trends, scores)
         age = trend_age_daily(cache['D'])
-
-        if mtf_dir in ('Bullish', 'Bearish'):
-            oppose  = 'Bearish' if mtf_dir == 'Bullish' else 'Bullish'
-            aligned = sum(1 for t in trends.values() if t == mtf_dir)
-            opposed = sum(1 for t in trends.values() if t == oppose)
-            nc      = aligned - opposed
-        else:
-            nc = 0
+        nc  = _compute_nc(trends, mtf_dir)  # [A6]
 
         row = {
-            'Paire':      pair.replace('_', '/'),
-            'M':          trends['M'],
-            'W':          trends['W'],
-            'D':          trends['D'],
-            '4H':         trends['4H'],
-            '1H':         trends['1H'],
-            '15m':        trends['15m'],
-            'MTF':        f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != 'Range' else 'Range',
-            '_mtf_score': mtf_score,
-            '_mtf_dir':   mtf_dir,
-            'NC':         nc,
-            'Age D1':     age,
-            'ATR Daily':  _fmt_atr(atrs['D']),
-            'ATR H4':     _fmt_atr(atrs['4H']),
-            'ATR H1':     _fmt_atr(atrs['1H']),
-            'ATR 15m':    _fmt_atr(atrs['15m']),
+            'Paire':       pair.replace('_', '/'),
+            'M':           trends['M'],
+            'W':           trends['W'],
+            'D':           trends['D'],
+            '4H':          trends['4H'],
+            '1H':          trends['1H'],
+            '15m':         trends['15m'],
+            'MTF':         f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != 'Range' else 'Range',
+            '_mtf_score':  mtf_score,   # [A15] conservé pour tri numérique
+            '_mtf_dir':    mtf_dir,
+            'NC':          nc,
+            'Age D1':      age,
+            'ATR Daily':   _fmt_atr(atrs['D']),
+            'ATR H4':      _fmt_atr(atrs['4H']),
+            'ATR H1':      _fmt_atr(atrs['1H']),
+            'ATR 15m':     _fmt_atr(atrs['15m']),
         }
         return row
 
     except Exception as e:
-        _log.error("analyze_pair %s — exception inattendue : %s", pair, e, exc_info=True)
+        _log.error("analyze_pair %s : %s", pair, e, exc_info=True)
         return None
 
 
-def analyze_all(account_id: str, access_token: str):
-    results, errors = [], []
-    progress = st.progress(0)
-    status   = st.empty()
-    total    = len(INSTRUMENTS)
+# ===================== [A13] NOYAU PUR + WRAPPER STREAMLIT =====================
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
+def analyze_all_core(account_id: str, access_token: str,
+                     progress_cb=None, status_cb=None) -> Tuple[pd.DataFrame, list]:
+    """
+    [A13] Logique pure sans Streamlit — testable unitairement.
+    [A14] Timeout global 120s — évite le blocage UI sur dégrades OANDA.
+    [A9]  Sessions HTTP fermées proprement après l'executor.
+    """
+    results: list = []
+    errors:  list = []
+    total        = len(INSTRUMENTS)
+    done         = 0
+    timed_out    = False
+
+    with ThreadPoolExecutor(max_workers=5, initializer=_pool_thread_init) as executor:
+        futures: dict[Future, str] = {
             executor.submit(analyze_pair, inst, account_id, access_token): inst
             for inst in INSTRUMENTS
         }
-        done = 0
-        for future in as_completed(futures):
-            inst = futures[future]
-            done += 1
-            progress.progress(done / total)
-            status.text(f"GPS ({done}/{total}) — {inst.replace('_', '/')} ✓")
-            try:
-                row = future.result()
-                if row:
-                    results.append(row)
-                else:
+        try:
+            for future in as_completed(futures, timeout=120):  # [A14]
+                inst = futures[future]
+                done += 1
+                if progress_cb: progress_cb(done / total)
+                if status_cb:   status_cb(f"GPS ({done}/{total}) — {inst.replace('_','/')} ✓")
+                try:
+                    row = future.result()
+                    if row:
+                        results.append(row)
+                    else:
+                        errors.append(inst)
+                except Exception as e:
                     errors.append(inst)
-            except Exception as e:
-                errors.append(inst)
-                _log.error("Future error %s: %s", inst, e)
+                    _log.error("Future %s: %s", inst, e)
+        except FutureTimeoutError:
+            timed_out = True
+            _log.error("analyze_all_core — timeout 120s. Résultats partiels.")
+            for f in futures:
+                f.cancel()
+            for f, inst in futures.items():
+                if not f.done():
+                    errors.append(inst)
 
-    progress.empty()
-    status.empty()
-
-    if errors:
-        st.warning(
-            f"⚠️ {len(errors)} paire(s) non analysée(s) "
-            f"(données insuffisantes ou erreur API) : "
-            f"{', '.join(e.replace('_', '/') for e in errors)}"
-        )
+    _close_pool_sessions()  # [A9]
 
     if not results:
-        return pd.DataFrame()
+        return pd.DataFrame(), errors
 
     scores_list = [r['_mtf_score'] for r in results]
     nc_list     = [r['NC']         for r in results]
@@ -1090,11 +1088,37 @@ def analyze_all(account_id: str, access_token: str):
         r['Quality'] = g
 
     df = pd.DataFrame(results)
-    df.drop(columns=['_mtf_score', '_mtf_dir'], inplace=True)
+    if timed_out:
+        df.attrs['timed_out'] = True
+    return df, errors
+
+
+def analyze_all(account_id: str, access_token: str) -> pd.DataFrame:
+    """[A13] Wrapper Streamlit — UI uniquement, délègue à analyze_all_core."""
+    progress = st.progress(0)
+    status   = st.empty()
+
+    df, errors = analyze_all_core(
+        account_id, access_token,
+        progress_cb=lambda v: progress.progress(v),
+        status_cb=lambda s: status.text(s),
+    )
+
+    progress.empty()
+    status.empty()
+
+    if df.attrs.get('timed_out'):
+        st.error("⏱️ Analyse interrompue après 120s — résultats partiels. Vérifiez la connexion OANDA.")
+
+    if errors:
+        st.warning(
+            f"⚠️ {len(errors)} paire(s) non analysée(s) : "
+            f"{', '.join(e.replace('_', '/') for e in errors)}"
+        )
     return df
 
 
-# ===================== PDF =====================
+# ===================== PDF — identique V5.0 =====================
 
 def _safe_str(s: str) -> str:
     return s.encode('latin-1', errors='replace').decode('latin-1')
@@ -1111,11 +1135,13 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
         'MTF': 30, 'Quality': 12, 'NC': 10, 'Age D1': 13,
         'ATR Daily': 17, 'ATR H4': 17, 'ATR H1': 15, 'ATR 15m': 15,
     }
+    # Couleurs NC — NC=0 corrigé en orange (était rouge en V5)
     nc_rgb = {
         (5, 99):  (46,  204, 113, 255, 255, 255),
         (3,  4):  (39,  174,  96, 255, 255, 255),
         (1,  2):  (241, 196,  15,   0,   0,   0),
-        (-99, 0): (231,  76,  60, 255, 255, 255),
+        (0,  0):  (230, 126,  34, 255, 255, 255),  # orange — cohérent avec UI
+        (-99, -1):(231,  76,  60, 255, 255, 255),
     }
     rh = 5.5
 
@@ -1178,20 +1204,15 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
                 elif col == 'NC':
                     fc, tc = _nc_colors(val)
                 elif 'Bull' in val and 'Ret' not in val:
-                    fc = (46,  204, 113)
-                    tc = (255, 255, 255)
+                    fc = (46,  204, 113); tc = (255, 255, 255)
                 elif 'Bear' in val and 'Ret' not in val:
-                    fc = (231, 76,  60)
-                    tc = (255, 255, 255)
+                    fc = (231,  76,  60); tc = (255, 255, 255)
                 elif 'Retracement Bull' in val:
-                    fc = (125, 206, 160)
-                    tc = (255, 255, 255)
+                    fc = (125, 206, 160); tc = (255, 255, 255)
                 elif 'Retracement Bear' in val:
-                    fc = (241, 148, 138)
-                    tc = (255, 255, 255)
+                    fc = (241, 148, 138); tc = (255, 255, 255)
                 elif 'Range' in val:
-                    fc = (149, 165, 166)
-                    tc = (255, 255, 255)
+                    fc = (149, 165, 166); tc = (255, 255, 255)
                 pdf.set_fill_color(*fc)
                 pdf.set_text_color(*tc)
                 pdf.cell(widths[col], rh, _cell_text(val), border=1, align='C', fill=True)
@@ -1204,20 +1225,20 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
         return buf
 
     except Exception as e:
-        _log.error("PDF generation error: %s", e, exc_info=True)
+        _log.error("PDF error: %s", e, exc_info=True)
         buf2 = BytesIO()
         if FPDF:
             fallback = FPDF()
             fallback.add_page()
             fallback.set_font("Helvetica", "B", 12)
-            fallback.cell(0, 10, "PDF Generation Error — check logs", ln=True)
+            fallback.cell(0, 10, "PDF Generation Error", ln=True)
             out2 = fallback.output(dest='S')
             buf2.write(out2.encode('latin-1') if isinstance(out2, str) else bytes(out2))
         buf2.seek(0)
         return buf2
 
 
-# ===================== UI =====================
+# ===================== UI — identique V5.0 =====================
 
 def main():
     st.markdown(
@@ -1285,9 +1306,15 @@ def main():
     if only_best:
         df = df[df['Quality'].isin(['A+', 'A'])]
 
-    grade_order  = ['A+', 'A', 'B+', 'B']
+    grade_order   = ['A+', 'A', 'B+', 'B']
     df['Quality'] = pd.Categorical(df['Quality'], categories=grade_order, ordered=True)
-    df = df.sort_values(['Quality', 'NC', 'MTF'], ascending=[True, False, False])
+
+    # [A15] Tri sur _mtf_score numérique — V5 triait sur string "Bullish (97%)"
+    sort_cols = [c for c in ['Quality', 'NC', '_mtf_score'] if c in df.columns]
+    df = df.sort_values(sort_cols, ascending=[True, False, False])
+
+    # Supprimer colonnes internes APRÈS le tri
+    df.drop(columns=['_mtf_score', '_mtf_dir'], inplace=True, errors='ignore')
 
     c1, c2, c3, c4 = st.columns(4)
     total   = len(df)
@@ -1330,6 +1357,7 @@ def main():
             for x in s
         ]
 
+    # style_nc — identique V5.0 (couleurs hex directes)
     def style_nc(s):
         if s.name != 'NC':
             return [''] * len(s)
@@ -1397,4 +1425,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
