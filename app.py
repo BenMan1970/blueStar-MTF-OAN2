@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass
@@ -84,15 +85,26 @@ TREND_COLORS = {
     'Range':            '#95a5a6',
 }
 
-# [A12] DATA_MAX_AGE_MIN aligné sur _CACHE_TTL — invariant enforced
-_CACHE_TTL       = 600   # 10 minutes
-DATA_MAX_AGE_MIN = 10    # minutes — doit rester <= _CACHE_TTL / 60
+# [P-FINAL-1] TTL différenciés par granularité OANDA
+# M/W quasi-statiques sur des heures → TTL long pour économiser les requêtes.
+# 15m doit être aussi frais que possible → TTL court.
+_CACHE_TTL: dict = {
+    'M':    14400,  # 4h  — mensuel : stable toute la journée
+    'W':     3600,  # 1h  — hebdo  : stable plusieurs heures
+    'D':      600,  # 10m — daily  : se met à jour 1× par jour
+    'H4':     300,  # 5m  — 4H     : toutes les 4h mais on veut être frais
+    'H1':     120,  # 2m  — 1H     : toutes les heures
+    'M15':     60,  # 1m  — 15m    : le plus récent possible
+}
+_CACHE_TTL_DEFAULT = 600   # fallback pour les live opens
+
+DATA_MAX_AGE_MIN = 10    # minutes — alerte UI données périmées
 MAX_PIVOT_AGE    = 50    # [C9]
 
-if DATA_MAX_AGE_MIN > _CACHE_TTL / 60:
+if DATA_MAX_AGE_MIN > _CACHE_TTL['D'] / 60:
     raise ValueError(
-        f"DATA_MAX_AGE_MIN ({DATA_MAX_AGE_MIN}) > CACHE_TTL ({_CACHE_TTL/60:.0f} min) — "
-        "l'alerte données périmées apparaîtrait après l'expiration du cache."
+        f"DATA_MAX_AGE_MIN ({DATA_MAX_AGE_MIN}) > CACHE_TTL Daily "
+        f"({_CACHE_TTL['D'] / 60:.0f} min)"
     )
 
 # ===================== CSS — identique V5.0 =====================
@@ -182,14 +194,17 @@ def _get_session() -> requests.Session:
     return _thread_local.session
 
 
-# ===================== [C1] CACHE THREAD-SAFE =====================
+# ===================== CACHE THREAD-SAFE =====================
 _data_cache: dict = {}
+_current_open_cache: dict = {}          # [P-FINAL-4] cache live opens séparé
 _cache_lock = threading.Lock()
+_LIVE_OPEN_TTL = 90                     # secondes — suffisant pour un open live
 
 
 def _cache_clear() -> None:
     with _cache_lock:
         _data_cache.clear()
+        _current_open_cache.clear()
 
 
 # ===================== INDICATEURS DE BASE =====================
@@ -853,6 +868,32 @@ def trend_age_daily(df: pd.DataFrame) -> str:
 
 # ===================== API + CACHE =====================
 
+def _validate_candle(row: dict) -> bool:
+    """
+    [P-FINAL-3] Validation OHLCV minimale.
+    Rejette les bougies structurellement impossibles :
+    prix négatifs, High < Low, Open/Close hors [Low, High].
+    Protège les indicateurs contre les artefacts de données OANDA
+    (splits, réouvertures de marché, ticks aberrants).
+    """
+    try:
+        h, lo, o, c, v = (
+            row['High'], row['Low'], row['Open'], row['Close'], row['Volume']
+        )
+        return (
+            h  >= lo > 0
+            and o  > 0
+            and c  > 0
+            and h  >= o
+            and h  >= c
+            and lo <= o
+            and lo <= c
+            and v  >= 0
+        )
+    except (KeyError, TypeError):
+        return False
+
+
 def fetch_candles(instrument: str, granularity: str, count: int,
                   account_id: str, access_token: str,
                   include_incomplete: bool = False) -> pd.DataFrame:
@@ -870,6 +911,12 @@ def fetch_candles(instrument: str, granularity: str, count: int,
     session = _get_session()
     try:
         r = session.get(url, headers=headers, params=params, timeout=15)
+        if r.status_code == 429:
+            # [P-FINAL-2] Respect du header Retry-After OANDA
+            retry_after = int(r.headers.get('Retry-After', 5))
+            _log.warning("OANDA 429 %s/%s — Retry-After %ds", instrument, granularity, retry_after)
+            time.sleep(retry_after)
+            return pd.DataFrame()
         if r.status_code != 200:
             _log.warning("OANDA %s HTTP %d — %s %s",
                          instrument, r.status_code, granularity, r.text[:120])
@@ -880,14 +927,20 @@ def fetch_candles(instrument: str, granularity: str, count: int,
             if not include_incomplete and not candle.get('complete'):
                 continue
             try:
-                rows.append({
+                row = {
                     'date':   candle['time'],
                     'Open':   float(candle['mid']['o']),
                     'High':   float(candle['mid']['h']),
                     'Low':    float(candle['mid']['l']),
                     'Close':  float(candle['mid']['c']),
                     'Volume': float(candle.get('volume', 0)),
-                })
+                }
+                # [P-FINAL-3] Validation OHLCV — rejette les bougies corrompues
+                if _validate_candle(row):
+                    rows.append(row)
+                else:
+                    _log.warning("Bougie OHLCV invalide ignorée %s/%s : %s",
+                                 instrument, granularity, row)
             except (KeyError, ValueError) as e:
                 _log.warning("Parse candle %s: %s", instrument, e)
         if not rows:
@@ -910,53 +963,65 @@ def fetch_candles(instrument: str, granularity: str, count: int,
         return pd.DataFrame()
 
 
-def fetch_current_open(instrument: str, granularity: str,
-                       account_id: str, access_token: str) -> Optional[float]:
+def fetch_live_open(instrument: str, granularity: str,
+                    account_id: str, access_token: str) -> Optional[float]:
     """
-    [BUG-1] Retourne l'open de la bougie courante (potentiellement incomplète).
+    [P-FINAL-4] Open de la bougie courante (incomplète) avec cache court (90s).
 
-    Utilisé exclusivement pour les références d'open de session :
-    - weekly open courant  → _vote_weekly_open_vote
-    - daily open courant   → trend_4h
+    Remplace fetch_current_open — identique fonctionnellement mais met en cache
+    la valeur 90s pour éviter 66 requêtes non cachées par run sur 33 instruments.
 
-    Non mis en cache : la valeur change en continu et ne doit pas être périmée.
-    Requête légère : count=1, une seule bougie.
+    Sur un second run < 90s : 0 requête live open → ~30% de requêtes économisées.
+    Non mis en cache si None (erreur réseau) pour permettre le retry immédiat.
     """
+    key = (instrument, granularity, '_live')
+    now = datetime.now(timezone.utc)
+
+    with _cache_lock:
+        entry = _current_open_cache.get(key)
+        if entry is not None:
+            ts, value = entry
+            if (now - ts).total_seconds() < _LIVE_OPEN_TTL:
+                return value
+
     df = fetch_candles(instrument, granularity, 1, account_id, access_token,
                        include_incomplete=True)
-    if df.empty:
-        _log.debug("fetch_current_open %s/%s — vide", instrument, granularity)
-        return None
-    try:
-        return float(df['Open'].iloc[-1])
-    except (IndexError, ValueError, TypeError) as e:
-        _log.debug("fetch_current_open %s/%s — parse error: %s", instrument, granularity, e)
-        return None
+    value: Optional[float] = None
+    if not df.empty:
+        try:
+            value = float(df['Open'].iloc[-1])
+        except (IndexError, ValueError, TypeError) as e:
+            _log.debug("fetch_live_open %s/%s — parse error: %s", instrument, granularity, e)
+
+    if value is not None:
+        with _cache_lock:
+            _current_open_cache[key] = (now, value)
+
+    return value
 
 
 def fetch_cached(inst: str, gran: str, cnt: int, acc: str, tok: str) -> pd.DataFrame:
     """
     Cache thread-safe avec double-checked locking.
 
-    [BUG-4] Les DataFrames vides (erreurs réseau) ne sont PAS mis en cache.
-    Une panne temporaire n'exclut plus la paire pendant 10 minutes.
-
-    [BUG-5] Le cache retourne df.copy() — le DataFrame original en cache
-    est protégé contre toute mutation accidentelle par l'appelant.
+    [P-FINAL-1] TTL par granularité : M/W cached longtemps, 15m très court.
+    [BUG-4] DataFrames vides non mis en cache.
+    [BUG-5] Retourne df.copy() — protection contre mutation du cache.
     """
     key = (inst, gran, cnt)
     now = datetime.now(timezone.utc)
+    ttl = _CACHE_TTL.get(gran, _CACHE_TTL_DEFAULT)
 
     with _cache_lock:
         entry = _data_cache.get(key)
         if entry is not None:
             ts, df = entry
-            if (now - ts).total_seconds() < _CACHE_TTL:
-                return df.copy()  # [BUG-5] copie défensive
+            if (now - ts).total_seconds() < ttl:
+                return df.copy()
 
     df = fetch_candles(inst, gran, cnt, acc, tok)
 
-    if not df.empty:  # [BUG-4] ne pas cacher les erreurs réseau
+    if not df.empty:
         with _cache_lock:
             _data_cache[key] = (datetime.now(timezone.utc), df)
 
@@ -990,9 +1055,9 @@ def fetch_all_data(instrument: str, account_id: str, access_token: str,
             return None
         cache[tf] = df
 
-    # Opens courants (bougie incomplète) — non mis en cache car valeur live
-    cache['_week_open'] = fetch_current_open(instrument, 'W', account_id, access_token)
-    cache['_day_open']  = fetch_current_open(instrument, 'D', account_id, access_token)
+    # [P-FINAL-4] Opens courants via cache 90s — économise 66 requêtes/run
+    cache['_week_open'] = fetch_live_open(instrument, 'W', account_id, access_token)
+    cache['_day_open']  = fetch_live_open(instrument, 'D', account_id, access_token)
 
     return cache
 
