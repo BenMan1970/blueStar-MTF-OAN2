@@ -120,10 +120,37 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ===================== [A9] SESSIONS HTTP — POOL AVEC REGISTRE + CLOSE =====================
-_thread_local       = threading.local()
-_pool_sessions: list = []
-_pool_sessions_lock = threading.Lock()
+# ===================== SESSIONS HTTP — REGISTRE SCOPÉ PAR ANALYSE =====================
+# [BUG-3] Le registre global _pool_sessions causait des fermetures inter-analyses :
+# analyse A terminée fermait les sessions de l'analyse B encore active.
+# Correction : SessionRegistry instanciée par analyse, passée via initargs au pool.
+
+_thread_local = threading.local()
+
+
+class _SessionRegistry:
+    """
+    Registre de sessions HTTP scopé par analyse.
+    Chaque appel à analyze_all_core crée sa propre instance —
+    aucun partage possible entre analyses concurrentes.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: list = []
+        self._lock = threading.Lock()
+
+    def add(self, session: requests.Session) -> None:
+        with self._lock:
+            self._sessions.append(session)
+
+    def close_all(self) -> None:
+        with self._lock:
+            for s in self._sessions:
+                try:
+                    s.close()
+                except OSError as exc:
+                    _log.debug("Session close (ignoré) : %s", exc)
+            self._sessions.clear()
 
 
 def _build_session() -> requests.Session:
@@ -139,22 +166,14 @@ def _build_session() -> requests.Session:
     return session
 
 
-def _pool_thread_init() -> None:
-    """Initializer ThreadPoolExecutor — une session par thread worker, enregistrée pour close propre."""
+def _pool_thread_init(registry: _SessionRegistry) -> None:
+    """
+    Initializer du pool — crée une session par thread worker
+    et l'enregistre dans le registre scopé de l'analyse courante.
+    """
     session = _build_session()
     _thread_local.session = session
-    with _pool_sessions_lock:
-        _pool_sessions.append(session)
-
-
-def _close_pool_sessions() -> None:
-    with _pool_sessions_lock:
-        for s in _pool_sessions:
-            try:
-                s.close()
-            except OSError as exc:
-                _log.debug("Session close error (ignoré) : %s", exc)
-        _pool_sessions.clear()
+    registry.add(session)
 
 
 def _get_session() -> requests.Session:
@@ -383,15 +402,36 @@ def _vote_ema_stack_vote(_h, _lo, _c, ctx: dict) -> VoteSignal:
 
 @register_daily_vote
 def _vote_weekly_open_vote(_h, _lo, _c, ctx: dict) -> VoteSignal:
-    """Vote 3 — Weekly Open [C6]. Reliability 0.80 cache natif / 0.60 resample."""
-    name      = "weekly_open"
-    cur       = ctx['cur']
-    df_weekly = ctx.get('df_weekly')
-    df_daily  = ctx['df_daily']
+    """
+    Vote 3 — Weekly Open.
+
+    [BUG-1] Priorité à current_week_open (bougie W incomplète = open de la semaine EN COURS).
+    Fallback sur df_weekly (dernière semaine complète) avec reliability réduite
+    si l'open courant est indisponible (weekend, API indisponible).
+
+    Reliability :
+      0.90 — open courant de la semaine (bougie incomplète)
+      0.70 — dernière semaine complète (référence décalée d'une semaine)
+      0.50 — resample daily (approximation)
+    """
+    name             = "weekly_open"
+    cur              = ctx['cur']
+    current_week_open = ctx.get('current_week_open')
+    df_weekly        = ctx.get('df_weekly')
+    df_daily         = ctx['df_daily']
+
     try:
-        if df_weekly is not None and not df_weekly.empty:
+        # [BUG-1] Open de la semaine COURANTE — référence correcte
+        if current_week_open is not None and not np.isnan(current_week_open):
+            wo_price = current_week_open
+            rel      = 0.90
+            source   = "current_W"
+        elif df_weekly is not None and not df_weekly.empty:
+            # Fallback : dernière semaine complète — décalée d'une semaine
             wo_price = float(df_weekly['Open'].iloc[-1])
-            rel      = 0.80
+            rel      = 0.70
+            source   = "prev_W_complete"
+            _log.debug("weekly_open fallback sur semaine précédente pour %s", ctx.get('instrument',''))
         else:
             if not isinstance(df_daily.index, pd.DatetimeIndex):
                 return VoteSignal(name=name, direction=Direction.RANGE,
@@ -400,23 +440,27 @@ def _vote_weekly_open_vote(_h, _lo, _c, ctx: dict) -> VoteSignal:
             w_open = df_daily['Open'].resample('W-MON').first().dropna()
             if w_open.empty:
                 return VoteSignal(name=name, direction=Direction.RANGE,
-                                  weight=1.0, reliability=0.60, fired=False,
+                                  weight=1.0, reliability=0.0, fired=False,
                                   reason="Weekly Open indisponible")
             wo_price = float(w_open.iloc[-1])
-            rel      = 0.60
+            rel      = 0.50
+            source   = "resample_fallback"
+
         if np.isnan(wo_price):
             return VoteSignal(name=name, direction=Direction.RANGE,
                               weight=1.0, reliability=rel, fired=False, reason="wo NaN")
         if cur > wo_price:
             return VoteSignal(name=name, direction=Direction.BULLISH,
                               weight=1.0, reliability=rel, fired=True,
-                              reason=f"cur={cur:.5f}>wo={wo_price:.5f}")
+                              reason=f"cur={cur:.5f}>wo={wo_price:.5f} [{source}]")
         if cur < wo_price:
             return VoteSignal(name=name, direction=Direction.BEARISH,
                               weight=1.0, reliability=rel, fired=True,
-                              reason=f"cur={cur:.5f}<wo={wo_price:.5f}")
+                              reason=f"cur={cur:.5f}<wo={wo_price:.5f} [{source}]")
         return VoteSignal(name=name, direction=Direction.RANGE,
-                          weight=1.0, reliability=rel, fired=False, reason="cur==wo")
+                          weight=1.0, reliability=rel, fired=False,
+                          reason=f"cur==wo={wo_price:.5f} [{source}]")
+
     except (TypeError, AttributeError, KeyError) as exc:
         _log.debug("_vote_weekly_open ignoré : %s", exc)
         return VoteSignal(name=name, direction=Direction.RANGE,
@@ -559,7 +603,8 @@ def _aggregate_votes(votes: tuple, atr_val: float) -> DailyTrendResult:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def trend_daily(df: pd.DataFrame, df_weekly: Optional[pd.DataFrame] = None,
-                instrument: str = '') -> DailyTrendResult:
+                instrument: str = '',
+                current_week_open: Optional[float] = None) -> DailyTrendResult:
     h       = df['High']
     lo      = df['Low']
     c       = df['Close']
@@ -588,6 +633,7 @@ def trend_daily(df: pd.DataFrame, df_weekly: Optional[pd.DataFrame] = None,
         'cur': cur, 'e21': e21, 'e50_cur': e50_cur, 'e50': e50,
         'atr_val': atr_val, 'df_weekly': df_weekly, 'df_daily': df,
         'vol_series': vol_series, 'instrument': instrument,
+        'current_week_open': current_week_open,
     }
 
     raw_votes = []
@@ -655,8 +701,15 @@ def trend_macro(df: pd.DataFrame, tf: str) -> Tuple[str, int, float]:
 
 
 def trend_4h(df: pd.DataFrame,
-             df_daily: Optional[pd.DataFrame] = None,   # [A19]
-             instrument: str = '') -> Tuple[str, int, float]:
+             df_daily: Optional[pd.DataFrame] = None,
+             instrument: str = '',
+             current_day_open: Optional[float] = None) -> Tuple[str, int, float]:
+    """
+    Tendance 4H — 3 votes (EMA50, DMI, Daily Open).
+
+    [BUG-1] current_day_open : open de la bougie daily EN COURS (incomplète).
+    Priorité sur df_daily['Open'].iloc[-1] qui pointe sur hier (bougie complète).
+    """
     h   = df['High']
     lo  = df['Low']
     c   = df['Close']
@@ -676,10 +729,14 @@ def trend_4h(df: pd.DataFrame,
     if not (np.isnan(pdi) or np.isnan(mdi)):
         score += 1 if pdi > mdi else -1
 
-    # [A10] KeyError/IndexError → WARNING (étaient DEBUG silencieux en V5)
+    # [BUG-1] current_day_open = open de la bougie D courante (incomplète = aujourd'hui)
+    # df_daily['Open'].iloc[-1] = open d'hier (dernière bougie D complète) — référence décalée
     try:
-        if df_daily is not None and not df_daily.empty:
+        if current_day_open is not None and not np.isnan(current_day_open):
+            today_open = current_day_open
+        elif df_daily is not None and not df_daily.empty:
             today_open = float(df_daily['Open'].iloc[-1])
+            _log.debug("trend_4h[%s] daily open fallback bougie complète", instrument)
         else:
             dates      = pd.to_datetime(df.index).normalize()
             today_open = float(df[dates == dates[-1]]['Open'].iloc[0])
@@ -797,7 +854,16 @@ def trend_age_daily(df: pd.DataFrame) -> str:
 # ===================== API + CACHE =====================
 
 def fetch_candles(instrument: str, granularity: str, count: int,
-                  account_id: str, access_token: str) -> pd.DataFrame:
+                  account_id: str, access_token: str,
+                  include_incomplete: bool = False) -> pd.DataFrame:
+    """
+    Récupère les bougies OANDA.
+
+    [BUG-1] include_incomplete=False (défaut) : bougies complètes uniquement,
+    correctes pour les indicateurs (pas de repainting).
+    include_incomplete=True : inclut la bougie courante (incomplète),
+    nécessaire pour obtenir l'open réel de la session/jour/semaine en cours.
+    """
     url     = f"{OANDA_API_URL}/v3/accounts/{account_id}/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params  = {'granularity': granularity, 'count': count, 'price': 'M'}
@@ -811,7 +877,7 @@ def fetch_candles(instrument: str, granularity: str, count: int,
         candles = r.json().get('candles', [])
         rows    = []
         for candle in candles:
-            if not candle.get('complete'):
+            if not include_incomplete and not candle.get('complete'):
                 continue
             try:
                 rows.append({
@@ -829,7 +895,6 @@ def fetch_candles(instrument: str, granularity: str, count: int,
         df = pd.DataFrame(rows)
         df['date'] = pd.to_datetime(df['date'], utc=True)
         df.set_index('date', inplace=True)
-        # [A11] Validation DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
             _log.error("fetch_candles %s/%s — index non-DatetimeIndex", instrument, granularity)
             return pd.DataFrame()
@@ -841,15 +906,43 @@ def fetch_candles(instrument: str, granularity: str, count: int,
         _log.warning("RequestException %s %s: %s", instrument, granularity, e)
         return pd.DataFrame()
     except Exception as e:  # pylint: disable=broad-exception-caught
-        # Catch-all : évite qu'une erreur réseau imprévue plante le thread worker
         _log.error("Unexpected error %s %s: %s", instrument, granularity, e, exc_info=True)
         return pd.DataFrame()
 
 
+def fetch_current_open(instrument: str, granularity: str,
+                       account_id: str, access_token: str) -> Optional[float]:
+    """
+    [BUG-1] Retourne l'open de la bougie courante (potentiellement incomplète).
+
+    Utilisé exclusivement pour les références d'open de session :
+    - weekly open courant  → _vote_weekly_open_vote
+    - daily open courant   → trend_4h
+
+    Non mis en cache : la valeur change en continu et ne doit pas être périmée.
+    Requête légère : count=1, une seule bougie.
+    """
+    df = fetch_candles(instrument, granularity, 1, account_id, access_token,
+                       include_incomplete=True)
+    if df.empty:
+        _log.debug("fetch_current_open %s/%s — vide", instrument, granularity)
+        return None
+    try:
+        return float(df['Open'].iloc[-1])
+    except (IndexError, ValueError, TypeError) as e:
+        _log.debug("fetch_current_open %s/%s — parse error: %s", instrument, granularity, e)
+        return None
+
+
 def fetch_cached(inst: str, gran: str, cnt: int, acc: str, tok: str) -> pd.DataFrame:
     """
-    [A8] Double-checked locking — lecture + décision sous lock atomique.
-    V5 lisait hors lock (TOCTOU) → 5 threads lançaient 5 requêtes identiques.
+    Cache thread-safe avec double-checked locking.
+
+    [BUG-4] Les DataFrames vides (erreurs réseau) ne sont PAS mis en cache.
+    Une panne temporaire n'exclut plus la paire pendant 10 minutes.
+
+    [BUG-5] Le cache retourne df.copy() — le DataFrame original en cache
+    est protégé contre toute mutation accidentelle par l'appelant.
     """
     key = (inst, gran, cnt)
     now = datetime.now(timezone.utc)
@@ -859,22 +952,35 @@ def fetch_cached(inst: str, gran: str, cnt: int, acc: str, tok: str) -> pd.DataF
         if entry is not None:
             ts, df = entry
             if (now - ts).total_seconds() < _CACHE_TTL:
-                return df
+                return df.copy()  # [BUG-5] copie défensive
 
     df = fetch_candles(inst, gran, cnt, acc, tok)
 
-    with _cache_lock:
-        _data_cache[key] = (datetime.now(timezone.utc), df)
+    if not df.empty:  # [BUG-4] ne pas cacher les erreurs réseau
+        with _cache_lock:
+            _data_cache[key] = (datetime.now(timezone.utc), df)
 
     return df
 
 
-def fetch_all_data(instrument: str, account_id: str, access_token: str) -> Optional[dict]:
+def fetch_all_data(instrument: str, account_id: str, access_token: str,
+                   stop_event: Optional[threading.Event] = None) -> Optional[dict]:
+    """
+    Récupère toutes les données OHLCV par timeframe + opens courants.
+
+    [BUG-1] Les opens de référence (weekly, daily) sont fetchés séparément
+    avec include_incomplete=True pour obtenir l'open de la session EN COURS.
+
+    [BUG-2] stop_event vérifié entre chaque TF pour permettre l'annulation
+    coopérative sans attendre la fin de toutes les requêtes réseau.
+    """
     specs    = {'M': ('M', 150), 'W': ('W', 250), 'D': ('D', 300),
                 '4H': ('H4', 300), '1H': ('H1', 300), '15m': ('M15', 300)}
     min_bars = {'M': 100, 'W': 50, 'D': 60, '4H': 60, '1H': 70, '15m': 70}
     cache: dict = {}
     for tf, (gran, count) in specs.items():
+        if stop_event and stop_event.is_set():   # [BUG-2] annulation coopérative
+            return None
         df = fetch_cached(instrument, gran, count, account_id, access_token)
         if df.empty:
             _log.warning("%s — vide TF=%s", instrument, tf)
@@ -883,6 +989,11 @@ def fetch_all_data(instrument: str, account_id: str, access_token: str) -> Optio
             _log.warning("%s — TF=%s : %d<%d bougies", instrument, tf, len(df), min_bars[tf])
             return None
         cache[tf] = df
+
+    # Opens courants (bougie incomplète) — non mis en cache car valeur live
+    cache['_week_open'] = fetch_current_open(instrument, 'W', account_id, access_token)
+    cache['_day_open']  = fetch_current_open(instrument, 'D', account_id, access_token)
+
     return cache
 
 
@@ -1022,9 +1133,16 @@ def _compute_nc(trends: dict, mtf_dir: str) -> int:
 
 # ===================== ANALYSE PRINCIPALE =====================
 
-def analyze_pair(pair: str, account_id: str, access_token: str) -> Optional[dict]:
+def analyze_pair(pair: str, account_id: str, access_token: str,
+                 stop_event: Optional[threading.Event] = None) -> Optional[dict]:
+    """
+    [BUG-2] stop_event : annulation coopérative entre TF lors d'un timeout global.
+    Vérifié avant fetch_all_data — évite les requêtes inutiles après timeout.
+    """
+    if stop_event and stop_event.is_set():
+        return None
     try:
-        cache = fetch_all_data(pair, account_id, access_token)
+        cache = fetch_all_data(pair, account_id, access_token, stop_event)
         if cache is None:
             return None
 
@@ -1036,10 +1154,12 @@ def analyze_pair(pair: str, account_id: str, access_token: str) -> Optional[dict
             t, s, a = trend_macro(cache[tf], tf)
             trends[tf], scores[tf], atrs[tf] = t, s, a
 
-        t, s, a = trend_daily(cache['D'], cache['W'], instrument=pair)
+        t, s, a = trend_daily(cache['D'], cache['W'], instrument=pair,
+                              current_week_open=cache.get('_week_open'))
         trends['D'], scores['D'], atrs['D'] = t, s, a
 
-        t, s, a = trend_4h(cache['4H'], cache['D'], instrument=pair)
+        t, s, a = trend_4h(cache['4H'], cache['D'], instrument=pair,
+                           current_day_open=cache.get('_day_open'))
         trends['4H'], scores['4H'], atrs['4H'] = t, s, a
 
         for tf in ('1H', '15m'):
@@ -1081,23 +1201,40 @@ def analyze_pair(pair: str, account_id: str, access_token: str) -> Optional[dict
 def analyze_all_core(account_id: str, access_token: str,
                      progress_cb=None, status_cb=None) -> Tuple[pd.DataFrame, list]:
     """
-    [A13] Logique pure sans Streamlit — testable unitairement.
-    [A14] Timeout global 120s — évite le blocage UI sur dégrades OANDA.
-    [A9]  Sessions HTTP fermées proprement après l'executor.
-    """
-    results: list = []
-    errors:  list = []
-    total        = len(INSTRUMENTS)
-    done         = 0
-    timed_out    = False
+    Noyau d'analyse — sans dépendance Streamlit.
 
-    with ThreadPoolExecutor(max_workers=5, initializer=_pool_thread_init) as executor:
+    [BUG-2] Timeout réel : executor explicite + shutdown(wait=False, cancel_futures=True).
+    Le `with ThreadPoolExecutor` appelait shutdown(wait=True) à la sortie,
+    bloquant le thread principal même après FutureTimeoutError.
+    Correction : executor hors bloc `with`, shutdown non-bloquant sur timeout.
+
+    [BUG-3] SessionRegistry scopée par analyse — pas de partage inter-analyses.
+
+    Annulation coopérative : stop_event transmis à fetch_all_data pour interrompre
+    entre deux requêtes TF dès que le timeout est déclenché.
+    """
+    results:   list = []
+    errors:    list = []
+    total          = len(INSTRUMENTS)
+    done           = 0
+    timed_out      = False
+    stop_event     = threading.Event()       # [BUG-2] annulation coopérative
+    registry       = _SessionRegistry()      # [BUG-3] scopé par analyse
+
+    executor = ThreadPoolExecutor(
+        max_workers=5,
+        initializer=_pool_thread_init,
+        initargs=(registry,),
+    )
+    try:
         futures: dict[Future, str] = {
-            executor.submit(analyze_pair, inst, account_id, access_token): inst
+            executor.submit(
+                analyze_pair, inst, account_id, access_token, stop_event
+            ): inst
             for inst in INSTRUMENTS
         }
         try:
-            for future in as_completed(futures, timeout=120):  # [A14]
+            for future in as_completed(futures, timeout=120):
                 inst = futures[future]
                 done += 1
                 if progress_cb:
@@ -1111,19 +1248,21 @@ def analyze_all_core(account_id: str, access_token: str,
                     else:
                         errors.append(inst)
                 except Exception as e:  # pylint: disable=broad-exception-caught
-                    # Un future en erreur ne doit pas interrompre les autres
                     errors.append(inst)
                     _log.error("Future %s: %s", inst, e)
+
         except FutureTimeoutError:
             timed_out = True
-            _log.error("analyze_all_core — timeout 120s. Résultats partiels.")
-            for f in futures:
-                f.cancel()
+            _log.error("analyze_all_core — timeout 120s. Arrêt coopératif.")
+            stop_event.set()                              # [BUG-2] signal aux workers
+            executor.shutdown(wait=False, cancel_futures=True)  # non-bloquant
             for f, inst in futures.items():
                 if not f.done():
                     errors.append(inst)
-
-    _close_pool_sessions()  # [A9]
+    finally:
+        if not timed_out:
+            executor.shutdown(wait=True)  # fermeture propre si pas de timeout
+        registry.close_all()             # [BUG-3] sessions de CETTE analyse uniquement
 
     if not results:
         return pd.DataFrame(), errors
