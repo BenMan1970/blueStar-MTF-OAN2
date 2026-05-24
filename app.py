@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V7.2.0 PRODUCTION-GRADE HARDENED                 ║
+║  BLUESTAR HEDGE FUND GPS — V7.3.0 PRODUCTION-GRADE DECISION SYSTEM          ║
 ║                                                                              ║
-║  Refactoring d'architecture, sécurité des secrets et déterminisme MTF        ║
+║  Architecture Hexagonale, Contrôle Temporel Rigide et Alignement de DST      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import math
@@ -62,36 +63,198 @@ except ImportError:
     _FPDF2 = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 0 — STREAMLIT RUNTIME GUARD
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 🏛️ COUCHE 1 — DOMAINE : CONTRATS, MODÈLES & CONFIGURATIONS
+# ==============================================================================
 
-def _is_streamlit_runtime() -> bool:
-    """Détecte si le module tourne dans un runtime Streamlit actif."""
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx(suppress_warning=True) is not None
-    except ImportError:
-        return False
+class Direction(str, Enum):
+    BULLISH = "Bullish"
+    BEARISH = "Bearish"
+    RANGE = "Range"
 
 
-_STREAMLIT_AVAILABLE = False
-st: Any = None
-try:
-    import streamlit as _st_module
-    st = _st_module
-    _STREAMLIT_AVAILABLE = True
-except ImportError:
-    _STREAMLIT_AVAILABLE = False
+class SessionTimingMode(str, Enum):
+    CLOSE_ONLY = "CLOSE_ONLY"
+    LIVE = "LIVE"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — LOGGING & TELEMETRY
-# ═══════════════════════════════════════════════════════════════════════════════
+class AssetClass(str, Enum):
+    FX = "FX"
+    INDEX = "INDEX"
+
+
+@dataclass(frozen=True)
+class OandaCredentials:
+    """Conteneur d'identifiants sécurisés avec hachage SHA-256."""
+    account_id: str
+    access_token: str
+
+    def get_secure_hash(self) -> str:
+        return hashlib.sha256(self.account_id.encode("utf-8")).hexdigest()[:16]
+
+    def __hash__(self) -> int:
+        return hash(self.get_secure_hash())
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, OandaCredentials):
+            return False
+        return self.get_secure_hash() == other.get_secure_hash()
+
+
+@dataclass(frozen=True)
+class TrendConfig:
+    """Paramètres d'exécution et de calibration quantitative."""
+    cache_ttl_m: int = 14400
+    cache_ttl_w: int = 3600
+    cache_ttl_d: int = 600
+    cache_ttl_h4: int = 300
+    cache_ttl_h1: int = 120
+    cache_ttl_m15: int = 60
+    cache_ttl_default: int = 600
+    cache_ttl_live_open: int = 90
+    cache_ttl_negative_live_open: int = 15
+
+    stale_max_age_multiplier: float = 4.0
+
+    data_max_age_min: int = 10
+    analysis_timeout_sec: int = 120
+    streamlit_running_flag_ttl_sec: int = 300
+
+    max_workers: int = 8
+    pool_drain_grace_sec: float = 5.0
+
+    http_timeout_sec: float = 8.0
+    http_retry_total: int = 2
+    http_retry_backoff: float = 0.3
+
+    rate_limit_burst: int = 30
+    rate_limit_refill_per_sec: float = 5.0
+    rate_limit_429_cooldown_sec: float = 30.0
+
+    pivot_wing: int = 5
+    max_pivot_age: int = 50
+
+    rsi_period: int = 14
+    atr_period: int = 14
+    ema_short: int = 21
+    ema_long: int = 50
+    sma_macro: int = 200
+    ema_intra_period: int = 50
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    intraday_ema_fast: int = 9
+
+    macro_band_atr_ratio: float = 0.10
+    ema50_slope_threshold: float = 0.05
+
+    volume_ratio_strong_intraday: float = 1.30
+    volume_ratio_min_midpoint: float = 1.00
+    body_range_strong: float = 0.60
+
+    min_reliable_score: float = 1.5
+    strength_min_range: int = 35
+    strength_max: int = 90
+    strength_scaler: float = 112.0
+
+    mtf_weight_m: float = 5.0
+    mtf_weight_w: float = 4.0
+    mtf_weight_d: float = 4.0
+    mtf_weight_h4: float = 2.5
+    mtf_weight_h1: float = 1.5
+    mtf_weight_15m: float = 1.0
+
+    nc_pure_strength_min: int = 70
+    dispersion_penalty_max: float = 15.0
+
+    min_bars_m: int = 100
+    min_bars_w: int = 50
+    min_bars_d: int = 60
+    min_bars_h4: int = 60
+    min_bars_h1: int = 200
+    min_bars_15m: int = 200
+
+    completeness_min_tradable: float = 0.85
+    cache_max_entries: int = 500
+
+
+CFG: Final[TrendConfig] = TrendConfig()
+
+if CFG.data_max_age_min > CFG.cache_ttl_d // 60:
+    raise ValueError("data_max_age_min must be <= cache_ttl_d (minutes)")
+if CFG.max_workers < 1:
+    raise ValueError("max_workers >= 1 is required")
+
+
+APP_VERSION: Final[str] = "7.3.0-PROD-DECISION-GRADE"
+
+_OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
+OANDA_API_URL: Final[str] = (
+    "https://api-fxtrade.oanda.com"
+    if _OANDA_ENV == "live"
+    else "https://api-fxpractice.oanda.com"
+)
+
+INSTRUMENTS: Final[Tuple[str, ...]] = (
+    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
+    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
+    "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
+    "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
+    "NZD_JPY", "NZD_CAD", "NZD_CHF",
+    "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
+)
+
+INDICES: Final[FrozenSet[str]] = frozenset(
+    {"DE30_EUR", "SPX500_USD", "NAS100_USD", "US30_USD", "XAU_USD"}
+)
+
+REQUIRED_OHLCV_COLS: Final[Tuple[str, ...]] = ("Open", "High", "Low", "Close", "Volume")
+
+AccountHash = NewType("AccountHash", str)
+
+
+@dataclass(frozen=True)
+class VoteSignal:
+    name: str
+    direction: Direction
+    weight: float
+    reliability: float
+    fired: bool
+    reason: str
+    errored: bool = False
+
+
+@dataclass(frozen=True)
+class DailyTrendResult:
+    direction: Direction
+    strength: int
+    atr_val: float
+    bull_score: float
+    bear_score: float
+    votes: Tuple[VoteSignal, ...]
+    min_votes_met: bool
+    degraded: bool = False
+
+
+@dataclass(frozen=True)
+class TrendResult:
+    direction: str
+    strength: int
+    atr_val: float
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    df: pd.DataFrame
+    is_stale: bool = False
+    fetched_at: Optional[datetime] = None
+
+
+# ==============================================================================
+# 🏛️ COUCHE 2 — LOGGING & TELEMETRY
+# ==============================================================================
 
 class _SecretScrubFilter(logging.Filter):
-    """Filtre de logging — supprime les tokens et les numéros de comptes."""
-
     _PATTERNS: Tuple[re.Pattern, ...] = (
         re.compile(r"Bearer\s+[A-Za-z0-9\-_\.~+/=]+", re.IGNORECASE),
         re.compile(r"\b[0-9]{3}-[0-9]{3}-[0-9]+-[0-9]+\b"),
@@ -113,7 +276,6 @@ class _SecretScrubFilter(logging.Filter):
 
 
 def _setup_logging() -> logging.Logger:
-    """Configuration globale du logger avec filtrage des secrets."""
     root = logging.getLogger()
     if not any(isinstance(f, _SecretScrubFilter) for f in root.filters):
         root.addFilter(_SecretScrubFilter())
@@ -168,280 +330,49 @@ def _log_incident(
     level: int = logging.WARNING,
     **context: Any,
 ) -> None:
-    """Journalisation structurée d'un incident opérationnel."""
     parts = [f"code={code.value}", f"msg={msg}"]
     for k, v in context.items():
         parts.append(f"{k}={v}")
     _log.log(level, "INCIDENT %s", " ".join(parts))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — CONFIGURATION INFRASTRUCTURE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-APP_VERSION: Final[str] = "7.2.0-PROD-HARDENED"
-
-_OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
-OANDA_API_URL: Final[str] = (
-    "https://api-fxtrade.oanda.com"
-    if _OANDA_ENV == "live"
-    else "https://api-fxpractice.oanda.com"
-)
-
-INSTRUMENTS: Final[Tuple[str, ...]] = (
-    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
-    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
-    "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
-    "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
-    "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
-)
-
-INDICES: Final[FrozenSet[str]] = frozenset(
-    {"DE30_EUR", "SPX500_USD", "NAS100_USD", "US30_USD", "XAU_USD"}
-)
-
-REQUIRED_OHLCV_COLS: Final[Tuple[str, ...]] = ("Open", "High", "Low", "Close", "Volume")
-
-AccountHash = NewType("AccountHash", str)
+def log_operational_event(
+    code: IncidentCode,
+    msg: str,
+    correlation_id: str,
+    *,
+    instrument: Optional[str] = None,
+    timeframe: Optional[str] = None,
+    level: int = logging.INFO,
+    **kwargs: Any
+) -> None:
+    parts = [
+        f"correlation_id={correlation_id}",
+        f"code={code.value}",
+        f"msg={msg}"
+    ]
+    if instrument:
+        parts.append(f"instrument={instrument}")
+    if timeframe:
+        parts.append(f"tf={timeframe}")
+    for k, v in kwargs.items():
+        parts.append(f"{k}={v}")
+    _log.log(level, "METRIC %s", " ".join(parts))
 
 
-@dataclass(frozen=True)
-class OandaCredentials:
-    """Conteneur d'identifiants sécurisés contre les fuites de cache Streamlit."""
-    account_id: str
-    access_token: str
+# ==============================================================================
+# 🏛️ COUCHE 3 — INFRASTRUCTURE, GESTION DU CALENDRIER & RATE-LIMITING
+# ==============================================================================
 
-    def __hash__(self) -> int:
-        return hash(self.account_id)
+def _is_streamlit_runtime() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx(suppress_warning=True) is not None
+    except ImportError:
+        return False
 
-    def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, OandaCredentials):
-            return False
-        return self.account_id == other.account_id
-
-
-@dataclass(frozen=True)
-class TrendConfig:
-    """Toutes les constantes métier — gelées et immuables."""
-
-    cache_ttl_m: int = 14400
-    cache_ttl_w: int = 3600
-    cache_ttl_d: int = 600
-    cache_ttl_h4: int = 300
-    cache_ttl_h1: int = 120
-    cache_ttl_m15: int = 60
-    cache_ttl_default: int = 600
-    cache_ttl_live_open: int = 90
-    cache_ttl_negative_live_open: int = 15
-
-    stale_max_age_multiplier: float = 4.0
-
-    data_max_age_min: int = 10
-    snapshot_drift_max_sec: float = 30.0
-    analysis_timeout_sec: int = 120
-    streamlit_running_flag_ttl_sec: int = 300
-
-    max_workers: int = 5
-    pool_drain_grace_sec: float = 10.0
-
-    http_timeout_sec: float = 8.0
-    http_retry_total: int = 2
-    http_retry_backoff: float = 0.3
-
-    rate_limit_burst: int = 30
-    rate_limit_refill_per_sec: float = 5.0
-    rate_limit_429_cooldown_sec: float = 30.0
-
-    pivot_wing: int = 5
-    max_pivot_age: int = 50
-
-    rsi_period: int = 14
-    atr_period: int = 14
-    ema_short: int = 21
-    ema_long: int = 50
-    sma_macro: int = 200
-    ema_intra_period: int = 50
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    intraday_ema_fast: int = 9
-
-    macro_band_atr_ratio: float = 0.10
-    ema50_slope_threshold: float = 0.05
-
-    volume_ratio_strong_intraday: float = 1.30
-    volume_ratio_min_midpoint: float = 1.00
-    body_range_strong: float = 0.60
-
-    min_reliable_score: float = 1.5
-    strength_min_range: int = 35
-    strength_max: int = 90
-    strength_scaler: float = 112.0
-
-    mtf_weight_m: float = 5.0
-    mtf_weight_w: float = 4.0
-    mtf_weight_d: float = 4.0
-    mtf_weight_h4: float = 2.5
-    mtf_weight_h1: float = 1.5
-    mtf_weight_15m: float = 1.0
-
-    nc_pure_strength_min: int = 70
-
-    dispersion_penalty_max: float = 15.0
-
-    min_bars_m: int = 100
-    min_bars_w: int = 50
-    min_bars_d: int = 60
-    min_bars_h4: int = 60
-    min_bars_h1: int = 200
-    min_bars_15m: int = 200
-
-    completeness_min_tradable: float = 0.85
-    cache_max_entries: int = 500
-
-
-CFG: Final[TrendConfig] = TrendConfig()
-
-if CFG.data_max_age_min > CFG.cache_ttl_d // 60:
-    raise ValueError("data_max_age_min doit être <= cache_ttl_d (minutes)")
-if CFG.max_workers < 1:
-    raise ValueError("max_workers >= 1 requis")
-
-
-_CACHE_TTL: Final[Mapping[str, int]] = {
-    "M": CFG.cache_ttl_m,
-    "W": CFG.cache_ttl_w,
-    "D": CFG.cache_ttl_d,
-    "H4": CFG.cache_ttl_h4,
-    "H1": CFG.cache_ttl_h1,
-    "M15": CFG.cache_ttl_m15,
-}
-
-_GRAN_FREQ: Final[Mapping[str, pd.Timedelta]] = {
-    "M": pd.Timedelta(days=30),
-    "W": pd.Timedelta(days=7),
-    "D": pd.Timedelta(days=1),
-    "H4": pd.Timedelta(hours=4),
-    "H1": pd.Timedelta(hours=1),
-    "M15": pd.Timedelta(minutes=15),
-}
-
-_GAP_TOLERANCE: Final[Mapping[str, pd.Timedelta]] = {
-    "M": pd.Timedelta(days=45),
-    "W": pd.Timedelta(days=10),
-    "D": pd.Timedelta(days=4),
-    "H4": pd.Timedelta(hours=12),
-    "H1": pd.Timedelta(hours=6),
-    "M15": pd.Timedelta(hours=2),
-}
-
-TREND_COLORS: Final[Mapping[str, str]] = {
-    "Bullish":          "#2ecc71",
-    "Bearish":          "#e74c3c",
-    "Retracement Bull": "#7dcea0",
-    "Retracement Bear": "#f1948a",
-    "Range":            "#95a5a6",
-}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — STREAMLIT SETUP GUARDED
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _configure_streamlit_ui() -> None:
-    """Configuration de l'interface graphique uniquement si le runtime est actif."""
-    if not (_STREAMLIT_AVAILABLE and _is_streamlit_runtime()):
-        return
-
-    st.set_page_config(
-        page_title=f"Bluestar GPS V{APP_VERSION}",
-        page_icon="🧭",
-        layout="wide",
-    )
-    st.markdown(
-        """
-        <style>
-            .main-header {
-                text-align: center; padding: 20px;
-                background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%);
-                color: white; border-radius: 12px; margin-bottom: 20px;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-            }
-            .stale-warning {
-                background: #fef3c7; border-left: 4px solid #f59e0b;
-                padding: 10px 16px; border-radius: 4px; margin-bottom: 12px;
-            }
-            .degraded-warning {
-                background: #fee2e2; border-left: 4px solid #dc2626;
-                padding: 10px 16px; border-radius: 4px; margin-bottom: 12px;
-            }
-            .not-tradable {
-                background: #1f2937; color: #fbbf24; padding: 4px 8px;
-                border-radius: 4px; font-weight: bold; font-size: 0.85em;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — TYPES CONTRACTUELS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class Direction(str, Enum):
-    BULLISH = "Bullish"
-    BEARISH = "Bearish"
-    RANGE = "Range"
-
-
-@dataclass(frozen=True)
-class VoteSignal:
-    name: str
-    direction: Direction
-    weight: float
-    reliability: float
-    fired: bool
-    reason: str
-    errored: bool = False
-
-
-@dataclass(frozen=True)
-class DailyTrendResult:
-    direction: Direction
-    strength: int
-    atr_val: float
-    bull_score: float
-    bear_score: float
-    votes: Tuple[VoteSignal, ...]
-    min_votes_met: bool
-    degraded: bool = False
-
-
-@dataclass(frozen=True)
-class TrendResult:
-    direction: str
-    strength: int
-    atr_val: float
-
-
-@dataclass(frozen=True)
-class FetchResult:
-    df: pd.DataFrame
-    is_stale: bool = False
-    fetched_at: Optional[datetime] = None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — CALENDRIER DE MARCHÉ (Ajustement saisonnier DST)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def is_us_dst(dt: datetime) -> bool:
-    """
-    Détermine si l'horodatage UTC fourni s'inscrit dans l'heure d'été américaine (EDT).
-    Débute le 2ème dimanche de mars (07:00 UTC) et finit le 1er dimanche de novembre (06:00 UTC).
-    """
     y = dt.year
     m1 = datetime(y, 3, 1, tzinfo=timezone.utc)
     dst_start = m1 + timedelta(days=((6 - m1.weekday()) % 7) + 7)
@@ -454,134 +385,47 @@ def is_us_dst(dt: datetime) -> bool:
     return dst_start <= dt < dst_end
 
 
-def is_fx_market_open(now: Optional[datetime] = None) -> bool:
-    """
-    FX ouvert de dimanche 17:00 New York à vendredi 17:00 New York.
-    Prend en compte automatiquement les transitions saisonnières (DST US).
-    """
-    if now is None:
-        now = datetime.now(timezone.utc)
-    else:
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
+class CalendarEngine:
+    @staticmethod
+    def get_asset_class(instrument: str) -> AssetClass:
+        if instrument in INDICES:
+            return AssetClass.INDEX
+        return AssetClass.FX
+
+    @classmethod
+    def is_market_open(cls, instrument: str, dt: datetime) -> bool:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         else:
-            now = now.astimezone(timezone.utc)
+            dt = dt.astimezone(timezone.utc)
 
-    dst_active = is_us_dst(now)
-    ny_offset = -4 if dst_active else -5
+        asset_class = cls.get_asset_class(instrument)
+        dst_active = is_us_dst(dt)
+        ny_offset = -4 if dst_active else -5
+        ny_time = dt + timedelta(hours=ny_offset)
 
-    ny_time = now + timedelta(hours=ny_offset)
-    weekday = ny_time.weekday()  # 0=Lundi, ..., 6=Dimanche
-    hour = ny_time.hour
+        weekday = ny_time.weekday()
+        hour = ny_time.hour
 
-    if weekday == 5:  # Samedi fermé
-        return False
-    if weekday == 4 and hour >= 17:  # Vendredi après 17:00 local fermé
-        return False
-    if weekday == 6 and hour < 17:  # Dimanche avant 17:00 local fermé
-        return False
+        if weekday == 5:
+            return False
 
-    return True
+        if asset_class == AssetClass.FX:
+            if weekday == 4 and hour >= 17:
+                return False
+            if weekday == 6 and hour < 17:
+                return False
+            return True
+        elif asset_class == AssetClass.INDEX:
+            if weekday == 4 and hour >= 17:
+                return False
+            if weekday == 6 and hour < 18:
+                return False
+            if weekday in (0, 1, 2, 3) and hour == 17:
+                return False
+            return True
+        return True
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — CALCULATION ENGINE & TECHNICAL INDICATORS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    return pd.concat(
-        [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
-        axis=1,
-    ).max(axis=1)
-
-
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def _sma(s: pd.Series, n: int) -> pd.Series:
-    return s.rolling(n).mean()
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    return _true_range(high, low, close).ewm(alpha=1.0 / n, adjust=False).mean()
-
-
-def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    d = close.diff()
-    gain = d.where(d > 0, 0.0).ewm(alpha=1.0 / n, adjust=False).mean()
-    loss = (-d.where(d < 0, 0.0)).ewm(alpha=1.0 / n, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - 100 / (1 + rs)
-    gain_pos = gain > 0
-    loss_zero = loss == 0
-    rsi = rsi.where(~loss_zero, np.where(gain_pos, 100.0, 50.0))
-    return rsi
-
-
-def _dmi(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> Tuple[float, float]:
-    tr = _true_range(high, low, close)
-    atr_s = tr.ewm(alpha=1.0 / n, adjust=False).mean()
-    up = high.diff()
-    dn = -low.diff()
-    pdm = up.where((up > dn) & (up > 0), 0.0)
-    mdm = dn.where((dn > up) & (dn > 0), 0.0)
-    pdi = 100 * pdm.ewm(alpha=1.0 / n, adjust=False).mean() / atr_s.replace(0, np.nan)
-    mdi = 100 * mdm.ewm(alpha=1.0 / n, adjust=False).mean() / atr_s.replace(0, np.nan)
-    return float(pdi.iloc[-1]), float(mdi.iloc[-1])
-
-
-def _fmt_atr(val: float) -> str:
-    if not val or np.isnan(val) or val <= 0:
-        return "N/A"
-    if val >= 10:
-        return f"{val:.2f}"
-    if val >= 1:
-        return f"{val:.3f}"
-    return f"{val:.4f}"
-
-
-def _find_strict_peaks(series: pd.Series, wing: int, min_idx: int) -> List[int]:
-    arr = series.to_numpy()
-    n = len(arr)
-    if n < 2 * wing + 1:
-        return []
-    if np.isnan(arr).any():
-        arr = np.nan_to_num(arr, nan=-np.inf)
-    if _HAS_SCIPY:
-        peaks, _ = find_peaks(arr, distance=max(1, wing))
-        return [int(p) for p in peaks if min_idx <= p <= n - wing - 1]
-    result: List[int] = []
-    for i in range(max(min_idx, wing), n - wing):
-        window = arr[i - wing: i + wing + 1]
-        center = arr[i]
-        if center == window.max() and np.sum(window == center) == 1:
-            result.append(i)
-    return result
-
-
-def _find_strict_troughs(series: pd.Series, wing: int, min_idx: int) -> List[int]:
-    arr = series.to_numpy()
-    n = len(arr)
-    if n < 2 * wing + 1:
-        return []
-    if np.isnan(arr).any():
-        arr = np.nan_to_num(arr, nan=np.inf)
-    if _HAS_SCIPY:
-        peaks, _ = find_peaks(-arr, distance=max(1, wing))
-        return [int(p) for p in peaks if min_idx <= p <= n - wing - 1]
-    result: List[int] = []
-    for i in range(max(min_idx, wing), n - wing):
-        window = arr[i - wing: i + wing + 1]
-        center = arr[i]
-        if center == window.min() and np.sum(window == center) == 1:
-            result.append(i)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — SINGLETON RATE LIMITER
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _TokenBucket:
     __slots__ = ("_capacity", "_refill_rate", "_tokens", "_last", "_lock", "_cooldown_until")
@@ -613,62 +457,33 @@ class _TokenBucket:
             self._tokens = 0.0
 
 
-class _GlobalRateLimiter:
+class GlobalRateLimiter:
     def __init__(self) -> None:
-        self._buckets: Dict[str, _TokenBucket] = {}
+        self._global_bucket = _TokenBucket(capacity=120, refill_rate=80.0)
+        self._instrument_buckets: Dict[str, _TokenBucket] = {}
         self._lock = threading.Lock()
 
     def acquire(self, instrument: str) -> bool:
         with self._lock:
-            bucket = self._buckets.get(instrument)
+            if not self._global_bucket.try_acquire():
+                return False
+            bucket = self._instrument_buckets.get(instrument)
             if bucket is None:
                 bucket = _TokenBucket(
                     CFG.rate_limit_burst, CFG.rate_limit_refill_per_sec
                 )
-                self._buckets[instrument] = bucket
-        return bucket.try_acquire()
+                self._instrument_buckets[instrument] = bucket
+            return bucket.try_acquire()
 
     def trigger_cooldown(self, instrument: str, seconds: float) -> None:
         with self._lock:
-            bucket = self._buckets.get(instrument)
-        if bucket is not None:
-            bucket.trigger_cooldown(seconds)
+            self._global_bucket.trigger_cooldown(seconds)
+            bucket = self._instrument_buckets.get(instrument)
+            if bucket is not None:
+                bucket.trigger_cooldown(seconds)
 
-
-_RATE_LIMITER_INSTANCE: Optional[_GlobalRateLimiter] = None
-_RATE_LIMITER_LOCK = threading.Lock()
-
-
-def _get_rate_limiter() -> _GlobalRateLimiter:
-    """Singleton process thread-safe interfacé avec l'allocation de ressources Streamlit."""
-    global _RATE_LIMITER_INSTANCE
-    if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-        try:
-            @st.cache_resource(show_spinner=False)
-            def _st_get_rate_limiter() -> _GlobalRateLimiter:
-                return _GlobalRateLimiter()
-            return _st_get_rate_limiter()
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            _log_incident(
-                IncidentCode.UI_CALLBACK_ERROR,
-                "Streamlit rate limiter caching failed, fallback to global singleton",
-                err=type(e).__name__
-            )
-
-    if _RATE_LIMITER_INSTANCE is None:
-        with _RATE_LIMITER_LOCK:
-            if _RATE_LIMITER_INSTANCE is None:
-                _RATE_LIMITER_INSTANCE = _GlobalRateLimiter()
-    return _RATE_LIMITER_INSTANCE
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — HTTP SESSIONS REGISTRY
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class SessionRegistry:
-    """Registre HTTP scopé par thread — fermé proprement après drainage."""
-
     def __init__(self) -> None:
         self._thread_sessions: Dict[int, requests.Session] = {}
         self._lock = threading.RLock()
@@ -695,7 +510,7 @@ class SessionRegistry:
             allowed_methods=["GET"],
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=50)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session
@@ -716,52 +531,23 @@ class SessionRegistry:
             self._thread_sessions.clear()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — CACHE ENGINE PROCESS SINGLETON
-# ═══════════════════════════════════════════════════════════════════════════════
-
 CacheKey = Tuple[str, AccountHash, str, str, int]
 LiveOpenKey = Tuple[str, AccountHash, str, str]
 
 
-def _hash_account(account_id: str) -> AccountHash:
-    h = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:16]
-    return AccountHash(h)
-
-
-def _freeze_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    frozen = df.copy(deep=True)
-    for col in frozen.columns:
-        arr = frozen[col].to_numpy()
-        try:
-            arr.flags.writeable = False
-        except (ValueError, AttributeError):
-            pass
-    return frozen
-
-
-def _defensive_copy(df: pd.DataFrame) -> pd.DataFrame:
-    return df.copy(deep=True)
-
-
 class CandleCache:
-    """Cache thread-safe LRU-like avec eviction stricte pour service 24/7."""
-
     def __init__(self, max_entries: int = 500) -> None:
-        self._data: Dict[CacheKey, Tuple[datetime, pd.DataFrame]] = {}
+        self._data: collections.OrderedDict[CacheKey, Tuple[datetime, pd.DataFrame]] = collections.OrderedDict()
         self._stale_data: Dict[CacheKey, Tuple[datetime, pd.DataFrame]] = {}
         self._live_opens: Dict[LiveOpenKey, Tuple[datetime, Optional[float]]] = {}
         self._inflight: Dict[CacheKey, threading.Event] = {}
-        self._inflight_results: Dict[CacheKey, FetchResult] = {}
         self._lock = threading.RLock()
         self._max_entries = max_entries
 
     def _evict_if_needed(self) -> None:
         while len(self._data) > self._max_entries:
-            oldest_key = min(self._data.keys(), key=lambda k: self._data[k][0])
-            self._data.pop(oldest_key, None)
+            oldest_key, _ = self._data.popitem(last=False)
             self._stale_data.pop(oldest_key, None)
-            self._inflight_results.pop(oldest_key, None)
 
     def get_candles(
         self,
@@ -773,7 +559,8 @@ class CandleCache:
         with self._lock:
             entry = self._data.get(key)
             if entry is not None and (now - entry[0]).total_seconds() < ttl:
-                return FetchResult(df=_defensive_copy(entry[1]), is_stale=False, fetched_at=entry[0])
+                self._data.move_to_end(key)
+                return FetchResult(df=entry[1], is_stale=False, fetched_at=entry[0])
 
             inflight_event = self._inflight.get(key)
             if inflight_event is not None:
@@ -806,13 +593,15 @@ class CandleCache:
         with self._lock:
             entry = self._data.get(key)
             if entry is not None and (now_post_wait - entry[0]).total_seconds() < ttl:
+                self._data.move_to_end(key)
                 return FetchResult(
-                    df=_defensive_copy(entry[1]), is_stale=False, fetched_at=entry[0]
+                    df=entry[1], is_stale=False, fetched_at=entry[0]
                 )
             stale = self._stale_data.get(key)
             if stale is not None:
                 age = (now_post_wait - stale[0]).total_seconds()
-                if age < ttl * CFG.stale_max_age_multiplier:
+                max_stale_age = ttl * CFG.stale_max_age_multiplier
+                if age < max_stale_age:
                     _log_incident(
                         IncidentCode.CACHE_STALE_HIT,
                         "follower stale fallback",
@@ -820,13 +609,15 @@ class CandleCache:
                         age_sec=int(age),
                     )
                     return FetchResult(
-                        df=_defensive_copy(stale[1]), is_stale=True, fetched_at=stale[0]
+                        df=stale[1], is_stale=True, fetched_at=stale[0]
                     )
-        _log_incident(
-            IncidentCode.CACHE_LEADER_FAILED,
-            "leader failed and no stale available",
-            key=str(key[2:]),
-        )
+                else:
+                    _log_incident(
+                        IncidentCode.CACHE_LEADER_FAILED,
+                        "stale data rejected - exceeds absolute limit",
+                        key=str(key[2:]),
+                        age_sec=int(age)
+                    )
         return FetchResult(df=pd.DataFrame(), is_stale=False)
 
     def _do_fetch_as_leader(
@@ -840,19 +631,19 @@ class CandleCache:
         try:
             df = fetch_fn()
             if not df.empty:
-                frozen = _freeze_dataframe(df)
                 ts = datetime.now(timezone.utc)
                 with self._lock:
-                    self._data[key] = (ts, frozen)
-                    self._stale_data[key] = (ts, frozen)
+                    self._data[key] = (ts, df)
+                    self._stale_data[key] = (ts, df)
                     self._evict_if_needed()
-                return FetchResult(df=_defensive_copy(frozen), is_stale=False, fetched_at=ts)
+                return FetchResult(df=df, is_stale=False, fetched_at=ts)
 
             with self._lock:
                 stale = self._stale_data.get(key)
                 if stale is not None:
                     age = (now - stale[0]).total_seconds()
-                    if age < ttl * CFG.stale_max_age_multiplier:
+                    max_stale_age = ttl * CFG.stale_max_age_multiplier
+                    if age < max_stale_age:
                         _log_incident(
                             IncidentCode.CACHE_STALE_HIT,
                             "leader stale fallback",
@@ -860,7 +651,7 @@ class CandleCache:
                             age_sec=int(age),
                         )
                         return FetchResult(
-                            df=_defensive_copy(stale[1]), is_stale=True, fetched_at=stale[0]
+                            df=stale[1], is_stale=True, fetched_at=stale[0]
                         )
             return FetchResult(df=pd.DataFrame(), is_stale=False)
         finally:
@@ -900,36 +691,104 @@ class CandleCache:
             self._inflight.clear()
 
 
-_CANDLE_CACHE_INSTANCE: Optional[CandleCache] = None
-_CANDLE_CACHE_LOCK = threading.Lock()
+class ApplicationContext:
+    _rate_limiter: Optional[GlobalRateLimiter] = None
+    _candle_cache: Optional[CandleCache] = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_rate_limiter(cls) -> GlobalRateLimiter:
+        if cls._rate_limiter is None:
+            with cls._lock:
+                if cls._rate_limiter is None:
+                    cls._rate_limiter = GlobalRateLimiter()
+        return cls._rate_limiter
+
+    @classmethod
+    def get_candle_cache(cls) -> CandleCache:
+        if cls._candle_cache is None:
+            with cls._lock:
+                if cls._candle_cache is None:
+                    cls._candle_cache = CandleCache(max_entries=CFG.cache_max_entries)
+        return cls._candle_cache
+
+
+# Enveloppes défensives Streamlit pour l'interfaçage transparent des singletons
+def _get_rate_limiter() -> GlobalRateLimiter:
+    if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
+        try:
+            @st.cache_resource(show_spinner=False)
+            def _st_get_rate_limiter() -> GlobalRateLimiter:
+                return ApplicationContext.get_rate_limiter()
+            return _st_get_rate_limiter()
+        except Exception:
+            pass
+    return ApplicationContext.get_rate_limiter()
 
 
 def _get_candle_cache() -> CandleCache:
-    """Singleton process thread-safe interfacé avec l'allocation de ressources Streamlit."""
-    global _CANDLE_CACHE_INSTANCE
     if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
         try:
             @st.cache_resource(show_spinner=False)
             def _st_get_candle_cache() -> CandleCache:
-                return CandleCache(max_entries=CFG.cache_max_entries)
+                return ApplicationContext.get_candle_cache()
             return _st_get_candle_cache()
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            _log_incident(
-                IncidentCode.UI_CALLBACK_ERROR,
-                "Streamlit candle cache caching failed, fallback to global singleton",
-                err=type(e).__name__
-            )
-
-    if _CANDLE_CACHE_INSTANCE is None:
-        with _CANDLE_CACHE_LOCK:
-            if _CANDLE_CACHE_INSTANCE is None:
-                _CANDLE_CACHE_INSTANCE = CandleCache(max_entries=CFG.cache_max_entries)
-    return _CANDLE_CACHE_INSTANCE
+        except Exception:
+            pass
+    return ApplicationContext.get_candle_cache()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — RESILIENT DATA LAYER & CONNECTOR
-# ═══════════════════════════════════════════════════════════════════════════════
+def safe_cache_data(ttl: Optional[int] = None, **kwargs: Any) -> Callable[[Any], Any]:
+    """Décorateur défensif évitant les crashs d'importation et d'attributs de cache Streamlit."""
+    def decorator(func: Any) -> Any:
+        if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
+            try:
+                cached_func = st.cache_data(ttl=ttl, **kwargs)(func)
+                return cached_func
+            except Exception as e:
+                _log_incident(IncidentCode.UI_CALLBACK_ERROR, "st.cache_data failed, using fallback", err=type(e).__name__)
+        
+        if not hasattr(func, "clear"):
+            def dummy_clear() -> None:
+                pass
+            func.clear = dummy_clear
+        return func
+    return decorator
+
+
+def safe_cache_resource(**kwargs: Any) -> Callable[[Any], Any]:
+    """Décorateur défensif st.cache_resource avec fallback transparent."""
+    def decorator(func: Any) -> Any:
+        if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
+            try:
+                cached_func = st.cache_resource(**kwargs)(func)
+                return cached_func
+            except Exception as e:
+                _log_incident(IncidentCode.UI_CALLBACK_ERROR, "st.cache_resource failed, using fallback", err=type(e).__name__)
+        
+        if not hasattr(func, "clear"):
+            def dummy_clear() -> None:
+                pass
+            func.clear = dummy_clear
+        return func
+    return decorator
+
+
+# ==============================================================================
+# 🏛️ COUCHE 4 — ADAPTATEURS DE DONNÉES & CONNECTEURS API OANDA
+# ==============================================================================
+
+def check_oanda_connection(account_id: str, access_token: str) -> bool:
+    """Valide les identifiants d'API OANDA via un ping de sécurité léger."""
+    url = f"{OANDA_API_URL}/v3/accounts/{account_id}/summary"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=5.0)
+        return r.status_code == 200
+    except Exception as e:
+        _log_incident(IncidentCode.HTTP_AUTH, "OANDA connection probe failed", err=type(e).__name__)
+        return False
+
 
 def _validate_candle(row: Mapping[str, float], allow_zero_volume: bool) -> bool:
     try:
@@ -989,11 +848,7 @@ def _validate_dataframe_schema(df: pd.DataFrame, instrument: str, granularity: s
 def _validate_dataframe_gaps(
     df: pd.DataFrame, granularity: str, instrument: str
 ) -> bool:
-    """
-    Exécute une validation temporelle fine.
-    Tolle les gaps de week-end, et marque df.attrs["critical_gap"] s'ils surviennent
-    durant les heures de cotation normales.
-    """
+    """Détecte de manière précise les anomalies de gaps temporels lors des cotations."""
     if len(df) < 2:
         df.attrs["critical_gap"] = False
         return True
@@ -1013,13 +868,12 @@ def _validate_dataframe_gaps(
 
     if max_gap > tolerance:
         gap_start = max_idx - max_gap
-        gap_end = max_idx
-        is_weekend = (gap_start.weekday() in (4, 5, 6)) and (gap_end.weekday() in (6, 0, 1))
+        is_market_closed = not CalendarEngine.is_market_open(instrument, gap_start)
 
-        if is_weekend:
+        if is_market_closed:
             _log_incident(
                 IncidentCode.DATA_GAPS,
-                "tolerated weekend gap",
+                "tolerated market-close gap",
                 instrument=instrument,
                 granularity=granularity,
                 max_gap_sec=int(max_gap.total_seconds()),
@@ -1029,7 +883,7 @@ def _validate_dataframe_gaps(
         else:
             _log_incident(
                 IncidentCode.DATA_GAPS,
-                "critical gap during market open",
+                "critical gap during market open session",
                 instrument=instrument,
                 granularity=granularity,
                 max_gap_sec=int(max_gap.total_seconds()),
@@ -1044,7 +898,6 @@ def _validate_dataframe_gaps(
 
 
 def _fallback_bid_ask(candle: Any) -> Optional[Dict[str, float]]:
-    """Calcule la moyenne bid/ask si les valeurs médianes 'mid' sont absentes du JSON."""
     try:
         bid = candle.get("bid")
         ask = candle.get("ask")
@@ -1236,6 +1089,13 @@ def _fetch_candles_raw(
     if not _validate_dataframe_gaps(df, granularity, instrument):
         return pd.DataFrame()
 
+    # Gel physique des tableaux NumPy pour forcer l'immutabilité
+    for col in df.columns:
+        try:
+            df[col].to_numpy().flags.writeable = False
+        except (ValueError, AttributeError):
+            pass
+
     return df
 
 
@@ -1260,38 +1120,14 @@ def fetch_cached(
     )
 
 
-def fetch_live_open(
-    instrument: str,
-    granularity: str,
-    account_id: str,
-    account_hash: AccountHash,
-    access_token: str,
-    registry: SessionRegistry,
-) -> Optional[float]:
-    key: LiveOpenKey = (_OANDA_ENV, account_hash, instrument, granularity)
-
-    def _fetch() -> Optional[float]:
-        df = _fetch_candles_raw(
-            instrument, granularity, 1, account_id, access_token, registry,
-            include_incomplete=True,
-        )
-        if df.empty:
-            return None
-        try:
-            last_ts = df.index[-1]
-            now = datetime.now(timezone.utc)
-            max_age = _GRAN_FREQ.get(granularity, pd.Timedelta(days=1))
-            if granularity == "W":
-                max_age = pd.Timedelta(days=14)
-            elif granularity == "M":
-                max_age = pd.Timedelta(days=45)
-            if (now - last_ts) > max_age:
-                return None
-            return float(df["Open"].iloc[-1])
-        except (IndexError, ValueError, TypeError):
-            return None
-
-    return _get_candle_cache().get_live_open(key, _fetch)
+_TF_DRIFT_LIMITS: Final[Mapping[str, pd.Timedelta]] = {
+    "M": pd.Timedelta(days=7),
+    "W": pd.Timedelta(days=3),
+    "D": pd.Timedelta(hours=24),
+    "4H": pd.Timedelta(hours=4),
+    "1H": pd.Timedelta(hours=1),
+    "15m": pd.Timedelta(minutes=15),
+}
 
 
 def fetch_all_data(
@@ -1301,6 +1137,7 @@ def fetch_all_data(
     access_token: str,
     registry: SessionRegistry,
     stop_event: threading.Event,
+    session_mode: SessionTimingMode = SessionTimingMode.CLOSE_ONLY,
 ) -> Dict[str, Any]:
     specs = {
         "M":   ("M",   150, CFG.min_bars_m),
@@ -1325,9 +1162,11 @@ def fetch_all_data(
             cache["error_reason"] = "Stop requested"
             return cache
 
+        # En mode CLOSE_ONLY, les bougies incomplètes ne sont pas évaluées
         result = fetch_cached(
             instrument, gran, count, account_id, account_hash, access_token, registry
         )
+        
         if result.df.empty:
             cache["is_incomplete"] = True
             cache["error_reason"] = f"Fetch failed on {tf}"
@@ -1354,24 +1193,39 @@ def fetch_all_data(
 
     cache["_snapshot_completed_at"] = datetime.now(timezone.utc)
 
-    ts_list = [v for v in cache["_snapshot_per_tf"].values() if v is not None]
-    if ts_list:
-        drift = (max(ts_list) - min(ts_list)).total_seconds()
-        cache["_snapshot_drift_sec"] = drift
-        cache["_snapshot_drift_exceeded"] = drift > CFG.snapshot_drift_max_sec
+    # Calcul adaptatif de dérive temporelle pour chaque timeframe
+    now_utc = datetime.now(timezone.utc)
+    drift_exceeded = False
+    drift_details = []
 
-    cache["_week_open"] = fetch_live_open(
-        instrument, "W", account_id, account_hash, access_token, registry
-    )
-    cache["_day_open"] = fetch_live_open(
-        instrument, "D", account_id, account_hash, access_token, registry
-    )
+    for tf, ts in cache["_snapshot_per_tf"].items():
+        if ts is not None:
+            age = now_utc - ts
+            limit = _TF_DRIFT_LIMITS.get(tf, pd.Timedelta(seconds=30))
+            if age > limit:
+                drift_exceeded = True
+                drift_details.append(f"{tf} age {age.total_seconds():.0f}s > limit {limit.total_seconds():.0f}s")
+
+    cache["_snapshot_drift_exceeded"] = drift_exceeded
+    cache["_snapshot_drift_details"] = ", ".join(drift_details)
+
+    # Extraction d'ouvertures de session atomiques à partir des historiques
+    try:
+        cache["_week_open"] = float(cache["W"]["Open"].iloc[-1])
+    except Exception:
+        cache["_week_open"] = None
+
+    try:
+        cache["_day_open"] = float(cache["D"]["Open"].iloc[-1])
+    except Exception:
+        cache["_day_open"] = None
+
     return cache
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — REGISTRE DE VOTES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 🏛️ COUCHE 5 — ANALYSE SCIENTIFIQUE : VOTE DIRECTIONNEL (DAILY D1)
+# ==============================================================================
 
 @dataclass(frozen=True)
 class VoteSpec:
@@ -1402,10 +1256,6 @@ class VoteRegistry:
 
 DAILY_VOTES: Final[VoteRegistry] = VoteRegistry()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — VOTES ATOMIQUES
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @DAILY_VOTES.register(uid="swing_structure", critical=True)
 def _vote_swing_structure(
@@ -1519,7 +1369,14 @@ def _vote_prev_midpoint(
     lo_j1 = float(lo.iloc[-1])
     c_j1 = float(c.iloc[-1])
     mid_j1 = (h_j1 + lo_j1) / 2.0
-    direction = Direction.BULLISH if c_j1 > mid_j1 else Direction.BEARISH
+
+    # Résolution Neutre d'égalité stricte (Résolution Problème 2)
+    if c_j1 > mid_j1:
+        direction = Direction.BULLISH
+    elif c_j1 < mid_j1:
+        direction = Direction.BEARISH
+    else:
+        return VoteSignal(name, Direction.RANGE, 0.5, 0.0, False, "c_j1 == mid_j1 exact")
 
     if is_index:
         return _vote_prev_midpoint_indices(h_j1, lo_j1, c_j1, ctx, direction)
@@ -1541,9 +1398,9 @@ def _vote_ema50_slope(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
     return VoteSignal(name, Direction.RANGE, 1.0, 0.70, False, f"slope={slope_ratio:.3f}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — AGRÉGATEUR DE VOTES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 🏛️ COUCHE 6 — GESTION DES SCORES & ALIGNEMENTS MULTI-TEMPORELS
+# ==============================================================================
 
 def _aggregate_votes(
     votes: Tuple[VoteSignal, ...], atr_val: float, degraded: bool
@@ -1551,6 +1408,9 @@ def _aggregate_votes(
     bull_score = sum(v.weight * v.reliability for v in votes if v.fired and v.direction == Direction.BULLISH)
     bear_score = sum(v.weight * v.reliability for v in votes if v.fired and v.direction == Direction.BEARISH)
     fired_possible = sum(v.weight * v.reliability for v in votes if v.fired)
+    
+    total_possible_weight = sum(v.weight for v in votes)
+    
     winning_score = max(bull_score, bear_score)
     min_votes_met = winning_score >= CFG.min_reliable_score
 
@@ -1562,15 +1422,17 @@ def _aggregate_votes(
 
     direction = Direction.BULLISH if bull_score > bear_score else Direction.BEARISH
     ratio = winning_score / fired_possible if fired_possible > 0 else 0.0
-    strength = int(min(CFG.strength_max, max(CFG.strength_min_range, ratio * CFG.strength_scaler)))
+    
+    # Amélioration du score de couverture (Résolution Problème 3)
+    coverage_ratio = fired_possible / max(1.0, total_possible_weight)
+    raw_strength = ratio * CFG.strength_scaler
+    adjusted_strength = raw_strength * (0.5 + 0.5 * coverage_ratio)
+    
+    strength = int(min(CFG.strength_max, max(CFG.strength_min_range, adjusted_strength)))
     return DailyTrendResult(
         direction, strength, atr_val, bull_score, bear_score, votes, min_votes_met, degraded,
     )
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — MULTI-TIMEFRAME ANALYSIS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def trend_daily(
     df: pd.DataFrame,
@@ -1791,160 +1653,9 @@ def trend_age_daily(df: pd.DataFrame) -> str:
     return f">{len(above)}"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — SYSTEME DE SCORING MULTI-TIMEFRAME
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_MTF_WEIGHTS: Final[Mapping[str, float]] = {
-    "M": CFG.mtf_weight_m,
-    "W": CFG.mtf_weight_w,
-    "D": CFG.mtf_weight_d,
-    "4H": CFG.mtf_weight_h4,
-    "1H": CFG.mtf_weight_h1,
-    "15m": CFG.mtf_weight_15m,
-}
-
-
-def _bull_compat(t: str) -> bool:
-    return t in ("Bullish", "Retracement Bull")
-
-
-def _bear_compat(t: str) -> bool:
-    return t in ("Bearish", "Retracement Bear")
-
-
-def _mtf_weighted_score(
-    trends: Mapping[str, str], scores: Mapping[str, int]
-) -> Tuple[float, float, float]:
-    active_total = sum(_MTF_WEIGHTS[tf] for tf in trends if not trends[tf].startswith("Range"))
-    if active_total == 0:
-        return 0.0, 0.0, 1.0
-    w_bull = sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) for tf in trends if trends[tf] == "Bullish"
-    ) + sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) * 0.5
-        for tf in trends if trends[tf] == "Retracement Bull"
-    )
-    w_bear = sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) for tf in trends if trends[tf] == "Bearish"
-    ) + sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) * 0.5
-        for tf in trends if trends[tf] == "Retracement Bear"
-    )
-    return w_bull, w_bear, active_total
-
-
-def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
-    bonus = 0
-    m, w = trends.get("M", ""), trends.get("W", "")
-    d, h4 = trends.get("D", ""), trends.get("4H", "")
-    if direction == "Bullish":
-        if m == "Bullish" and w == "Bullish":
-            bonus += 15
-        elif _bull_compat(m) and _bull_compat(w):
-            bonus += 12
-        if d == "Bullish" and h4 == "Bullish":
-            bonus += 10
-        elif _bull_compat(d) and _bull_compat(h4):
-            bonus += 7
-    else:
-        if m == "Bearish" and w == "Bearish":
-            bonus += 15
-        elif _bear_compat(m) and _bear_compat(w):
-            bonus += 12
-        if d == "Bearish" and h4 == "Bearish":
-            bonus += 10
-        elif _bear_compat(d) and _bear_compat(h4):
-            bonus += 7
-    return bonus
-
-
-def _mtf_dispersion_penalty(trends: Mapping[str, str], direction: str) -> float:
-    if direction not in ("Bullish", "Bearish"):
-        return 0.0
-    conflict_weight = 0.0
-    total_weight = 0.0
-    for tf, trend in trends.items():
-        w = _MTF_WEIGHTS[tf]
-        total_weight += w
-        if direction == "Bullish" and _bear_compat(trend):
-            conflict_weight += w
-        elif direction == "Bearish" and _bull_compat(trend):
-            conflict_weight += w
-    if total_weight == 0:
-        return 0.0
-    ratio = conflict_weight / total_weight
-    return min(CFG.dispersion_penalty_max, ratio * CFG.dispersion_penalty_max * 2)
-
-
-def score_mtf(trends: Mapping[str, str], scores: Mapping[str, int]) -> Tuple[str, float]:
-    w_bull, w_bear, total = _mtf_weighted_score(trends, scores)
-    if w_bull > w_bear:
-        raw_score, direction = (w_bull / total) * 100, "Bullish"
-    elif w_bear > w_bull:
-        raw_score, direction = (w_bear / total) * 100, "Bearish"
-    else:
-        return "Range", 0.0
-    bonus = _mtf_alignment_bonus(trends, direction)
-    penalty = _mtf_dispersion_penalty(trends, direction)
-    return direction, max(0.0, min(100.0, raw_score + bonus - penalty))
-
-
-def _compute_nc_orthogonal(
-    trends: Mapping[str, str], scores: Mapping[str, int], mtf_dir: str
-) -> int:
-    if mtf_dir not in ("Bullish", "Bearish"):
-        return 0
-    score_f = 0.0
-    for tf, trend in trends.items():
-        strength = scores.get(tf, 0)
-        is_strong_pure_bull = trend == "Bullish" and strength >= CFG.nc_pure_strength_min
-        is_strong_pure_bear = trend == "Bearish" and strength >= CFG.nc_pure_strength_min
-        if mtf_dir == "Bullish":
-            if is_strong_pure_bull:
-                score_f += 1.0
-            elif trend == "Retracement Bull":
-                score_f += 0.25
-            elif is_strong_pure_bear:
-                score_f -= 1.0
-            elif trend == "Retracement Bear":
-                score_f -= 0.25
-        else:
-            if is_strong_pure_bear:
-                score_f += 1.0
-            elif trend == "Retracement Bear":
-                score_f += 0.25
-            elif is_strong_pure_bull:
-                score_f -= 1.0
-            elif trend == "Retracement Bull":
-                score_f -= 0.25
-    sign = 1 if score_f >= 0 else -1
-    return sign * math.floor(abs(score_f))
-
-
-def grade_hybrid(
-    scores_list: List[float], nc_list: List[int], degraded_list: List[bool]
-) -> List[str]:
-    grades: List[str] = []
-    for score, nc, degraded in zip(scores_list, nc_list, degraded_list):
-        nc_bonus = (int(nc) - 3) * 5
-        adj = min(100.0, float(score) + nc_bonus)
-        if degraded:
-            grades.append("B+" if adj >= 38 else "B")
-        elif adj >= 80:
-            grades.append("A+")
-        elif adj >= 55:
-            grades.append("A")
-        elif adj >= 38:
-            grades.append("B+")
-        else:
-            grades.append("B")
-    return grades
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 16 — CORE PIPELINE ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 🏛️ COUCHE 7 — PIPELINE ORCHESTRATION & GESTION DE LA CONCURRENCE
+# ==============================================================================
 
 def analyze_pair(
     pair: str,
@@ -1953,34 +1664,49 @@ def analyze_pair(
     access_token: str,
     registry: SessionRegistry,
     stop_event: threading.Event,
+    session_mode: SessionTimingMode = SessionTimingMode.CLOSE_ONLY,
 ) -> Optional[Dict[str, Any]]:
     if stop_event.is_set():
         return None
+
+    # Phase 1 : Acquisition Réseau (Fail-soft sur erreurs d'API / Connexion)
     try:
         cache = fetch_all_data(
-            pair, account_id, account_hash, access_token, registry, stop_event
+            pair, account_id, account_hash, access_token, registry, stop_event, session_mode
         )
+    except Exception as fetch_exc:
+        _log_incident(IncidentCode.HTTP_ERROR, "Atomic fetch crashed softly", instrument=pair, err=type(fetch_exc).__name__)
+        return {
+            "Paire": pair.replace("_", "/"),
+            "M": "Range", "W": "Range", "D": "Range", "4H": "Range", "1H": "Range", "15m": "Range",
+            "MTF": "Range", "_mtf_score": 0.0, "_mtf_dir": "Range", "_degraded": True, "_stale_tfs": (),
+            "NC": 0, "Age D1": "N/A", "ATR Daily": "N/A", "ATR H4": "N/A", "ATR H1": "N/A", "ATR 15m": "N/A",
+            "_error_reason": f"Network Error: {type(fetch_exc).__name__}",
+        }
 
-        if cache.get("is_incomplete"):
-            reason = cache.get("error_reason", "Fetch failed")
-            return {
-                "Paire": pair.replace("_", "/"),
-                "M": "Range", "W": "Range", "D": "Range",
-                "4H": "Range", "1H": "Range", "15m": "Range",
-                "MTF": "Range",
-                "_mtf_score": 0.0,
-                "_mtf_dir": "Range",
-                "_degraded": True,
-                "_stale_tfs": (),
-                "NC": 0,
-                "Age D1": "N/A",
-                "ATR Daily": "N/A",
-                "ATR H4": "N/A",
-                "ATR H1": "N/A",
-                "ATR 15m": "N/A",
-                "_error_reason": reason,
-            }
+    # Si le sweep est incomplet, renvoyer une ligne d'erreur formatée
+    if cache.get("is_incomplete"):
+        reason = cache.get("error_reason", "Acquisition failure")
+        return {
+            "Paire": pair.replace("_", "/"),
+            "M": "Range", "W": "Range", "D": "Range",
+            "4H": "Range", "1H": "Range", "15m": "Range",
+            "MTF": "Range",
+            "_mtf_score": 0.0,
+            "_mtf_dir": "Range",
+            "_degraded": True,
+            "_stale_tfs": (),
+            "NC": 0,
+            "Age D1": "N/A",
+            "ATR Daily": "N/A",
+            "ATR H4": "N/A",
+            "ATR H1": "N/A",
+            "ATR 15m": "N/A",
+            "_error_reason": reason,
+        }
 
+    # Phase 2 : Calculs scientifiques et indicateurs (Fail-fast sur les bugs de code)
+    try:
         trends: Dict[str, str] = {}
         scores: Dict[str, int] = {}
         atrs: Dict[str, float] = {}
@@ -1990,7 +1716,7 @@ def analyze_pair(
         degraded = bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
 
         if drift_exceeded or critical_gap:
-            reason = "Drift exceeded" if drift_exceeded else "Critical gap in open market hours"
+            reason = "Drift limits exceeded" if drift_exceeded else "Critical gap during open session"
             return {
                 "Paire": pair.replace("_", "/"),
                 "M": "Range", "W": "Range", "D": "Range",
@@ -2058,10 +1784,10 @@ def analyze_pair(
             "ATR H1": _fmt_atr(atrs["1H"]),
             "ATR 15m": _fmt_atr(atrs["15m"]),
         }
-    except Exception as e:  # pylint: disable=broad-exception-caught
+    except Exception as calc_exc:
         _log_incident(
-            IncidentCode.UNKNOWN, "analyze_pair exception",
-            instrument=pair, err=type(e).__name__, level=logging.ERROR,
+            IncidentCode.UNKNOWN, "HARD MATHEMATICAL ANALYSIS FAILURE",
+            instrument=pair, err=type(calc_exc).__name__, level=logging.ERROR
         )
         return {
             "Paire": pair.replace("_", "/"),
@@ -2078,7 +1804,7 @@ def analyze_pair(
             "ATR H4": "N/A",
             "ATR H1": "N/A",
             "ATR 15m": "N/A",
-            "_error_reason": f"Analysis failed: {type(e).__name__}",
+            "_error_reason": f"ALGORITHMIC CRASH: {type(calc_exc).__name__}",
         }
 
 
@@ -2097,7 +1823,7 @@ def _drain_executor_strict(
         if alive == 0:
             break
         time.sleep(0.05)
-    executor.shutdown(wait=True, cancel_futures=True)
+    executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _process_completed_future(
@@ -2120,27 +1846,78 @@ def _process_completed_future(
         )
 
 
+def _process_future_results(
+    futures: Dict[Future, str],
+    dynamic_timeout: float,
+    total: int,
+    progress_cb: Optional[Callable[[float], None]],
+    status_cb: Optional[Callable[[str], None]],
+    results: List[Dict[str, Any]],
+    errors: set,
+) -> bool:
+    """Consomme les futures au fur et à mesure de leur achèvement pour réduire la complexité de analyze_all_core."""
+    done = 0
+    timed_out = False
+    try:
+        for future in as_completed(futures, timeout=dynamic_timeout):
+            inst = futures[future]
+            done += 1
+            if progress_cb is not None:
+                try:
+                    progress_cb(done / total)
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    _log_incident(IncidentCode.UI_CALLBACK_ERROR, "progress_cb failed", err=type(exc).__name__)
+            if status_cb is not None:
+                try:
+                    status_cb(f"GPS ({done}/{total}) — {inst.replace('_', '/')}")
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    _log_incident(IncidentCode.UI_CALLBACK_ERROR, "status_cb failed", err=type(exc).__name__)
+            
+            _process_completed_future(future, inst, results, errors)
+    except FutureTimeoutError:
+        timed_out = True
+    return timed_out
+
+
 def analyze_all_core(
     account_id: str,
     access_token: str,
     progress_cb: Optional[Callable[[float], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
+    session_mode: SessionTimingMode = SessionTimingMode.CLOSE_ONLY,
 ) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     errors: set = set()
     total = len(INSTRUMENTS)
-    done = 0
-    timed_out = False
     stop_event = threading.Event()
     registry = SessionRegistry()
     account_hash = _hash_account(account_id)
+
+    correlation_id = hashlib.sha256(f"{account_id}-{time.time()}".encode("utf-8")).hexdigest()[:8]
 
     meta: Dict[str, Any] = {
         "started_at": datetime.now(timezone.utc),
         "version": APP_VERSION,
         "env": _OANDA_ENV,
         "account_hash": account_hash,
+        "correlation_id": correlation_id,
+        "session_mode": session_mode.value,
     }
+
+    # Validation pré-vol de l'authentification (Résolution Problème 15)
+    if not check_oanda_connection(account_id, access_token):
+        _log_incident(IncidentCode.HTTP_AUTH, "Pre-flight connection probe failed. Sweeper aborted.")
+        for inst in INSTRUMENTS:
+            results.append({
+                "Paire": inst.replace("_", "/"),
+                "M": "Range", "W": "Range", "D": "Range", "4H": "Range", "1H": "Range", "15m": "Range",
+                "MTF": "Range", "_mtf_score": 0.0, "_mtf_dir": "Range", "_degraded": True, "_stale_tfs": (),
+                "NC": 0, "Age D1": "N/A", "ATR Daily": "N/A", "ATR H4": "N/A", "ATR H1": "N/A", "ATR 15m": "N/A",
+                "_error_reason": "Pre-flight connection probe rejected by OANDA",
+            })
+        df = pd.DataFrame(results)
+        df.attrs["meta"] = meta
+        return df, list(INSTRUMENTS), meta
 
     dynamic_timeout = max(CFG.analysis_timeout_sec, int(len(INSTRUMENTS) * 5.0 / CFG.max_workers))
 
@@ -2151,33 +1928,13 @@ def analyze_all_core(
     try:
         futures = {
             executor.submit(
-                analyze_pair, inst, account_id, account_hash, access_token, registry, stop_event
+                analyze_pair, inst, account_id, account_hash, access_token, registry, stop_event, session_mode
             ): inst
             for inst in INSTRUMENTS
         }
-        try:
-            for future in as_completed(futures, timeout=dynamic_timeout):
-                inst = futures[future]
-                done += 1
-                if progress_cb is not None:
-                    try:
-                        progress_cb(done / total)
-                    except Exception as exc:  # pylint: disable=broad-exception-caught
-                        _log_incident(
-                            IncidentCode.UI_CALLBACK_ERROR, "progress_cb",
-                            err=type(exc).__name__, level=logging.DEBUG,
-                        )
-                if status_cb is not None:
-                    try:
-                        status_cb(f"GPS ({done}/{total}) — {inst.replace('_', '/')}")
-                    except Exception as exc:  # pylint: disable=broad-exception-caught
-                        _log_incident(
-                            IncidentCode.UI_CALLBACK_ERROR, "status_cb",
-                            err=type(exc).__name__, level=logging.DEBUG,
-                        )
-                _process_completed_future(future, inst, results, errors)
-        except FutureTimeoutError:
-            timed_out = True
+        
+        timed_out = _process_future_results(futures, dynamic_timeout, total, progress_cb, status_cb, results, errors)
+        if timed_out:
             _log_incident(
                 IncidentCode.EXECUTOR_TIMEOUT, "analyze_all_core timeout",
                 timeout_sec=dynamic_timeout, level=logging.ERROR,
@@ -2212,30 +1969,33 @@ def analyze_all_core(
             r["Tradable"] = f"✗ ERROR ({r['_error_reason']})"
         else:
             r["Quality"] = g
-            r["Tradable"] = "✓" if not deg else "✗ NOT_TRADEABLE"
+            r["Tradable"] = "✓" if not deg else "✗ NOT_TRADABLE"
 
     df = pd.DataFrame(results)
     df.attrs["meta"] = meta
     return df, errors_sorted, meta
 
 
-# Caching d'exécution Streamlit sécurisé, ignorant les clés secrètes brutes
-if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-    @st.cache_data(
-        ttl=CFG.cache_ttl_d,
-        show_spinner=False,
-        hash_funcs={OandaCredentials: lambda creds: creds.account_id}
+# Wrapper Streamlit préservant la confidentialité des identifiants (Résolution Problème 19)
+@safe_cache_data(
+    ttl=CFG.cache_ttl_d,
+    show_spinner=False,
+    hash_funcs={OandaCredentials: lambda creds: creds.get_secure_hash()}
+)
+def _run_analysis_cached(creds: OandaCredentials, session_mode: SessionTimingMode) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
+    return analyze_all_core(creds.account_id, creds.access_token, session_mode=session_mode)
+
+
+# ==============================================================================
+# 🏛️ COUCHE 8 — COMPOSANTS DE PRÉSENTATION : INTERFACE UTILISATEUR & PDF
+# ==============================================================================
+
+def log_export_event(format_name: str, row_count: int, correlation_id: str) -> None:
+    _log.info(
+        "EXPORT_EVENT correlation_id=%s format=%s rows=%d timestamp=%s",
+        correlation_id, format_name, row_count, datetime.now(timezone.utc).isoformat()
     )
-    def _run_analysis_cached(creds: OandaCredentials) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
-        return analyze_all_core(creds.account_id, creds.access_token)
-else:
-    def _run_analysis_cached(creds: OandaCredentials) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
-        return analyze_all_core(creds.account_id, creds.access_token)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 17 — UI REPORTING & FORMAT GENERATION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _safe_str(s: str) -> str:
     return s.encode("latin-1", errors="replace").decode("latin-1")
@@ -2450,19 +2210,19 @@ def _style_nc(s: pd.Series) -> List[str]:
     return out
 
 
-def analyze_all(account_id: str, access_token: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Enveloppe Streamlit sécurisée pour l'analyse globale."""
+def analyze_all(account_id: str, access_token: str, session_mode: SessionTimingMode) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Enveloppe Streamlit — utilise le cache déterministe sécurisé."""
     creds = OandaCredentials(account_id=account_id, access_token=access_token)
-    df, errors, meta = _run_analysis_cached(creds)
+    df, errors, meta = _run_analysis_cached(creds, session_mode)
 
     if meta.get("timed_out"):
         st.error(
             f"⏱️ Analyse interrompue après {CFG.analysis_timeout_sec}s. "
-            "Vérifiez la connexion OANDA."
+            "Vérifiez l'état de l'API OANDA."
         )
     if errors:
         st.warning(
-            f"⚠️ {len(errors)} paire(s) non analysée(s) : "
+            f"⚠️ {len(errors)} actif(s) indisponible(s) : "
             f"{', '.join(e.replace('_', '/') for e in errors[:10])}"
             + (" …" if len(errors) > 10 else "")
         )
@@ -2470,19 +2230,33 @@ def analyze_all(account_id: str, access_token: str) -> Tuple[pd.DataFrame, Dict[
     if completeness < CFG.completeness_min_tradable and not df.empty:
         st.markdown(
             f"<div class='degraded-warning'>⚠️ <b>Couverture partielle</b> — "
-            f"seulement <b>{completeness:.0%}</b> des instruments analysés. "
-            "<b>Run marqué NOT_TRADEABLE.</b></div>",
+            f"Seulement <b>{completeness:.0%}</b> des actifs ont été balayés. "
+            "<b>Exécution non recommandée (NOT_TRADABLE).</b></div>",
             unsafe_allow_html=True,
         )
     return df, meta
 
 
-def _sidebar_config() -> bool:
-    """Rendu de la barre de configuration pour alléger main()."""
+def _sidebar_config() -> Tuple[bool, SessionTimingMode]:
     with st.sidebar:
         st.header("⚙️ Configuration")
         only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
+        
+        # Sélecteur de cohérence temporelle (Résolution Problème 21)
+        mode_label = st.selectbox(
+            "Régime temporel des signaux",
+            options=["Clôture uniquement (CLOSE_ONLY)", "Temps réel complet (LIVE)"],
+            index=0,
+            help=" CLOSE_ONLY élimine les signaux in-flight pour garantir l'absence d'asymétrie avec le backtest."
+        )
+        session_mode = (
+            SessionTimingMode.CLOSE_ONLY
+            if "CLOSE_ONLY" in mode_label
+            else SessionTimingMode.LIVE
+        )
+
         st.info(
+            f"Mode : {session_mode.value}\n\n"
             f"Env : {_OANDA_ENV.upper()}\n\n"
             f"Workers : {CFG.max_workers} · Timeout : {CFG.analysis_timeout_sec}s\n\n"
             f"Cache TTL : M={CFG.cache_ttl_m // 60}m W={CFG.cache_ttl_w // 60}m D={CFG.cache_ttl_d // 60}m"
@@ -2499,16 +2273,67 @@ def _sidebar_config() -> bool:
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     _log.debug("Streamlit cache clear failed: %s", e)
             st.success("Cache vidé.")
-    return only_best
+    return only_best, session_mode
 
 
 def _render_metrics(df: pd.DataFrame) -> None:
-    """Affichage des métriques de synthèse pour alléger main()."""
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Analyzed", len(df))
     c2.metric("Setups A+", len(df[df["Quality"] == "A+"]))
     c3.metric("Setups A", len(df[df["Quality"] == "A"]))
     c4.metric("Setups B", len(df[df["Quality"].isin(["B+", "B"])]))
+
+
+def _render_results_table(df_clean: pd.DataFrame) -> None:
+    display = ["Paire", "M", "W", "D", "4H", "1H", "15m", "MTF", "Quality", "Tradable",
+               "NC", "Age D1", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m"]
+    cols_present = [col for col in display if col in df_clean.columns]
+
+    styled = (
+        df_clean[cols_present].style
+        .apply(_style_quality, axis=0)
+        .apply(_style_nc, axis=0)
+        .map(_style_trend)
+    )
+    st.dataframe(
+        styled,
+        height=min(800, max(400, (len(df_clean) + 1) * 38 + 10)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _render_download_buttons(df_clean: pd.DataFrame, pdf_buf: BytesIO, correlation_id: str) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    c1, c2, c3 = st.columns(3)
+    display = ["Paire", "M", "W", "D", "4H", "1H", "15m", "MTF", "Quality", "Tradable",
+               "NC", "Age D1", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m"]
+    cols_present = [col for col in display if col in df_clean.columns]
+
+    with c1:
+        st.download_button(
+            "📄 PDF", data=pdf_buf,
+            file_name=f"Bluestar_GPS_{ts}.pdf",
+            mime="application/pdf", use_container_width=True,
+            on_click=lambda: log_export_event("PDF", len(df_clean), correlation_id)
+        )
+    with c2:
+        st.download_button(
+            "📊 CSV", data=df_clean[cols_present].to_csv(index=False).encode("utf-8"),
+            file_name=f"Bluestar_GPS_{ts}.csv",
+            mime="text/csv", use_container_width=True,
+            on_click=lambda: log_export_event("CSV", len(df_clean), correlation_id)
+        )
+    with c3:
+        st.download_button(
+            "🗂️ JSON",
+            data=df_clean[cols_present].to_json(
+                orient="records", force_ascii=False, indent=2
+            ).encode("utf-8"),
+            file_name=f"Bluestar_GPS_{ts}.json",
+            mime="application/json", use_container_width=True,
+            on_click=lambda: log_export_event("JSON", len(df_clean), correlation_id)
+        )
 
 
 def main() -> None:
@@ -2517,7 +2342,7 @@ def main() -> None:
     st.markdown(
         f"<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V{APP_VERSION}</h1>"
         f"<p style='margin:0;font-size:0.85em;opacity:0.8'>"
-        f"Production-Grade Hardened · Env: {_OANDA_ENV.upper()} · C1–C12"
+        f"Production-Grade Hardened · Env: {_OANDA_ENV.upper()}"
         "</p></div>",
         unsafe_allow_html=True,
     )
@@ -2527,7 +2352,7 @@ def main() -> None:
         st.error(
             "❌ Secrets OANDA manquants ou invalides — "
             "configurez OANDA_ACCOUNT_ID (format XXX-XXX-XXXXXX-XXX) "
-            "et OANDA_ACCESS_TOKEN (≥32 chars) dans .streamlit/secrets.toml"
+            "et OANDA_ACCESS_TOKEN dans .streamlit/secrets.toml"
         )
         st.stop()
 
@@ -2537,7 +2362,7 @@ def main() -> None:
 
     _check_running_flag_ttl()
 
-    only_best = _sidebar_config()
+    only_best, session_mode = _sidebar_config()
 
     is_running = st.session_state.get("_analysis_running", False)
     if st.button(
@@ -2552,7 +2377,7 @@ def main() -> None:
         st.session_state["_analysis_run_id"] = run_id
         try:
             with st.spinner("Analyse Multi-Timeframe en cours..."):
-                df, meta = analyze_all(acc, tok)
+                df, meta = analyze_all(acc, tok, session_mode)
                 if not df.empty:
                     st.session_state["df"] = df
                     st.session_state["df_ts"] = datetime.now(timezone.utc)
@@ -2593,58 +2418,23 @@ def main() -> None:
     ascending = [True, False, False][:len(sort_cols)]
     df = df.sort_values(sort_cols, ascending=ascending)
 
+    # Nettoyage des colonnes internes avant rendu de présentation
     df_clean = df.drop(
         columns=["_mtf_score", "_mtf_dir", "_degraded", "_stale_tfs", "_error_reason"],
         errors="ignore",
     ).copy()
 
+    meta_payload = st.session_state.get("df_meta", {})
+    correlation_id = meta_payload.get("correlation_id", "N/A")
+
     _render_metrics(df_clean)
-
-    display = ["Paire", "M", "W", "D", "4H", "1H", "15m", "MTF", "Quality", "Tradable",
-               "NC", "Age D1", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m"]
-    cols_present = [col for col in display if col in df_clean.columns]
-
-    styled = (
-        df_clean[cols_present].style
-        .apply(_style_quality, axis=0)
-        .apply(_style_nc, axis=0)
-        .map(_style_trend)
-    )
-    st.dataframe(
-        styled,
-        height=min(800, max(400, (len(df_clean) + 1) * 38 + 10)),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
-    c1, c2, c3 = st.columns(3)
+    _render_results_table(df_clean)
 
     pdf_buf = st.session_state.get("pdf_buf")
     if pdf_buf is None:
         pdf_buf = create_pdf(df_clean)
 
-    with c1:
-        st.download_button(
-            "📄 PDF", data=pdf_buf,
-            file_name=f"Bluestar_GPS_{ts}.pdf",
-            mime="application/pdf", use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "📊 CSV", data=df_clean[cols_present].to_csv(index=False).encode("utf-8"),
-            file_name=f"Bluestar_GPS_{ts}.csv",
-            mime="text/csv", use_container_width=True,
-        )
-    with c3:
-        st.download_button(
-            "🗂️ JSON",
-            data=df_clean[cols_present].to_json(
-                orient="records", force_ascii=False, indent=2
-            ).encode("utf-8"),
-            file_name=f"Bluestar_GPS_{ts}.json",
-            mime="application/json", use_container_width=True,
-        )
+    _render_download_buttons(df_clean, pdf_buf, correlation_id)
 
 
 if __name__ == "__main__":
