@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V7.3.0 PRODUCTION-GRADE DECISION SYSTEM          ║
+║  BLUESTAR HEDGE FUND GPS — V7.3.1 PRODUCTION-GRADE DECISION SYSTEM          ║
 ║                                                                              ║
 ║  Architecture Hexagonale, Contrôle Temporel Rigide et Alignement de DST      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -186,7 +186,7 @@ if CFG.max_workers < 1:
     raise ValueError("max_workers >= 1 is required")
 
 
-APP_VERSION: Final[str] = "7.3.0-PROD-DECISION-GRADE"
+APP_VERSION: Final[str] = "7.3.1-PROD-DECISION-GRADE"
 
 _OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
 OANDA_API_URL: Final[str] = (
@@ -251,7 +251,76 @@ class FetchResult:
 
 
 # ==============================================================================
-# 🏛️ COUCHE 2 — LOGGING & TELEMETRY
+# 🏛️ COUCHE 2 — SECURE STREAMLIT ENVIRONMENT DECORATORS
+# ==============================================================================
+
+def _is_streamlit_runtime() -> bool:
+    """Détecte de manière robuste l'environnement d'exécution Streamlit actif."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx(suppress_warning=True) is not None
+    except ImportError:
+        return False
+
+
+_STREAMLIT_AVAILABLE = False
+st: Any = None
+try:
+    import streamlit as _st_module
+    st = _st_module
+    _STREAMLIT_AVAILABLE = True
+except ImportError:
+    _STREAMLIT_AVAILABLE = False
+
+
+def safe_cache_data(ttl: Optional[int] = None, **kwargs: Any) -> Callable[[Any], Any]:
+    """Décorateur défensif de cache_data immunisé contre les NameError à l'importation."""
+    def decorator(func: Any) -> Any:
+        is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+        is_st_runtime = globals().get("_is_streamlit_runtime", lambda: False)
+        
+        if is_st_avail and is_st_runtime():
+            try:
+                st_mod = globals().get("st")
+                if st_mod is not None:
+                    cached_func = st_mod.cache_data(ttl=ttl, **kwargs)(func)
+                    return cached_func
+            except Exception as e:
+                _log_incident(IncidentCode.UI_CALLBACK_ERROR, "Streamlit cache_data decoration failed", err=type(e).__name__)
+        
+        if not hasattr(func, "clear"):
+            def dummy_clear() -> None:
+                pass
+            func.clear = dummy_clear
+        return func
+    return decorator
+
+
+def safe_cache_resource(**kwargs: Any) -> Callable[[Any], Any]:
+    """Décorateur défensif de cache_resource immunisé contre les NameError à l'importation."""
+    def decorator(func: Any) -> Any:
+        is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+        is_st_runtime = globals().get("_is_streamlit_runtime", lambda: False)
+        
+        if is_st_avail and is_st_runtime():
+            try:
+                st_mod = globals().get("st")
+                if st_mod is not None:
+                    cached_func = st_mod.cache_resource(**kwargs)(func)
+                    return cached_func
+            except Exception as e:
+                _log_incident(IncidentCode.UI_CALLBACK_ERROR, "Streamlit cache_resource decoration failed", err=type(e).__name__)
+        
+        if not hasattr(func, "clear"):
+            def dummy_clear() -> None:
+                pass
+            func.clear = dummy_clear
+        return func
+    return decorator
+
+
+# ==============================================================================
+# 🏛️ COUCHE 3 — LOGGING & TELEMETRY
 # ==============================================================================
 
 class _SecretScrubFilter(logging.Filter):
@@ -361,16 +430,8 @@ def log_operational_event(
 
 
 # ==============================================================================
-# 🏛️ COUCHE 3 — INFRASTRUCTURE, GESTION DU CALENDRIER & RATE-LIMITING
+# 🏛️ COUCHE 4 — INFRASTRUCTURE, CALENDAR & RATE-LIMITING
 # ==============================================================================
-
-def _is_streamlit_runtime() -> bool:
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx(suppress_warning=True) is not None
-    except ImportError:
-        return False
-
 
 def is_us_dst(dt: datetime) -> bool:
     y = dt.year
@@ -713,73 +774,53 @@ class ApplicationContext:
         return cls._candle_cache
 
 
-# Enveloppes défensives Streamlit pour l'interfaçage transparent des singletons
 def _get_rate_limiter() -> GlobalRateLimiter:
-    if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
+    is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+    is_st_runtime = globals().get("_is_streamlit_runtime", lambda: False)
+    
+    if is_st_avail and is_st_runtime():
         try:
-            @st.cache_resource(show_spinner=False)
-            def _st_get_rate_limiter() -> GlobalRateLimiter:
-                return ApplicationContext.get_rate_limiter()
-            return _st_get_rate_limiter()
-        except Exception:
-            pass
+            st_mod = globals().get("st")
+            if st_mod is not None:
+                @st_mod.cache_resource(show_spinner=False)
+                def _st_get_rate_limiter() -> GlobalRateLimiter:
+                    return ApplicationContext.get_rate_limiter()
+                return _st_get_rate_limiter()
+        except Exception as e:
+            _log_incident(
+                IncidentCode.UI_CALLBACK_ERROR,
+                "Streamlit rate limiter caching failed, fallback to global singleton",
+                err=type(e).__name__
+            )
     return ApplicationContext.get_rate_limiter()
 
 
 def _get_candle_cache() -> CandleCache:
-    if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
+    is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+    is_st_runtime = globals().get("_is_streamlit_runtime", lambda: False)
+    
+    if is_st_avail and is_st_runtime():
         try:
-            @st.cache_resource(show_spinner=False)
-            def _st_get_candle_cache() -> CandleCache:
-                return ApplicationContext.get_candle_cache()
-            return _st_get_candle_cache()
-        except Exception:
-            pass
+            st_mod = globals().get("st")
+            if st_mod is not None:
+                @st_mod.cache_resource(show_spinner=False)
+                def _st_get_candle_cache() -> CandleCache:
+                    return ApplicationContext.get_candle_cache()
+                return _st_get_candle_cache()
+        except Exception as e:
+            _log_incident(
+                IncidentCode.UI_CALLBACK_ERROR,
+                "Streamlit candle cache caching failed, fallback to global singleton",
+                err=type(e).__name__
+            )
     return ApplicationContext.get_candle_cache()
 
 
-def safe_cache_data(ttl: Optional[int] = None, **kwargs: Any) -> Callable[[Any], Any]:
-    """Décorateur défensif évitant les crashs d'importation et d'attributs de cache Streamlit."""
-    def decorator(func: Any) -> Any:
-        if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-            try:
-                cached_func = st.cache_data(ttl=ttl, **kwargs)(func)
-                return cached_func
-            except Exception as e:
-                _log_incident(IncidentCode.UI_CALLBACK_ERROR, "st.cache_data failed, using fallback", err=type(e).__name__)
-        
-        if not hasattr(func, "clear"):
-            def dummy_clear() -> None:
-                pass
-            func.clear = dummy_clear
-        return func
-    return decorator
-
-
-def safe_cache_resource(**kwargs: Any) -> Callable[[Any], Any]:
-    """Décorateur défensif st.cache_resource avec fallback transparent."""
-    def decorator(func: Any) -> Any:
-        if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-            try:
-                cached_func = st.cache_resource(**kwargs)(func)
-                return cached_func
-            except Exception as e:
-                _log_incident(IncidentCode.UI_CALLBACK_ERROR, "st.cache_resource failed, using fallback", err=type(e).__name__)
-        
-        if not hasattr(func, "clear"):
-            def dummy_clear() -> None:
-                pass
-            func.clear = dummy_clear
-        return func
-    return decorator
-
-
 # ==============================================================================
-# 🏛️ COUCHE 4 — ADAPTATEURS DE DONNÉES & CONNECTEURS API OANDA
+# 🏛️ COUCHE 5 — ADAPTATEURS DE DONNÉES & CONNECTEURS API OANDA
 # ==============================================================================
 
 def check_oanda_connection(account_id: str, access_token: str) -> bool:
-    """Valide les identifiants d'API OANDA via un ping de sécurité léger."""
     url = f"{OANDA_API_URL}/v3/accounts/{account_id}/summary"
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
@@ -848,7 +889,6 @@ def _validate_dataframe_schema(df: pd.DataFrame, instrument: str, granularity: s
 def _validate_dataframe_gaps(
     df: pd.DataFrame, granularity: str, instrument: str
 ) -> bool:
-    """Détecte de manière précise les anomalies de gaps temporels lors des cotations."""
     if len(df) < 2:
         df.attrs["critical_gap"] = False
         return True
@@ -873,7 +913,7 @@ def _validate_dataframe_gaps(
         if is_market_closed:
             _log_incident(
                 IncidentCode.DATA_GAPS,
-                "tolerated market-close gap",
+                "tolerated closed-market gap",
                 instrument=instrument,
                 granularity=granularity,
                 max_gap_sec=int(max_gap.total_seconds()),
@@ -1162,7 +1202,6 @@ def fetch_all_data(
             cache["error_reason"] = "Stop requested"
             return cache
 
-        # En mode CLOSE_ONLY, les bougies incomplètes ne sont pas évaluées
         result = fetch_cached(
             instrument, gran, count, account_id, account_hash, access_token, registry
         )
@@ -1224,7 +1263,7 @@ def fetch_all_data(
 
 
 # ==============================================================================
-# 🏛️ COUCHE 5 — ANALYSE SCIENTIFIQUE : VOTE DIRECTIONNEL (DAILY D1)
+# 🏛️ COUCHE 6 — LOGIQUE MÉTIER : CONSENSUS DE DIRECTION D1
 # ==============================================================================
 
 @dataclass(frozen=True)
@@ -1370,7 +1409,6 @@ def _vote_prev_midpoint(
     c_j1 = float(c.iloc[-1])
     mid_j1 = (h_j1 + lo_j1) / 2.0
 
-    # Résolution Neutre d'égalité stricte (Résolution Problème 2)
     if c_j1 > mid_j1:
         direction = Direction.BULLISH
     elif c_j1 < mid_j1:
@@ -1399,7 +1437,7 @@ def _vote_ema50_slope(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
 
 
 # ==============================================================================
-# 🏛️ COUCHE 6 — GESTION DES SCORES & ALIGNEMENTS MULTI-TEMPORELS
+# 🏛️ COUCHE 7 — SCORE CALIBRATION & MULTI-TIME FRAME COHERENCE
 # ==============================================================================
 
 def _aggregate_votes(
@@ -1654,7 +1692,158 @@ def trend_age_daily(df: pd.DataFrame) -> str:
 
 
 # ==============================================================================
-# 🏛️ COUCHE 7 — PIPELINE ORCHESTRATION & GESTION DE LA CONCURRENCE
+# 🏛️ COUCHE 8 — SYSTÈME DE PONDÉRATION MULTI-TIME FRAME
+# ==============================================================================
+
+_MTF_WEIGHTS: Final[Mapping[str, float]] = {
+    "M": CFG.mtf_weight_m,
+    "W": CFG.mtf_weight_w,
+    "D": CFG.mtf_weight_d,
+    "4H": CFG.mtf_weight_h4,
+    "1H": CFG.mtf_weight_h1,
+    "15m": CFG.mtf_weight_15m,
+}
+
+
+def _bull_compat(t: str) -> bool:
+    return t in ("Bullish", "Retracement Bull")
+
+
+def _bear_compat(t: str) -> bool:
+    return t in ("Bearish", "Retracement Bear")
+
+
+def _mtf_weighted_score(
+    trends: Mapping[str, str], scores: Mapping[str, int]
+) -> Tuple[float, float, float]:
+    active_total = sum(_MTF_WEIGHTS[tf] for tf in trends if not trends[tf].startswith("Range"))
+    if active_total == 0:
+        return 0.0, 0.0, 1.0
+    w_bull = sum(
+        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) for tf in trends if trends[tf] == "Bullish"
+    ) + sum(
+        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) * 0.5
+        for tf in trends if trends[tf] == "Retracement Bull"
+    )
+    w_bear = sum(
+        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) for tf in trends if trends[tf] == "Bearish"
+    ) + sum(
+        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) * 0.5
+        for tf in trends if trends[tf] == "Retracement Bear"
+    )
+    return w_bull, w_bear, active_total
+
+
+def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
+    bonus = 0
+    m, w = trends.get("M", ""), trends.get("W", "")
+    d, h4 = trends.get("D", ""), trends.get("4H", "")
+    if direction == "Bullish":
+        if m == "Bullish" and w == "Bullish":
+            bonus += 15
+        elif _bull_compat(m) and _bull_compat(w):
+            bonus += 12
+        if d == "Bullish" and h4 == "Bullish":
+            bonus += 10
+        elif _bull_compat(d) and _bull_compat(h4):
+            bonus += 7
+    else:
+        if m == "Bearish" and w == "Bearish":
+            bonus += 15
+        elif _bear_compat(m) and _bear_compat(w):
+            bonus += 12
+        if d == "Bearish" and h4 == "Bearish":
+            bonus += 10
+        elif _bear_compat(d) and _bear_compat(h4):
+            bonus += 7
+    return bonus
+
+
+def _mtf_dispersion_penalty(trends: Mapping[str, str], direction: str) -> float:
+    if direction not in ("Bullish", "Bearish"):
+        return 0.0
+    conflict_weight = 0.0
+    total_weight = 0.0
+    for tf, trend in trends.items():
+        w = _MTF_WEIGHTS[tf]
+        total_weight += w
+        if direction == "Bullish" and _bear_compat(trend):
+            conflict_weight += w
+        elif direction == "Bearish" and _bull_compat(trend):
+            conflict_weight += w
+    if total_weight == 0:
+        return 0.0
+    ratio = conflict_weight / total_weight
+    return min(CFG.dispersion_penalty_max, ratio * CFG.dispersion_penalty_max * 2)
+
+
+def score_mtf(trends: Mapping[str, str], scores: Mapping[str, int]) -> Tuple[str, float]:
+    w_bull, w_bear, total = _mtf_weighted_score(trends, scores)
+    if w_bull > w_bear:
+        raw_score, direction = (w_bull / total) * 100, "Bullish"
+    elif w_bear > w_bull:
+        raw_score, direction = (w_bear / total) * 100, "Bearish"
+    else:
+        return "Range", 0.0
+    bonus = _mtf_alignment_bonus(trends, direction)
+    penalty = _mtf_dispersion_penalty(trends, direction)
+    return direction, max(0.0, min(100.0, raw_score + bonus - penalty))
+
+
+def _compute_nc_orthogonal(
+    trends: Mapping[str, str], scores: Mapping[str, int], mtf_dir: str
+) -> int:
+    if mtf_dir not in ("Bullish", "Bearish"):
+        return 0
+    score_f = 0.0
+    for tf, trend in trends.items():
+        strength = scores.get(tf, 0)
+        is_strong_pure_bull = trend == "Bullish" and strength >= CFG.nc_pure_strength_min
+        is_strong_pure_bear = trend == "Bearish" and strength >= CFG.nc_pure_strength_min
+        if mtf_dir == "Bullish":
+            if is_strong_pure_bull:
+                score_f += 1.0
+            elif trend == "Retracement Bull":
+                score_f += 0.25
+            elif is_strong_pure_bear:
+                score_f -= 1.0
+            elif trend == "Retracement Bear":
+                score_f -= 0.25
+        else:
+            if is_strong_pure_bear:
+                score_f += 1.0
+            elif trend == "Retracement Bear":
+                score_f += 0.25
+            elif is_strong_pure_bull:
+                score_f -= 1.0
+            elif trend == "Retracement Bull":
+                score_f -= 0.25
+    sign = 1 if score_f >= 0 else -1
+    return sign * math.floor(abs(score_f))
+
+
+def grade_hybrid(
+    scores_list: List[float], nc_list: List[int], degraded_list: List[bool]
+) -> List[str]:
+    grades: List[str] = []
+    for score, nc, degraded in zip(scores_list, nc_list, degraded_list):
+        nc_bonus = (int(nc) - 3) * 5
+        adj = min(100.0, float(score) + nc_bonus)
+        if degraded:
+            grades.append("B+" if adj >= 38 else "B")
+        elif adj >= 80:
+            grades.append("A+")
+        elif adj >= 55:
+            grades.append("A")
+        elif adj >= 38:
+            grades.append("B+")
+        else:
+            grades.append("B")
+    return grades
+
+
+# ==============================================================================
+# 🏛️ COUCHE 9 — PIPELINE ORCHESTRATOR & RESILIENT TASK MANAGER
 # ==============================================================================
 
 def analyze_pair(
@@ -1684,7 +1873,7 @@ def analyze_pair(
             "_error_reason": f"Network Error: {type(fetch_exc).__name__}",
         }
 
-    # Si le sweep est incomplet, renvoyer une ligne d'erreur formatée
+    # Si le sweep est incomplet, renvoyer une ligne d'erreur formatée (Pas de biais de sélection)
     if cache.get("is_incomplete"):
         reason = cache.get("error_reason", "Acquisition failure")
         return {
@@ -1976,7 +2165,7 @@ def analyze_all_core(
     return df, errors_sorted, meta
 
 
-# Wrapper Streamlit préservant la confidentialité des identifiants (Résolution Problème 19)
+# Décoration sécurisée contre les chargements asynchrones et NameError (Résolution Problème 19)
 @safe_cache_data(
     ttl=CFG.cache_ttl_d,
     show_spinner=False,
@@ -1987,15 +2176,8 @@ def _run_analysis_cached(creds: OandaCredentials, session_mode: SessionTimingMod
 
 
 # ==============================================================================
-# 🏛️ COUCHE 8 — COMPOSANTS DE PRÉSENTATION : INTERFACE UTILISATEUR & PDF
+# 🏛️ COUCHE 10 — COMPOSANTS DE PRÉSENTATION UTILISATEUR & PDF
 # ==============================================================================
-
-def log_export_event(format_name: str, row_count: int, correlation_id: str) -> None:
-    _log.info(
-        "EXPORT_EVENT correlation_id=%s format=%s rows=%d timestamp=%s",
-        correlation_id, format_name, row_count, datetime.now(timezone.utc).isoformat()
-    )
-
 
 def _safe_str(s: str) -> str:
     return s.encode("latin-1", errors="replace").decode("latin-1")
@@ -2131,7 +2313,8 @@ def _validate_secret_format(account_id: str, token: str) -> bool:
 
 
 def _load_secrets() -> Tuple[Optional[str], Optional[str]]:
-    if not _STREAMLIT_AVAILABLE:
+    is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+    if not is_st_avail:
         acc = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
         tok = os.environ.get("OANDA_ACCESS_TOKEN", "").strip()
         if _validate_secret_format(acc, tok):
@@ -2266,8 +2449,11 @@ def _sidebar_config() -> Tuple[bool, SessionTimingMode]:
         st.markdown("---")
         if st.button("🗑️ Vider le cache", use_container_width=True):
             _get_candle_cache().clear()
-            if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-                _run_analysis_cached.clear()
+            is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+            is_st_runtime = globals().get("_is_streamlit_runtime", lambda: False)
+            if is_st_avail and is_st_runtime():
+                if hasattr(_run_analysis_cached, "clear"):
+                    _run_analysis_cached.clear()
                 try:
                     st.cache_resource.clear()
                 except Exception as e:  # pylint: disable=broad-exception-caught
@@ -2334,6 +2520,44 @@ def _render_download_buttons(df_clean: pd.DataFrame, pdf_buf: BytesIO, correlati
             mime="application/json", use_container_width=True,
             on_click=lambda: log_export_event("JSON", len(df_clean), correlation_id)
         )
+
+
+def _configure_streamlit_ui() -> None:
+    is_st_avail = globals().get("_STREAMLIT_AVAILABLE", False)
+    is_st_runtime = globals().get("_is_streamlit_runtime", lambda: False)
+    if not (is_st_avail and is_st_runtime()):
+        return
+
+    st.set_page_config(
+        page_title=f"Bluestar GPS V{APP_VERSION}",
+        page_icon="🧭",
+        layout="wide",
+    )
+    st.markdown(
+        """
+        <style>
+            .main-header {
+                text-align: center; padding: 20px;
+                background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%);
+                color: white; border-radius: 12px; margin-bottom: 20px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            }
+            .stale-warning {
+                background: #fef3c7; border-left: 4px solid #f59e0b;
+                padding: 10px 16px; border-radius: 4px; margin-bottom: 12px;
+            }
+            .degraded-warning {
+                background: #fee2e2; border-left: 4px solid #dc2626;
+                padding: 10px 16px; border-radius: 4px; margin-bottom: 12px;
+            }
+            .not-tradable {
+                background: #1f2937; color: #fbbf24; padding: 4px 8px;
+                border-radius: 4px; font-weight: bold; font-size: 0.85em;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
