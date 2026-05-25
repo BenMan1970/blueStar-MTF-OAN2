@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V8.1.0 PRODUCTION-HARDENED                        ║
+║  BLUESTAR HEDGE FUND GPS — V9.0.0 PRODUCTION-GRADE                           ║
 ║                                                                              ║
-║  Audit-driven hardening pass #2: deterministic rate-limit accounting,        ║
-║  resilient cache wrappers, RFC3339-strict snapshots, indicator NaN           ║
-║  surface widening, atomic excepthook scrubbing via public API, executor     ║
-║  drain with deterministic stop-first semantics, holiday-aware FX calendar.  ║
+║  Production-grade hardening:                                                 ║
+║    • Removed pd.set_option global side-effect (per-DF copies)                ║
+║    • Removed @st.cache_data on analysis (was blocking manual reruns)         ║
+║    • Idempotent excepthook installation                                      ║
+║    • Streamlit-aware RunController via cache_resource                        ║
+║    • Atomic critical_gap attribute write before cache insertion              ║
+║    • Strict OHLC + finite validation (NaN/inf rejection at parse layer)      ║
+║    • Full-token hash for OandaCredentials (no prefix collisions)             ║
+║    • Robust executor drain with thread accounting                            ║
+║    • Inflight result hand-off populated even on leader exception             ║
+║    • Table-driven MTF alignment + PDF color classification                   ║
+║    • Heartbeat-based analysis_running lifecycle                              ║
+║    • Defensive JSON parsing tolerant to any OANDA shape variation            ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -54,34 +63,27 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Activate Copy-on-Write semantics globally — critical for cross-thread
-# DataFrame safety. Must be set before any DataFrame ops.
-try:
-    pd.set_option("mode.copy_on_write", True)
-except (KeyError, ValueError):
-    pass
-
 try:
     from scipy.signal import find_peaks
-    _HAS_SCIPY = True
+    _HAS_SCIPY: Final[bool] = True
 except ImportError:
-    _HAS_SCIPY = False
+    _HAS_SCIPY = False  # type: ignore[misc]
 
 try:
     from fpdf import FPDF
-    _FPDF_AVAILABLE = True
-    _FPDF2 = hasattr(FPDF, "set_lang")
+    _FPDF_AVAILABLE: Final[bool] = True
+    _FPDF2: Final[bool] = hasattr(FPDF, "set_lang")
 except ImportError:
-    FPDF = None
-    _FPDF_AVAILABLE = False
-    _FPDF2 = False
+    FPDF = None  # type: ignore[assignment,misc]
+    _FPDF_AVAILABLE = False  # type: ignore[misc]
+    _FPDF2 = False  # type: ignore[misc]
 
 try:
     import holidays as _holidays_lib
-    _HAS_HOLIDAYS = True
+    _HAS_HOLIDAYS: Final[bool] = True
 except ImportError:
-    _holidays_lib = None
-    _HAS_HOLIDAYS = False
+    _holidays_lib = None  # type: ignore[assignment]
+    _HAS_HOLIDAYS = False  # type: ignore[misc]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -96,6 +98,8 @@ def _is_streamlit_runtime() -> bool:
         )
         return get_script_run_ctx(suppress_warning=True) is not None
     except ImportError:
+        return False
+    except Exception:  # pylint: disable=broad-exception-caught
         return False
 
 
@@ -119,6 +123,8 @@ class SecretToken:
     __slots__ = ("_value", "_digest")
 
     def __init__(self, value: str) -> None:
+        if not isinstance(value, str):
+            raise TypeError("SecretToken requires str")
         object.__setattr__(self, "_value", value)
         object.__setattr__(
             self,
@@ -152,11 +158,13 @@ class SecretToken:
         return self.reveal() == other.reveal()
 
     def __hash__(self) -> int:
-        return hash(self.digest)
+        # Hash the full secret deterministically (not the prefix digest) to
+        # prevent theoretical collisions between distinct tokens.
+        return hash(("SecretToken", self.reveal()))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — LOGGING & TELEMETRY (token-aware scrubbing, public API)
+# SECTION 2 — LOGGING & TELEMETRY (token-aware scrubbing)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _SecretScrubFilter(logging.Filter):
@@ -183,7 +191,12 @@ class _SecretScrubFilter(logging.Filter):
 
     @classmethod
     def scrub_text(cls, text: str) -> str:
-        """Public scrubbing API — used by excepthook & external callers."""
+        """Public scrubbing API."""
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:  # pylint: disable=broad-exception-caught
+                return "[SCRUB_ERROR]"
         try:
             with cls._registry_lock:
                 for raw, replacement in cls._registered_tokens:
@@ -227,15 +240,21 @@ def _setup_logging() -> logging.Logger:
     root.setLevel(getattr(logging, log_level, logging.WARNING))
 
     logger = logging.getLogger("bluestar_gps")
-    logger.addFilter(_SecretScrubFilter())
+    if not any(isinstance(f, _SecretScrubFilter) for f in logger.filters):
+        logger.addFilter(_SecretScrubFilter())
     return logger
 
 
 _log: Final[logging.Logger] = _setup_logging()
 
 
+_EXCEPTHOOK_SENTINEL: Final[str] = "_bluestar_scrubbing_excepthook_installed"
+
+
 def _install_excepthook() -> None:
-    """Replace sys.excepthook with a scrubbing variant (uses public API)."""
+    """Replace sys.excepthook idempotently — prevents chaining on reload."""
+    if getattr(sys.excepthook, _EXCEPTHOOK_SENTINEL, False):
+        return
     original_hook = sys.excepthook
 
     def _scrubbing_excepthook(exc_type, exc_value, exc_tb) -> None:
@@ -243,8 +262,12 @@ def _install_excepthook() -> None:
             tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
             sys.stderr.write(_SecretScrubFilter.scrub_text(tb_text))
         except BaseException:  # pylint: disable=broad-exception-caught
-            original_hook(exc_type, exc_value, exc_tb)
+            try:
+                original_hook(exc_type, exc_value, exc_tb)
+            except BaseException:  # pylint: disable=broad-exception-caught
+                pass
 
+    setattr(_scrubbing_excepthook, _EXCEPTHOOK_SENTINEL, True)
     sys.excepthook = _scrubbing_excepthook
 
 
@@ -284,17 +307,20 @@ def _log_incident(
     **context: Any,
 ) -> None:
     """Structured incident logging."""
-    parts = [f"code={code.value}", f"msg={msg}"]
-    for k, v in context.items():
-        parts.append(f"{k}={v}")
-    _log.log(level, "INCIDENT %s", " ".join(parts), exc_info=exc_info)
+    try:
+        parts = [f"code={code.value}", f"msg={msg}"]
+        for k, v in context.items():
+            parts.append(f"{k}={v}")
+        _log.log(level, "INCIDENT %s", " ".join(parts), exc_info=exc_info)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass  # Logging must never crash the pipeline
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION: Final[str] = "8.1.0-PROD-HARDENED"
+APP_VERSION: Final[str] = "9.0.0-PROD-GRADE"
 
 _OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
 OANDA_API_URL: Final[str] = (
@@ -352,7 +378,7 @@ class CacheConfig:
     ttl_negative_pricing_sec: int = 10
     stale_max_age_multiplier: float = 4.0
     max_entries: int = 500
-    inflight_result_ttl_sec: float = 300.0  # cleanup orphaned handoffs
+    inflight_result_ttl_sec: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -445,6 +471,8 @@ class TrendConfig:
             raise ValueError("max_workers >= 1 required")
         if self.mtf.min_active_tfs < 1:
             raise ValueError("min_active_tfs >= 1 required")
+        if self.http.timeout_sec <= 0:
+            raise ValueError("timeout_sec > 0 required")
 
 
 CFG: Final[TrendConfig] = TrendConfig()
@@ -457,15 +485,6 @@ _CACHE_TTL: Final[Mapping[str, int]] = {
     "H4": CFG.cache.ttl_h4,
     "H1": CFG.cache.ttl_h1,
     "M15": CFG.cache.ttl_m15,
-}
-
-_GRAN_FREQ: Final[Mapping[str, pd.Timedelta]] = {
-    "M": pd.Timedelta(days=30),
-    "W": pd.Timedelta(days=7),
-    "D": pd.Timedelta(days=1),
-    "H4": pd.Timedelta(hours=4),
-    "H1": pd.Timedelta(hours=1),
-    "M15": pd.Timedelta(minutes=15),
 }
 
 _LIVE_OPEN_MAX_AGE: Final[Mapping[str, pd.Timedelta]] = {
@@ -502,11 +521,14 @@ TREND_COLORS: Final[Mapping[str, str]] = {
 def _configure_streamlit_ui() -> None:
     if not (_STREAMLIT_AVAILABLE and _is_streamlit_runtime()):
         return
-    st.set_page_config(
-        page_title=f"Bluestar GPS V{APP_VERSION}",
-        page_icon="🧭",
-        layout="wide",
-    )
+    try:
+        st.set_page_config(
+            page_title=f"Bluestar GPS V{APP_VERSION}",
+            page_icon="🧭",
+            layout="wide",
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass  # already configured
     st.markdown(
         """
         <style>
@@ -588,17 +610,17 @@ class IndicatorBundle:
     ema_intra_long: float
     zlema: float
     has_nan: bool
-    has_momentum_nan: bool = False  # RSI/MACD specific
+    has_momentum_nan: bool = False
 
 
 @dataclass(frozen=True)
 class OandaCredentials:
-    """Account credentials with hashed token for safe cache keying."""
+    """Account credentials with safe hashing."""
     account_id: str
     token: SecretToken
 
     def __hash__(self) -> int:
-        return hash((self.account_id, self.token.digest))
+        return hash((self.account_id, self.token))  # SecretToken hash is full-token
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, OandaCredentials):
@@ -610,7 +632,6 @@ class OandaCredentials:
 # SECTION 6 — MARKET CALENDAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Major US holidays where FX liquidity collapses fully (best-effort list)
 _FX_FULL_CLOSURE_HOLIDAYS_US: Final[FrozenSet[str]] = frozenset({
     "New Year's Day",
     "Christmas Day",
@@ -634,7 +655,7 @@ def _get_us_holiday_set(year: int) -> FrozenSet[Any]:
 
 @functools.lru_cache(maxsize=8)
 def _get_us_holiday_map(year: int) -> Mapping[Any, str]:
-    """Date → holiday name map, used to detect FX-closure holidays."""
+    """Date → holiday name map."""
     if not _HAS_HOLIDAYS or _holidays_lib is None:
         return {}
     try:
@@ -651,26 +672,27 @@ def is_us_market_holiday(dt: datetime) -> bool:
     return ny_dt.date() in _get_us_holiday_set(ny_dt.year)
 
 
+def _is_weekend_closed(wd: int, hr: int) -> bool:
+    if wd == 5:                # Saturday
+        return True
+    if wd == 4 and hr >= 17:   # Friday after 17:00 NY
+        return True
+    if wd == 6 and hr < 17:    # Sunday before 17:00 NY
+        return True
+    return False
+
+
 def is_fx_market_open(now: Optional[datetime] = None) -> bool:
-    """
-    FX market: open Sunday 17:00 NY local → Friday 17:00 NY local.
-    Major US holidays (New Year, Christmas) treated as closed.
-    """
+    """FX market: Sunday 17:00 NY → Friday 17:00 NY. US major holidays closed."""
     if now is None:
         now = datetime.now(UTC)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
 
     ny = now.astimezone(NY_TZ)
-    wd, hr = ny.weekday(), ny.hour
-    if wd == 5:                # Saturday closed
-        return False
-    if wd == 4 and hr >= 17:   # Friday after 17:00 closed
-        return False
-    if wd == 6 and hr < 17:    # Sunday before 17:00 closed
+    if _is_weekend_closed(ny.weekday(), ny.hour):
         return False
 
-    # Holiday filter — only full-closure events
     if _HAS_HOLIDAYS:
         hmap = _get_us_holiday_map(ny.year)
         name = hmap.get(ny.date())
@@ -693,6 +715,11 @@ def _safe_float(value: Any) -> Optional[float]:
         return f
     except (TypeError, ValueError):
         return None
+
+
+def _is_finite_positive(value: Any) -> bool:
+    f = _safe_float(value)
+    return f is not None and f > 0
 
 
 def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
@@ -750,10 +777,45 @@ def _fmt_atr(val: Optional[float]) -> str:
     return f"{val:.4f}"
 
 
-def _find_strict_peaks(
-    series: pd.Series, wing: int, min_idx: int, prominence: Optional[float] = None
+def _find_extrema_scipy(
+    arr: np.ndarray, wing: int, min_idx: int, prominence: Optional[float], invert: bool,
 ) -> List[int]:
-    """Locate strict local maxima with optional prominence."""
+    target = -arr if invert else arr
+    kwargs: Dict[str, Any] = {"distance": max(1, wing)}
+    if prominence is not None and prominence > 0:
+        kwargs["prominence"] = prominence
+    peaks, _ = find_peaks(target, **kwargs)
+    n = len(arr)
+    return [int(p) for p in peaks if min_idx <= p <= n - wing - 1]
+
+
+def _find_extrema_fallback(
+    arr: np.ndarray, wing: int, min_idx: int, prominence: Optional[float], invert: bool,
+) -> List[int]:
+    n = len(arr)
+    result: List[int] = []
+    for i in range(max(min_idx, wing), n - wing):
+        window = arr[i - wing: i + wing + 1]
+        center = arr[i]
+        if invert:
+            if center != window.min() or np.sum(window == center) != 1:
+                continue
+            if prominence is not None and prominence > 0:
+                if (window.max() - center) < prominence:
+                    continue
+        else:
+            if center != window.max() or np.sum(window == center) != 1:
+                continue
+            if prominence is not None and prominence > 0:
+                if (center - window.min()) < prominence:
+                    continue
+        result.append(i)
+    return result
+
+
+def _find_strict_peaks(
+    series: pd.Series, wing: int, min_idx: int, prominence: Optional[float] = None,
+) -> List[int]:
     arr = series.to_numpy()
     n = len(arr)
     if n < 2 * wing + 1:
@@ -761,25 +823,12 @@ def _find_strict_peaks(
     if np.isnan(arr).any():
         arr = np.nan_to_num(arr, nan=-np.inf)
     if _HAS_SCIPY:
-        kwargs: Dict[str, Any] = {"distance": max(1, wing)}
-        if prominence is not None and prominence > 0:
-            kwargs["prominence"] = prominence
-        peaks, _ = find_peaks(arr, **kwargs)
-        return [int(p) for p in peaks if min_idx <= p <= n - wing - 1]
-    result: List[int] = []
-    for i in range(max(min_idx, wing), n - wing):
-        window = arr[i - wing: i + wing + 1]
-        center = arr[i]
-        if center == window.max() and np.sum(window == center) == 1:
-            if prominence is not None and prominence > 0:
-                if (center - window.min()) < prominence:
-                    continue
-            result.append(i)
-    return result
+        return _find_extrema_scipy(arr, wing, min_idx, prominence, invert=False)
+    return _find_extrema_fallback(arr, wing, min_idx, prominence, invert=False)
 
 
 def _find_strict_troughs(
-    series: pd.Series, wing: int, min_idx: int, prominence: Optional[float] = None
+    series: pd.Series, wing: int, min_idx: int, prominence: Optional[float] = None,
 ) -> List[int]:
     arr = series.to_numpy()
     n = len(arr)
@@ -788,27 +837,13 @@ def _find_strict_troughs(
     if np.isnan(arr).any():
         arr = np.nan_to_num(arr, nan=np.inf)
     if _HAS_SCIPY:
-        kwargs: Dict[str, Any] = {"distance": max(1, wing)}
-        if prominence is not None and prominence > 0:
-            kwargs["prominence"] = prominence
-        peaks, _ = find_peaks(-arr, **kwargs)
-        return [int(p) for p in peaks if min_idx <= p <= n - wing - 1]
-    result: List[int] = []
-    for i in range(max(min_idx, wing), n - wing):
-        window = arr[i - wing: i + wing + 1]
-        center = arr[i]
-        if center == window.min() and np.sum(window == center) == 1:
-            if prominence is not None and prominence > 0:
-                if (window.max() - center) < prominence:
-                    continue
-            result.append(i)
-    return result
+        return _find_extrema_scipy(arr, wing, min_idx, prominence, invert=True)
+    return _find_extrema_fallback(arr, wing, min_idx, prominence, invert=True)
 
 
 def _compute_trend_indicators(
-    c: pd.Series, h: pd.Series, lo: pd.Series
+    c: pd.Series, h: pd.Series, lo: pd.Series,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], pd.Series]:
-    """Returns (atr, ema_short, ema_long_cur, ema_long_series)."""
     atr_v = _safe_float(_atr(h, lo, c, CFG.ind.atr_period).iloc[-1])
     e_short = _safe_float(_ema(c, CFG.ind.ema_short).iloc[-1])
     e_long_series = _ema(c, CFG.ind.ema_long)
@@ -819,21 +854,21 @@ def _compute_trend_indicators(
 def _compute_momentum_indicators(
     c: pd.Series,
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Returns (rsi, macd, macd_signal)."""
     rsi_v = _safe_float(_rsi(c, CFG.ind.rsi_period).iloc[-1])
     ema_fast = _ema(c, CFG.ind.macd_fast)
     ema_slow = _ema(c, CFG.ind.macd_slow)
     macd_line = ema_fast - ema_slow
     signal_line = _ema(macd_line, CFG.ind.macd_signal)
-    macd_v = _safe_float(macd_line.iloc[-1])
-    signal_v = _safe_float(signal_line.iloc[-1])
-    return rsi_v, macd_v, signal_v
+    return (
+        rsi_v,
+        _safe_float(macd_line.iloc[-1]),
+        _safe_float(signal_line.iloc[-1]),
+    )
 
 
 def _compute_intraday_indicators(
     c: pd.Series,
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Returns (ema_intra_fast, ema_intra_long, zlema)."""
     period = CFG.ind.ema_intra_period
     lag = (period - 1) // 2
     ema_fast = _safe_float(_ema(c, CFG.ind.intraday_ema_fast).iloc[-1])
@@ -843,37 +878,47 @@ def _compute_intraday_indicators(
     return ema_fast, ema_long, zlema
 
 
-def compute_indicator_bundle(df: pd.DataFrame, intraday: bool) -> Optional[IndicatorBundle]:
+def _build_bundle(
+    atr_v: Optional[float], e_short: Optional[float], e_long_cur: Optional[float],
+    e_long_series: pd.Series, rsi_v: Optional[float], macd_v: Optional[float],
+    signal_v: Optional[float], intra_fast: Optional[float],
+    intra_long: Optional[float], zlema_v: Optional[float],
+) -> IndicatorBundle:
+    has_nan = any(v is None for v in (atr_v, e_short, e_long_cur))
+    has_momentum_nan = any(v is None for v in (rsi_v, macd_v, signal_v))
+    return IndicatorBundle(
+        atr_val=atr_v if atr_v is not None else 0.0,
+        ema_short=e_short if e_short is not None else 0.0,
+        ema_long_cur=e_long_cur if e_long_cur is not None else 0.0,
+        ema_long_series=e_long_series,
+        rsi=rsi_v if rsi_v is not None else 50.0,
+        macd=macd_v if macd_v is not None else 0.0,
+        macd_signal=signal_v if signal_v is not None else 0.0,
+        ema_intra_fast=intra_fast if intra_fast is not None else 0.0,
+        ema_intra_long=intra_long if intra_long is not None else 0.0,
+        zlema=zlema_v if zlema_v is not None else 0.0,
+        has_nan=has_nan,
+        has_momentum_nan=has_momentum_nan,
+    )
+
+
+def compute_indicator_bundle(
+    df: pd.DataFrame, intraday: bool,
+) -> Optional[IndicatorBundle]:
     """Pre-compute all indicators for a single (instrument, tf)."""
     if df.empty or len(df) < 30:
         return None
-    h, lo, c = df["High"], df["Low"], df["Close"]
     try:
+        h, lo, c = df["High"], df["Low"], df["Close"]
         atr_v, e_short, e_long_cur, e_long_series = _compute_trend_indicators(c, h, lo)
         rsi_v, macd_v, signal_v = _compute_momentum_indicators(c)
-
-        ema_intra_fast_v: Optional[float] = None
-        ema_intra_long_v: Optional[float] = None
-        zlema_v: Optional[float] = None
+        intra_fast = intra_long = zlema_v = None
         if intraday:
-            ema_intra_fast_v, ema_intra_long_v, zlema_v = _compute_intraday_indicators(c)
-
-        has_nan = any(v is None for v in (atr_v, e_short, e_long_cur))
-        has_momentum_nan = any(v is None for v in (rsi_v, macd_v, signal_v))
-
-        return IndicatorBundle(
-            atr_val=atr_v if atr_v is not None else 0.0,
-            ema_short=e_short if e_short is not None else 0.0,
-            ema_long_cur=e_long_cur if e_long_cur is not None else 0.0,
-            ema_long_series=e_long_series,
-            rsi=rsi_v if rsi_v is not None else 50.0,
-            macd=macd_v if macd_v is not None else 0.0,
-            macd_signal=signal_v if signal_v is not None else 0.0,
-            ema_intra_fast=ema_intra_fast_v if ema_intra_fast_v is not None else 0.0,
-            ema_intra_long=ema_intra_long_v if ema_intra_long_v is not None else 0.0,
-            zlema=zlema_v if zlema_v is not None else 0.0,
-            has_nan=has_nan,
-            has_momentum_nan=has_momentum_nan,
+            intra_fast, intra_long, zlema_v = _compute_intraday_indicators(c)
+        return _build_bundle(
+            atr_v, e_short, e_long_cur, e_long_series,
+            rsi_v, macd_v, signal_v,
+            intra_fast, intra_long, zlema_v,
         )
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         _log_incident(
@@ -894,7 +939,7 @@ class _TokenBucket:
 
     def __init__(self, capacity: int, refill_rate: float) -> None:
         self._capacity = float(capacity)
-        self._refill_rate = refill_rate
+        self._refill_rate = float(refill_rate)
         self._tokens = float(capacity)
         self._last = time.monotonic()
         self._lock = threading.Lock()
@@ -914,14 +959,13 @@ class _TokenBucket:
             return False
 
     def refund(self) -> None:
-        """Return a previously-acquired token (used by atomic dual-acquire)."""
         with self._lock:
             self._tokens = min(self._capacity, self._tokens + 1.0)
 
     def trigger_cooldown(self, seconds: float) -> None:
         with self._lock:
             self._cooldown_until = max(
-                self._cooldown_until, time.monotonic() + seconds
+                self._cooldown_until, time.monotonic() + max(0.0, seconds),
             )
             self._tokens = 0.0
 
@@ -959,7 +1003,7 @@ class _GlobalRateLimiter:
         if not global_bucket.try_acquire():
             return False
         if not inst_bucket.try_acquire():
-            global_bucket.refund()  # atomic accounting — prevents global starvation
+            global_bucket.refund()
             return False
         return True
 
@@ -971,7 +1015,6 @@ class _GlobalRateLimiter:
         global_bucket.trigger_cooldown(min(seconds, 10.0))
 
 
-# Module-level singletons — Streamlit-aware with sentinel pattern
 _RATE_LIMITER_INSTANCE: Optional[_GlobalRateLimiter] = None
 _RATE_LIMITER_LOCK = threading.Lock()
 
@@ -980,11 +1023,12 @@ def _st_rate_limiter_factory() -> _GlobalRateLimiter:
     return _GlobalRateLimiter()
 
 
-# Resolve Streamlit-cached factory once at import time (avoid binding ambiguity)
 if _STREAMLIT_AVAILABLE:
-    _st_rate_limiter = st.cache_resource(show_spinner=False)(_st_rate_limiter_factory)
+    _st_rate_limiter: Optional[Callable[[], _GlobalRateLimiter]] = st.cache_resource(
+        show_spinner=False,
+    )(_st_rate_limiter_factory)
 else:
-    _st_rate_limiter = None  # type: ignore[assignment]
+    _st_rate_limiter = None
 
 
 def _get_rate_limiter() -> _GlobalRateLimiter:
@@ -1010,7 +1054,7 @@ def _get_rate_limiter() -> _GlobalRateLimiter:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SessionRegistry:
-    """Thread-scoped HTTP session registry — module-level singleton."""
+    """Thread-scoped HTTP session registry."""
 
     def __init__(self) -> None:
         self._thread_sessions: Dict[int, requests.Session] = {}
@@ -1066,11 +1110,11 @@ def _st_session_registry_factory() -> SessionRegistry:
 
 
 if _STREAMLIT_AVAILABLE:
-    _st_session_registry = st.cache_resource(show_spinner=False)(
-        _st_session_registry_factory
-    )
+    _st_session_registry: Optional[Callable[[], SessionRegistry]] = st.cache_resource(
+        show_spinner=False,
+    )(_st_session_registry_factory)
 else:
-    _st_session_registry = None  # type: ignore[assignment]
+    _st_session_registry = None
 
 
 def _get_session_registry() -> SessionRegistry:
@@ -1109,9 +1153,12 @@ def _hash_account(account_id: str) -> AccountHash:
 
 
 def _defensive_copy(df: pd.DataFrame) -> pd.DataFrame:
-    """Deep copy including attrs."""
+    """Deep copy including attrs — used at every cache boundary."""
     out = df.copy(deep=True)
-    out.attrs = dict(df.attrs)
+    try:
+        out.attrs = dict(df.attrs)
+    except (AttributeError, TypeError):
+        out.attrs = {}
     return out
 
 
@@ -1124,7 +1171,6 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
         self._live_opens: Dict[LiveOpenKey, Tuple[datetime, Optional[float]]] = {}
         self._pricing: Dict[PricingKey, Tuple[datetime, Optional[float]]] = {}
         self._inflight: Dict[CacheKey, threading.Event] = {}
-        # Now stores (timestamp, FetchResult) for TTL cleanup
         self._inflight_results: Dict[CacheKey, Tuple[datetime, FetchResult]] = {}
         self._lock = threading.RLock()
         self._max_entries = max_entries
@@ -1139,7 +1185,6 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
             self._data.move_to_end(key)
 
     def _cleanup_orphan_handoffs(self) -> None:
-        """Remove inflight_results entries older than TTL — prevents memory leak."""
         if not self._inflight_results:
             return
         now = datetime.now(UTC)
@@ -1155,6 +1200,24 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                 key=str(k[2:]), level=logging.DEBUG,
             )
 
+    def _build_fresh_result(
+        self, entry: Tuple[datetime, pd.DataFrame],
+    ) -> FetchResult:
+        df = _defensive_copy(entry[1])
+        return FetchResult(
+            df=df, is_stale=False, fetched_at=entry[0],
+            critical_gap=bool(df.attrs.get("critical_gap", False)),
+        )
+
+    def _build_stale_result(
+        self, entry: Tuple[datetime, pd.DataFrame],
+    ) -> FetchResult:
+        df = _defensive_copy(entry[1])
+        return FetchResult(
+            df=df, is_stale=True, fetched_at=entry[0],
+            critical_gap=bool(df.attrs.get("critical_gap", False)),
+        )
+
     def get_candles(
         self,
         key: CacheKey,
@@ -1168,11 +1231,7 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
             entry = self._data.get(key)
             if entry is not None and (now - entry[0]).total_seconds() < ttl:
                 self._touch(key)
-                df = _defensive_copy(entry[1])
-                return FetchResult(
-                    df=df, is_stale=False, fetched_at=entry[0],
-                    critical_gap=bool(df.attrs.get("critical_gap", False)),
-                )
+                return self._build_fresh_result(entry)
 
             inflight_event = self._inflight.get(key)
             if inflight_event is not None:
@@ -1205,20 +1264,17 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
             handoff_entry = self._inflight_results.pop(key, None)
             if handoff_entry is not None:
                 _, handoff = handoff_entry
-                return FetchResult(
-                    df=_defensive_copy(handoff.df) if not handoff.df.empty else handoff.df,
-                    is_stale=handoff.is_stale,
-                    fetched_at=handoff.fetched_at,
-                    critical_gap=handoff.critical_gap,
-                )
+                if not handoff.df.empty:
+                    return FetchResult(
+                        df=_defensive_copy(handoff.df),
+                        is_stale=handoff.is_stale,
+                        fetched_at=handoff.fetched_at,
+                        critical_gap=handoff.critical_gap,
+                    )
             entry = self._data.get(key)
             if entry is not None:
                 self._touch(key)
-                df = _defensive_copy(entry[1])
-                return FetchResult(
-                    df=df, is_stale=False, fetched_at=entry[0],
-                    critical_gap=bool(df.attrs.get("critical_gap", False)),
-                )
+                return self._build_fresh_result(entry)
             stale = self._stale.get(key)
             if stale is not None:
                 age = (datetime.now(UTC) - stale[0]).total_seconds()
@@ -1227,11 +1283,7 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                         IncidentCode.CACHE_STALE_HIT, "follower stale fallback",
                         key=str(key[2:]), age_sec=int(age),
                     )
-                    df = _defensive_copy(stale[1])
-                    return FetchResult(
-                        df=df, is_stale=True, fetched_at=stale[0],
-                        critical_gap=bool(df.attrs.get("critical_gap", False)),
-                    )
+                    return self._build_stale_result(stale)
         return FetchResult(df=pd.DataFrame(), is_stale=False)
 
     def _do_fetch_as_leader(
@@ -1242,8 +1294,18 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
         fetch_fn: Callable[[], FetchResult],
         event: threading.Event,
     ) -> FetchResult:
+        result: FetchResult = FetchResult(df=pd.DataFrame(), is_stale=False)
         try:
-            result = fetch_fn()
+            try:
+                result = fetch_fn()
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _log_incident(
+                    IncidentCode.CACHE_LEADER_FAILED, "leader fetch exception",
+                    key=str(key[2:]), err=type(exc).__name__, level=logging.ERROR,
+                    exc_info=True,
+                )
+                result = FetchResult(df=pd.DataFrame(), is_stale=False)
+
             if not result.df.empty:
                 ts = result.fetched_at or datetime.now(UTC)
                 with self._lock:
@@ -1263,6 +1325,7 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                     critical_gap=result.critical_gap,
                 )
 
+            # Empty result — try stale fallback
             with self._lock:
                 stale = self._stale.get(key)
                 if stale is not None:
@@ -1272,11 +1335,7 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                             IncidentCode.CACHE_STALE_HIT, "leader stale fallback",
                             key=str(key[2:]), age_sec=int(age),
                         )
-                        df = _defensive_copy(stale[1])
-                        result = FetchResult(
-                            df=df, is_stale=True, fetched_at=stale[0],
-                            critical_gap=bool(df.attrs.get("critical_gap", False)),
-                        )
+                        stale_result = self._build_stale_result(stale)
                         self._inflight_results[key] = (
                             datetime.now(UTC),
                             FetchResult(
@@ -1284,7 +1343,12 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                                 critical_gap=bool(stale[1].attrs.get("critical_gap", False)),
                             ),
                         )
-                        return result
+                        return stale_result
+                # No stale either — publish empty handoff so followers know
+                self._inflight_results[key] = (
+                    datetime.now(UTC),
+                    FetchResult(df=pd.DataFrame(), is_stale=False),
+                )
             return FetchResult(df=pd.DataFrame(), is_stale=False)
         finally:
             with self._lock:
@@ -1309,7 +1373,14 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                 )
                 if age < ttl:
                     return value
-        value = fetch_fn()
+        try:
+            value = fetch_fn()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log_incident(
+                IncidentCode.PRICING_UNAVAILABLE, "live_open fetch exception",
+                err=type(exc).__name__, level=logging.WARNING,
+            )
+            value = None
         with self._lock:
             self._live_opens[key] = (datetime.now(UTC), value)
         return value
@@ -1319,7 +1390,6 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
         key: PricingKey,
         fetch_fn: Callable[[], Optional[float]],
     ) -> Optional[float]:
-        """Cache live mid prices with very short TTL + separate negative TTL."""
         now = datetime.now(UTC)
         with self._lock:
             entry = self._pricing.get(key)
@@ -1333,7 +1403,14 @@ class CandleCache:  # pylint: disable=too-many-instance-attributes
                 )
                 if age < ttl:
                     return value
-        value = fetch_fn()
+        try:
+            value = fetch_fn()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log_incident(
+                IncidentCode.PRICING_UNAVAILABLE, "pricing fetch exception",
+                err=type(exc).__name__, level=logging.WARNING,
+            )
+            value = None
         with self._lock:
             self._pricing[key] = (datetime.now(UTC), value)
         return value
@@ -1357,9 +1434,11 @@ def _st_candle_cache_factory() -> CandleCache:
 
 
 if _STREAMLIT_AVAILABLE:
-    _st_candle_cache = st.cache_resource(show_spinner=False)(_st_candle_cache_factory)
+    _st_candle_cache: Optional[Callable[[], CandleCache]] = st.cache_resource(
+        show_spinner=False,
+    )(_st_candle_cache_factory)
 else:
-    _st_candle_cache = None  # type: ignore[assignment]
+    _st_candle_cache = None
 
 
 def _get_candle_cache() -> CandleCache:
@@ -1384,7 +1463,7 @@ def _get_candle_cache() -> CandleCache:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — RUN CONTROL (deterministic prior-run drain)
+# SECTION 11 — RUN CONTROL (Streamlit-aware via cache_resource)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _RunController:
@@ -1401,7 +1480,6 @@ class _RunController:
         if prev_stop is not None:
             prev_stop.set()
             if prev_drained is not None:
-                # Bounded wait — do not block UI rerun
                 prev_drained.wait(timeout=CFG.ops.prior_run_drain_timeout_sec)
         with self._lock:
             ev = threading.Event()
@@ -1418,34 +1496,90 @@ class _RunController:
                 self._current_drained = None
 
 
-_RUN_CONTROLLER = _RunController()
+_RUN_CONTROLLER_INSTANCE: Optional[_RunController] = None
+_RUN_CONTROLLER_LOCK = threading.Lock()
+
+
+def _st_run_controller_factory() -> _RunController:
+    return _RunController()
+
+
+if _STREAMLIT_AVAILABLE:
+    _st_run_controller: Optional[Callable[[], _RunController]] = st.cache_resource(
+        show_spinner=False,
+    )(_st_run_controller_factory)
+else:
+    _st_run_controller = None
+
+
+def _get_run_controller() -> _RunController:
+    global _RUN_CONTROLLER_INSTANCE  # pylint: disable=global-statement
+    if (
+        _STREAMLIT_AVAILABLE
+        and _is_streamlit_runtime()
+        and _st_run_controller is not None
+    ):
+        try:
+            return _st_run_controller()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            _log_incident(
+                IncidentCode.UI_CALLBACK_ERROR, "streamlit run controller cache failed",
+                err=type(e).__name__,
+            )
+    if _RUN_CONTROLLER_INSTANCE is None:
+        with _RUN_CONTROLLER_LOCK:
+            if _RUN_CONTROLLER_INSTANCE is None:
+                _RUN_CONTROLLER_INSTANCE = _RunController()
+    return _RUN_CONTROLLER_INSTANCE
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 12 — DATA LAYER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _validate_candle(row: Mapping[str, float], allow_zero_volume: bool) -> bool:
+def _validate_candle_ohlc(row: Mapping[str, float]) -> bool:
+    """Strict OHLC ordering + positivity checks."""
     try:
-        h, lo, o, c, v = row["High"], row["Low"], row["Open"], row["Close"], row["Volume"]
-        if h <= 0 or lo <= 0 or o <= 0 or c <= 0:
-            return False
-        if h < lo or h < o or h < c or lo > o or lo > c or v < 0:
-            return False
-        if not allow_zero_volume and v == 0:
-            return False
-        return True
-    except (KeyError, TypeError):
+        h, lo, o, c = row["High"], row["Low"], row["Open"], row["Close"]
+    except KeyError:
         return False
+    for v in (h, lo, o, c):
+        if not _is_finite_positive(v):
+            return False
+    # Strict ordering: H >= max(O,C) and L <= min(O,C)
+    if h < lo:
+        return False
+    if h < o or h < c:
+        return False
+    if lo > o or lo > c:
+        return False
+    return True
 
 
-def _validate_dataframe_schema(df: pd.DataFrame, instrument: str, granularity: str) -> bool:
+def _validate_candle(row: Mapping[str, float], allow_zero_volume: bool) -> bool:
+    if not _validate_candle_ohlc(row):
+        return False
+    try:
+        v = float(row.get("Volume", 0))
+    except (TypeError, ValueError):
+        return False
+    if math.isnan(v) or math.isinf(v) or v < 0:
+        return False
+    if not allow_zero_volume and v == 0:
+        return False
+    return True
+
+
+def _validate_dataframe_schema(
+    df: pd.DataFrame, instrument: str, granularity: str,
+) -> bool:
     if df.empty:
         return False
     missing = [c for c in REQUIRED_OHLCV_COLS if c not in df.columns]
     if missing:
         _log_incident(IncidentCode.DATA_VALIDATION, "missing columns",
-                      instrument=instrument, granularity=granularity, missing=",".join(missing))
+                      instrument=instrument, granularity=granularity,
+                      missing=",".join(missing))
         return False
     if not isinstance(df.index, pd.DatetimeIndex):
         _log_incident(IncidentCode.DATA_VALIDATION, "non-datetime index",
@@ -1484,31 +1618,22 @@ def _count_market_open_days_in_gap(
     return holiday_or_weekend, total
 
 
-def _validate_dataframe_gaps(df: pd.DataFrame, granularity: str, instrument: str) -> bool:
-    """
-    Critical-gap detection with NY-local weekday + holiday awareness.
-    Mutation of df.attrs happens before insertion into shared cache.
-    """
+def _detect_critical_gap(
+    df: pd.DataFrame, granularity: str, instrument: str,
+) -> bool:
+    """Returns True if a critical (market-open) gap is detected."""
     if len(df) < 2:
-        df.attrs["critical_gap"] = False
-        return True
-
+        return False
     tolerance = _GAP_TOLERANCE.get(granularity)
     if tolerance is None:
-        df.attrs["critical_gap"] = False
-        return True
-
+        return False
     deltas = df.index.to_series().diff().dropna()
     if deltas.empty:
-        df.attrs["critical_gap"] = False
-        return True
-
+        return False
     max_idx = deltas.idxmax()
     max_gap = deltas.loc[max_idx]
-
     if max_gap <= tolerance:
-        df.attrs["critical_gap"] = False
-        return True
+        return False
 
     gap_start_utc = max_idx - max_gap
     gap_end_utc = max_idx
@@ -1516,8 +1641,11 @@ def _validate_dataframe_gaps(df: pd.DataFrame, granularity: str, instrument: str
         gs_ny = gap_start_utc.tz_convert(NY_TZ)
         ge_ny = gap_end_utc.tz_convert(NY_TZ)
     except (TypeError, AttributeError):
-        gs_ny = gap_start_utc.to_pydatetime().astimezone(NY_TZ)
-        ge_ny = gap_end_utc.to_pydatetime().astimezone(NY_TZ)
+        try:
+            gs_ny = gap_start_utc.to_pydatetime().astimezone(NY_TZ)
+            ge_ny = gap_end_utc.to_pydatetime().astimezone(NY_TZ)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return True  # Conservative: treat as critical if conversion fails
 
     is_weekend = (gs_ny.weekday() in (4, 5, 6)) and (ge_ny.weekday() in (6, 0, 1))
     is_holiday_bridge = False
@@ -1530,83 +1658,96 @@ def _validate_dataframe_gaps(df: pd.DataFrame, granularity: str, instrument: str
         _log_incident(
             IncidentCode.DATA_GAPS, "tolerated weekend/holiday gap",
             instrument=instrument, granularity=granularity,
-            max_gap_sec=int(max_gap.total_seconds()),
-            level=logging.INFO,
+            max_gap_sec=int(max_gap.total_seconds()), level=logging.INFO,
         )
-        df.attrs["critical_gap"] = False
-    else:
-        _log_incident(
-            IncidentCode.DATA_GAPS, "critical gap during market open",
-            instrument=instrument, granularity=granularity,
-            max_gap_sec=int(max_gap.total_seconds()),
-            tolerance_sec=int(tolerance.total_seconds()),
-        )
-        df.attrs["critical_gap"] = True
+        return False
+
+    _log_incident(
+        IncidentCode.DATA_GAPS, "critical gap during market open",
+        instrument=instrument, granularity=granularity,
+        max_gap_sec=int(max_gap.total_seconds()),
+        tolerance_sec=int(tolerance.total_seconds()),
+    )
     return True
 
 
 def _fallback_bid_ask(candle: Any) -> Optional[Dict[str, float]]:
+    if not isinstance(candle, dict):
+        return None
     try:
         bid = candle.get("bid")
         ask = candle.get("ask")
-        if isinstance(bid, dict) and isinstance(ask, dict):
-            mid: Dict[str, float] = {}
-            for field_name in ("o", "h", "l", "c"):
-                b = bid.get(field_name)
-                a = ask.get(field_name)
-                if b is not None and a is not None:
-                    mid[field_name] = (float(b) + float(a)) / 2.0
-                elif b is not None:
-                    mid[field_name] = float(b)
-                elif a is not None:
-                    mid[field_name] = float(a)
-                else:
-                    return None
-            return mid
-    except (ValueError, TypeError, KeyError):
+        if not isinstance(bid, dict) and not isinstance(ask, dict):
+            return None
+        mid: Dict[str, float] = {}
+        for field_name in ("o", "h", "l", "c"):
+            b = bid.get(field_name) if isinstance(bid, dict) else None
+            a = ask.get(field_name) if isinstance(ask, dict) else None
+            bf = _safe_float(b) if b is not None else None
+            af = _safe_float(a) if a is not None else None
+            if bf is not None and af is not None:
+                mid[field_name] = (bf + af) / 2.0
+            elif bf is not None:
+                mid[field_name] = bf
+            elif af is not None:
+                mid[field_name] = af
+            else:
+                return None
+        return mid
+    except (ValueError, TypeError, KeyError, AttributeError):
         return None
-    return None
 
 
 def _extract_mid_dict(candle: Mapping[str, Any]) -> Optional[Dict[str, float]]:
-    """Robust OHLC extraction from mid or bid/ask fallback."""
-    mid_raw = candle.get("mid")
+    """Robust OHLC extraction from mid or bid/ask fallback. Validates finite."""
+    mid_raw = candle.get("mid") if isinstance(candle, Mapping) else None
     if isinstance(mid_raw, dict):
         try:
-            return {k: float(mid_raw[k]) for k in ("o", "h", "l", "c")}
+            out: Dict[str, float] = {}
+            for k in ("o", "h", "l", "c"):
+                f = _safe_float(mid_raw.get(k))
+                if f is None:
+                    return _fallback_bid_ask(candle)
+                out[k] = f
+            return out
         except (KeyError, TypeError, ValueError):
             pass
     return _fallback_bid_ask(candle)
 
 
 def _parse_candle_row(
-    candle: Mapping[str, Any], allow_zero_volume: bool
+    candle: Mapping[str, Any], allow_zero_volume: bool,
 ) -> Optional[Dict[str, Any]]:
     """Parse a single candle dict. Returns None on any defect."""
+    if not isinstance(candle, Mapping):
+        return None
     mid = _extract_mid_dict(candle)
     if mid is None:
         return None
-    try:
-        volume_raw = candle.get("volume", 0)
-        volume = float(volume_raw) if volume_raw is not None else 0.0
-    except (ValueError, TypeError):
+    volume_raw = candle.get("volume", 0)
+    volume = _safe_float(volume_raw)
+    if volume is None or volume < 0:
         volume = 0.0
 
+    time_raw = candle.get("time")
+    if not isinstance(time_raw, str) or not time_raw:
+        return None
+
     row = {
-        "date": candle.get("time"),
+        "date":   time_raw,
         "Open":   mid["o"],
         "High":   mid["h"],
         "Low":    mid["l"],
         "Close":  mid["c"],
         "Volume": volume,
     }
-    if row["date"] is None or not _validate_candle(row, allow_zero_volume):
+    if not _validate_candle(row, allow_zero_volume):
         return None
     return row
 
 
 def _parse_oanda_json(
-    raw_json: Any, instrument: str, granularity: str, include_incomplete: bool
+    raw_json: Any, instrument: str, granularity: str, include_incomplete: bool,
 ) -> List[Dict[str, Any]]:
     if not isinstance(raw_json, dict):
         _log_incident(IncidentCode.JSON_INVALID, "root not dict",
@@ -1659,8 +1800,10 @@ def _handle_oanda_status(
     if status == 200:
         return True
     if status == 429:
+        retry_after = 5
         try:
-            retry_after = int(headers.get("Retry-After", "5"))
+            ra_str = headers.get("Retry-After", "5")
+            retry_after = int(ra_str) if ra_str else 5
         except (ValueError, TypeError):
             retry_after = 5
         cooldown = min(retry_after, CFG.http.rate_limit_429_cooldown_sec)
@@ -1684,6 +1827,32 @@ def _handle_oanda_status(
     return False
 
 
+def _execute_oanda_request(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    url: str,
+    headers: Mapping[str, str],
+    params: Mapping[str, Any],
+    registry: SessionRegistry,
+    instrument: str,
+    granularity: str,
+) -> Optional[requests.Response]:
+    try:
+        session = registry.get_for_thread()
+    except RuntimeError:
+        return None
+    try:
+        return session.get(url, headers=headers, params=params,
+                           timeout=CFG.http.timeout_sec)
+    except requests.exceptions.Timeout:
+        _log_incident(IncidentCode.HTTP_TIMEOUT, "OANDA timeout",
+                      instrument=instrument, granularity=granularity)
+        return None
+    except requests.exceptions.RequestException as e:
+        _log_incident(IncidentCode.HTTP_ERROR, "OANDA request exception",
+                      instrument=instrument, granularity=granularity,
+                      err=type(e).__name__)
+        return None
+
+
 def _fetch_candles_raw(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     instrument: str,
     granularity: str,
@@ -1703,27 +1872,15 @@ def _fetch_candles_raw(  # pylint: disable=too-many-arguments,too-many-positiona
 
     url = f"{OANDA_API_URL}/v3/accounts/{account_id}/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {access_token.reveal()}"}
-    params: Dict[str, Any] = {"granularity": granularity, "count": count, "price": "M"}
+    params: Dict[str, Any] = {
+        "granularity": granularity, "count": count, "price": "M",
+    }
     if to_iso is not None:
         params["to"] = to_iso
 
-    try:
-        session = registry.get_for_thread()
-    except RuntimeError:
+    r = _execute_oanda_request(url, headers, params, registry, instrument, granularity)
+    if r is None:
         return FetchResult(df=pd.DataFrame())
-
-    try:
-        r = session.get(url, headers=headers, params=params, timeout=CFG.http.timeout_sec)
-    except requests.exceptions.Timeout:
-        _log_incident(IncidentCode.HTTP_TIMEOUT, "OANDA timeout",
-                      instrument=instrument, granularity=granularity)
-        return FetchResult(df=pd.DataFrame())
-    except requests.exceptions.RequestException as e:
-        _log_incident(IncidentCode.HTTP_ERROR, "OANDA request exception",
-                      instrument=instrument, granularity=granularity,
-                      err=type(e).__name__)
-        return FetchResult(df=pd.DataFrame())
-
     if not _handle_oanda_status(r.status_code, r.headers, instrument, granularity):
         return FetchResult(df=pd.DataFrame())
 
@@ -1745,16 +1902,58 @@ def _fetch_candles_raw(  # pylint: disable=too-many-arguments,too-many-positiona
         return FetchResult(df=pd.DataFrame())
     df = df.set_index("date").sort_index()
 
+    # Deduplicate timestamps (OANDA edge case on partial candles)
+    if df.index.has_duplicates:
+        df = df[~df.index.duplicated(keep="last")]
+
     if not _validate_dataframe_schema(df, instrument, granularity):
         return FetchResult(df=pd.DataFrame())
-    _validate_dataframe_gaps(df, granularity, instrument)
+
+    # CRITICAL: write attrs BEFORE cache insertion so all consumers see them
+    critical_gap = _detect_critical_gap(df, granularity, instrument)
+    df.attrs["critical_gap"] = critical_gap
+    df.attrs["instrument"] = instrument
+    df.attrs["granularity"] = granularity
 
     return FetchResult(
         df=df,
         is_stale=False,
         fetched_at=datetime.now(UTC),
-        critical_gap=bool(df.attrs.get("critical_gap", False)),
+        critical_gap=critical_gap,
     )
+
+
+def _parse_pricing_response(data: Any) -> Optional[float]:
+    """Defensive parser for OANDA /pricing response."""
+    if not isinstance(data, dict):
+        return None
+    prices = data.get("prices")
+    if not isinstance(prices, list) or not prices:
+        return None
+    p = prices[0]
+    if not isinstance(p, dict):
+        return None
+    bids = p.get("bids")
+    asks = p.get("asks")
+    if not isinstance(bids, list) or not bids:
+        return None
+    if not isinstance(asks, list) or not asks:
+        return None
+    try:
+        b0 = bids[0]
+        a0 = asks[0]
+        if not isinstance(b0, dict) or not isinstance(a0, dict):
+            return None
+        bid = _safe_float(b0.get("price"))
+        ask = _safe_float(a0.get("price"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return None
+        mid = (bid + ask) / 2.0
+        if math.isnan(mid) or math.isinf(mid) or mid <= 0:
+            return None
+        return mid
+    except (TypeError, IndexError):
+        return None
 
 
 def fetch_pricing_mid(
@@ -1775,40 +1974,22 @@ def fetch_pricing_mid(
         params = {"instruments": instrument}
         try:
             session = registry.get_for_thread()
-            r = session.get(url, headers=headers, params=params, timeout=CFG.http.timeout_sec)
+            r = session.get(url, headers=headers, params=params,
+                            timeout=CFG.http.timeout_sec)
         except (requests.exceptions.RequestException, RuntimeError) as e:
             _log_incident(IncidentCode.PRICING_UNAVAILABLE, "pricing fetch failed",
                           instrument=instrument, err=type(e).__name__)
             return None
         if r.status_code != 200:
             _log_incident(IncidentCode.PRICING_UNAVAILABLE, "pricing non-200",
-                          instrument=instrument, status=r.status_code, level=logging.INFO)
+                          instrument=instrument, status=r.status_code,
+                          level=logging.INFO)
             return None
         try:
             data = r.json()
         except ValueError:
             return None
-        if not isinstance(data, dict):
-            return None
-        prices = data.get("prices", [])
-        if not isinstance(prices, list) or not prices:
-            return None
-        p = prices[0]
-        if not isinstance(p, dict):
-            return None
-        bids = p.get("bids", [])
-        asks = p.get("asks", [])
-        if not bids or not asks:
-            return None
-        try:
-            bid = float(bids[0].get("price"))
-            ask = float(asks[0].get("price"))
-            mid = (bid + ask) / 2.0
-            if math.isnan(mid) or math.isinf(mid) or mid <= 0:
-                return None
-            return mid
-        except (ValueError, TypeError, KeyError, IndexError):
-            return None
+        return _parse_pricing_response(data)
 
     return _get_candle_cache().get_pricing(key, _fetch)
 
@@ -1861,7 +2042,7 @@ def fetch_live_open(  # pylint: disable=too-many-arguments,too-many-positional-a
             if (now - last_ts) > max_age:
                 return None
             return _safe_float(result.df["Open"].iloc[-1])
-        except (IndexError, ValueError, TypeError):
+        except (IndexError, ValueError, TypeError, KeyError):
             return None
 
     return _get_candle_cache().get_live_open(key, _fetch)
@@ -1876,6 +2057,32 @@ def _build_tf_specs() -> Dict[str, Tuple[str, int, int]]:
         "1H":  ("H1",  300, CFG.bars.min_bars_h1),
         "15m": ("M15", 300, CFG.bars.min_bars_15m),
     }
+
+
+def _fetch_one_tf(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    instrument: str,
+    tf: str,
+    spec: Tuple[str, int, int],
+    account_id: str,
+    account_hash: AccountHash,
+    access_token: SecretToken,
+    registry: SessionRegistry,
+    snapshot_to_iso: Optional[str],
+) -> Tuple[Optional[FetchResult], Optional[str]]:
+    """Returns (result, error_reason). One non-None."""
+    gran, count, min_bars = spec
+    result = fetch_cached(
+        instrument, gran, count, account_id, account_hash, access_token, registry,
+        to_iso=snapshot_to_iso,
+    )
+    if result.df.empty:
+        return None, f"Fetch failed on {tf}"
+    if len(result.df) < min_bars:
+        _log_incident(IncidentCode.DATA_INSUFFICIENT, "bars below minimum",
+                      instrument=instrument, tf=tf,
+                      bars=len(result.df), min_bars=min_bars)
+        return None, f"Insufficient bars on {tf} ({len(result.df)} < {min_bars})"
+    return result, None
 
 
 def fetch_all_data(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -1898,28 +2105,19 @@ def fetch_all_data(  # pylint: disable=too-many-arguments,too-many-positional-ar
         "error_reason": None,
     }
 
-    for tf, (gran, count, min_bars) in specs.items():
+    for tf, spec in specs.items():
         if stop_event.is_set():
             cache["is_incomplete"] = True
             cache["error_reason"] = "Stop requested"
             return cache
 
-        result = fetch_cached(
-            instrument, gran, count, account_id, account_hash, access_token, registry,
-            to_iso=snapshot_to_iso,
+        result, err = _fetch_one_tf(
+            instrument, tf, spec, account_id, account_hash, access_token,
+            registry, snapshot_to_iso,
         )
-        if result.df.empty:
+        if result is None:
             cache["is_incomplete"] = True
-            cache["error_reason"] = f"Fetch failed on {tf}"
-            return cache
-        if len(result.df) < min_bars:
-            _log_incident(IncidentCode.DATA_INSUFFICIENT, "bars below minimum",
-                          instrument=instrument, tf=tf,
-                          bars=len(result.df), min_bars=min_bars)
-            cache["is_incomplete"] = True
-            cache["error_reason"] = (
-                f"Insufficient bars on {tf} ({len(result.df)} < {min_bars})"
-            )
+            cache["error_reason"] = err
             return cache
 
         cache[tf] = result.df
@@ -1989,9 +2187,20 @@ DAILY_VOTES: Final[VoteRegistry] = VoteRegistry()
 # SECTION 14 — ATOMIC VOTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _check_swing_structure_alignment(
+    last_highs: List[float], last_lows: List[float],
+) -> Tuple[bool, bool]:
+    """Returns (is_bullish_structure, is_bearish_structure)."""
+    all_hh = all(last_highs[i] > last_highs[i - 1] for i in range(1, len(last_highs)))
+    all_hl = all(last_lows[i] > last_lows[i - 1] for i in range(1, len(last_lows)))
+    all_lh = all(last_highs[i] < last_highs[i - 1] for i in range(1, len(last_highs)))
+    all_ll = all(last_lows[i] < last_lows[i - 1] for i in range(1, len(last_lows)))
+    return (all_hh and all_hl, all_lh and all_ll)
+
+
 @DAILY_VOTES.register(uid="swing_structure", critical=True)
-def _vote_swing_structure(  # pylint: disable=too-many-locals
-    h: pd.Series, lo: pd.Series, _c: pd.Series, ctx: Mapping[str, Any]
+def _vote_swing_structure(
+    h: pd.Series, lo: pd.Series, _c: pd.Series, ctx: Mapping[str, Any],
 ) -> VoteSignal:
     """Multi-pivot confirmation with prominence."""
     name = "swing_structure"
@@ -2012,18 +2221,15 @@ def _vote_swing_structure(  # pylint: disable=too-many-locals
         return VoteSignal(name, Direction.RANGE, CFG.vote.weight_swing_structure,
                           0.9, False, f"pivots insuf sh={len(sh)} sl={len(sl)}")
 
-    last_highs = [h.iloc[i] for i in sh[-min_conf:]]
-    last_lows = [lo.iloc[i] for i in sl[-min_conf:]]
+    last_highs = [float(h.iloc[i]) for i in sh[-min_conf:]]
+    last_lows = [float(lo.iloc[i]) for i in sl[-min_conf:]]
 
-    all_hh = all(last_highs[i] > last_highs[i - 1] for i in range(1, len(last_highs)))
-    all_hl = all(last_lows[i] > last_lows[i - 1] for i in range(1, len(last_lows)))
-    all_lh = all(last_highs[i] < last_highs[i - 1] for i in range(1, len(last_highs)))
-    all_ll = all(last_lows[i] < last_lows[i - 1] for i in range(1, len(last_lows)))
+    is_bull, is_bear = _check_swing_structure_alignment(last_highs, last_lows)
 
-    if all_hh and all_hl:
+    if is_bull:
         return VoteSignal(name, Direction.BULLISH, CFG.vote.weight_swing_structure,
                           0.9, True, f"{min_conf}xHH+{min_conf}xHL")
-    if all_lh and all_ll:
+    if is_bear:
         return VoteSignal(name, Direction.BEARISH, CFG.vote.weight_swing_structure,
                           0.9, True, f"{min_conf}xLH+{min_conf}xLL")
     return VoteSignal(name, Direction.RANGE, CFG.vote.weight_swing_structure,
@@ -2068,7 +2274,8 @@ def _vote_weekly_open(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
 
 
 def _vote_prev_midpoint_indices(
-    h_j1: float, lo_j1: float, c_j1: float, ctx: Mapping[str, Any], direction: Direction
+    h_j1: float, lo_j1: float, c_j1: float, ctx: Mapping[str, Any],
+    direction: Direction,
 ) -> VoteSignal:
     name = "prev_midpoint"
     rng = h_j1 - lo_j1
@@ -2093,17 +2300,19 @@ def _vote_prev_midpoint_indices(
 
 
 def _vote_prev_midpoint_fx(
-    vol: Optional[pd.Series], direction: Direction
+    vol: Optional[pd.Series], direction: Direction,
 ) -> VoteSignal:
     name = "prev_midpoint"
-    # Conservative default — no firing without volume confirmation
     if vol is None or vol.empty:
         return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
                           0.0, False, "no_vol_data")
     try:
         vol_nz = vol[vol > 0]
+        if len(vol_nz) < 1:
+            return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
+                              0.0, False, "no nonzero vol")
         vol_ref = vol_nz.iloc[:-1] if len(vol_nz) >= 1 else pd.Series(dtype=float)
-        vol_j1 = _safe_float(vol_nz.iloc[-1]) if len(vol_nz) >= 1 else None
+        vol_j1 = _safe_float(vol_nz.iloc[-1])
         if vol_j1 is None or len(vol_ref) < 20:
             return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
                               0.0, False, "vol_history<20 or NaN")
@@ -2125,7 +2334,7 @@ def _vote_prev_midpoint_fx(
 
 @DAILY_VOTES.register(uid="prev_midpoint")
 def _vote_prev_midpoint(
-    h: pd.Series, lo: pd.Series, c: pd.Series, ctx: Mapping[str, Any]
+    h: pd.Series, lo: pd.Series, c: pd.Series, ctx: Mapping[str, Any],
 ) -> VoteSignal:
     name = "prev_midpoint"
     if len(c) < 1:
@@ -2174,11 +2383,11 @@ def _vote_ema50_slope(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — AGGREGATOR (deterministic ordering)
+# SECTION 15 — AGGREGATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _aggregate_votes(
-    votes: Tuple[VoteSignal, ...], atr_val: float, degraded: bool
+    votes: Tuple[VoteSignal, ...], atr_val: float, degraded: bool,
 ) -> DailyTrendResult:
     bull_score = sum(v.weight * v.reliability for v in votes
                      if v.fired and v.direction == Direction.BULLISH)
@@ -2188,13 +2397,7 @@ def _aggregate_votes(
     winning_score = max(bull_score, bear_score)
     min_votes_met = winning_score >= CFG.vote.min_reliable_score
 
-    # Tie-break first — semantic clarity: equal score = no direction
-    if bull_score == bear_score:
-        return DailyTrendResult(
-            Direction.RANGE, CFG.vote.strength_min_range, atr_val,
-            bull_score, bear_score, votes, False, degraded,
-        )
-    if not min_votes_met:
+    if bull_score == bear_score or not min_votes_met:
         return DailyTrendResult(
             Direction.RANGE, CFG.vote.strength_min_range, atr_val,
             bull_score, bear_score, votes, False, degraded,
@@ -2215,7 +2418,34 @@ def _aggregate_votes(
 # SECTION 16 — TREND ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def trend_daily(  # pylint: disable=too-many-locals
+def _run_daily_votes(
+    h: pd.Series, lo: pd.Series, c: pd.Series, ctx: Mapping[str, Any],
+    instrument: str,
+) -> Tuple[List[VoteSignal], bool]:
+    raw_votes: List[VoteSignal] = []
+    degraded = False
+    for spec in DAILY_VOTES.all_votes():
+        try:
+            v = spec.fn(h, lo, c, ctx)
+            if not isinstance(v, VoteSignal):
+                raise TypeError(f"Vote {spec.uid} bad return")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log_incident(
+                IncidentCode.VOTE_CRITICAL_ERROR if spec.critical
+                else IncidentCode.VOTE_ERROR,
+                f"vote {spec.uid} error",
+                instrument=instrument, err=type(exc).__name__,
+                level=logging.ERROR if spec.critical else logging.WARNING,
+            )
+            v = VoteSignal(spec.uid, Direction.RANGE, 0.0, 0.0, False,
+                           f"err:{type(exc).__name__}", errored=True)
+            if spec.critical:
+                degraded = True
+        raw_votes.append(v)
+    return raw_votes, degraded
+
+
+def trend_daily(
     df: pd.DataFrame,
     instrument: str,
     bundle: IndicatorBundle,
@@ -2252,27 +2482,7 @@ def trend_daily(  # pylint: disable=too-many-locals
         "current_week_open": current_week_open,
     }
 
-    raw_votes: List[VoteSignal] = []
-    degraded = False
-    for spec in DAILY_VOTES.all_votes():
-        try:
-            v = spec.fn(h, lo, c, ctx)
-            if not isinstance(v, VoteSignal):
-                raise TypeError(f"Vote {spec.uid} bad return")
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _log_incident(
-                IncidentCode.VOTE_CRITICAL_ERROR if spec.critical
-                else IncidentCode.VOTE_ERROR,
-                f"vote {spec.uid} error",
-                instrument=instrument, err=type(exc).__name__,
-                level=logging.ERROR if spec.critical else logging.WARNING,
-            )
-            v = VoteSignal(spec.uid, Direction.RANGE, 0.0, 0.0, False,
-                           f"err:{type(exc).__name__}", errored=True)
-            if spec.critical:
-                degraded = True
-        raw_votes.append(v)
-
+    raw_votes, degraded = _run_daily_votes(h, lo, c, ctx, instrument)
     return _aggregate_votes(tuple(raw_votes), atr_val, degraded)
 
 
@@ -2314,15 +2524,32 @@ def _trend_macro_weekly(c: pd.Series, e50_series: pd.Series, atr_val: float,
 
 
 def trend_macro(df: pd.DataFrame, tf: str, bundle: IndicatorBundle) -> TrendResult:
-    if len(df) < 50:
-        return TrendResult("Range", 0, bundle.atr_val)
-    if bundle.has_nan:
+    if len(df) < 50 or bundle.has_nan:
         return TrendResult("Range", 0, bundle.atr_val)
     band = bundle.atr_val * CFG.vote.macro_band_atr_ratio
     c = df["Close"]
     if tf == "M":
-        return _trend_macro_monthly(c, bundle.ema_long_series, bundle.atr_val, band, len(df))
-    return _trend_macro_weekly(c, bundle.ema_long_series, bundle.atr_val, band, len(df))
+        return _trend_macro_monthly(
+            c, bundle.ema_long_series, bundle.atr_val, band, len(df),
+        )
+    return _trend_macro_weekly(
+        c, bundle.ema_long_series, bundle.atr_val, band, len(df),
+    )
+
+
+def _trend_4h_score(
+    h: pd.Series, lo: pd.Series, c: pd.Series,
+    cur: float, e50_cur: float, current_day_open: Optional[float],
+) -> int:
+    score = 0
+    if e50_cur != 0:
+        score += 1 if cur > e50_cur else -1
+    pdi, mdi = _dmi(h, lo, c, CFG.ind.atr_period)
+    if pdi is not None and mdi is not None:
+        score += 1 if pdi > mdi else -1
+    if current_day_open is not None:
+        score += 1 if cur > current_day_open else -1
+    return score
 
 
 def trend_4h(
@@ -2339,16 +2566,7 @@ def trend_4h(
     if cur is None:
         return TrendResult("Range", 0, atr_val)
 
-    score = 0
-    e50_cur = bundle.ema_long_cur
-    if e50_cur != 0:
-        score += 1 if cur > e50_cur else -1
-    pdi, mdi = _dmi(h, lo, c, CFG.ind.atr_period)
-    if pdi is not None and mdi is not None:
-        score += 1 if pdi > mdi else -1
-    if current_day_open is not None:
-        score += 1 if cur > current_day_open else -1
-
+    score = _trend_4h_score(h, lo, c, cur, bundle.ema_long_cur, current_day_open)
     s = abs(score)
     strength = 90 if s == 3 else 70 if s >= 1 else 40
     direction = "Bullish" if score > 0 else "Bearish" if score < 0 else "Range"
@@ -2358,7 +2576,6 @@ def trend_4h(
 def _intraday_volume_vote(
     df: pd.DataFrame, instrument: str, bull_zlema: bool, bear_zlema: bool,
 ) -> Tuple[Optional[bool], Optional[bool]]:
-    """Returns (bull_volume_vote, bear_volume_vote) or (None, None) if unavailable."""
     if instrument in INDICES or "Volume" not in df.columns:
         return None, None
     vol = df["Volume"]
@@ -2423,7 +2640,6 @@ def trend_intraday(
     bear_zlema = cur < zlema
     bull_stack = e9 > e21 > e50_cur
     bear_stack = e9 < e21 < e50_cur
-    # Momentum votes are suppressed when momentum indicators NaN'd out
     if bundle.has_momentum_nan:
         bull_mom = False
         bear_mom = False
@@ -2452,7 +2668,7 @@ def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> str:
     e50 = bundle.ema_long_series
     above = c > e50
     for i in range(len(above) - 1, 0, -1):
-        if above.iloc[i] != above.iloc[i - 1]:
+        if bool(above.iloc[i]) != bool(above.iloc[i - 1]):
             age = len(above) - 1 - i
             return str(age) if age > 0 else "0"
     return f">{len(above)}"
@@ -2473,58 +2689,61 @@ _MTF_WEIGHTS: Final[Mapping[str, float]] = {
 _MTF_TOTAL_POSSIBLE: Final[float] = sum(_MTF_WEIGHTS.values())
 
 
+_BULL_TRENDS: Final[FrozenSet[str]] = frozenset({"Bullish", "Retracement Bull"})
+_BEAR_TRENDS: Final[FrozenSet[str]] = frozenset({"Bearish", "Retracement Bear"})
+
+
 def _bull_compat(t: str) -> bool:
-    return t in ("Bullish", "Retracement Bull")
+    return t in _BULL_TRENDS
 
 
 def _bear_compat(t: str) -> bool:
-    return t in ("Bearish", "Retracement Bear")
+    return t in _BEAR_TRENDS
 
 
 def _mtf_weighted_score(
-    trends: Mapping[str, str], scores: Mapping[str, int]
+    trends: Mapping[str, str], scores: Mapping[str, int],
 ) -> Tuple[float, float, int]:
     """Returns (w_bull, w_bear, active_tf_count)."""
     active_count = sum(1 for tf in trends if not trends[tf].startswith("Range"))
-    w_bull = sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0)
-        for tf in trends if trends[tf] == "Bullish"
-    ) + sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) * 0.5
-        for tf in trends if trends[tf] == "Retracement Bull"
-    )
-    w_bear = sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0)
-        for tf in trends if trends[tf] == "Bearish"
-    ) + sum(
-        _MTF_WEIGHTS[tf] * (scores[tf] / 100.0) * 0.5
-        for tf in trends if trends[tf] == "Retracement Bear"
-    )
+    w_bull = 0.0
+    w_bear = 0.0
+    for tf, trend in trends.items():
+        if tf not in _MTF_WEIGHTS:
+            continue
+        weight = _MTF_WEIGHTS[tf]
+        score = scores.get(tf, 0) / 100.0
+        if trend == "Bullish":
+            w_bull += weight * score
+        elif trend == "Retracement Bull":
+            w_bull += weight * score * 0.5
+        elif trend == "Bearish":
+            w_bear += weight * score
+        elif trend == "Retracement Bear":
+            w_bear += weight * score * 0.5
     return w_bull, w_bear, active_count
 
 
+# Table-driven alignment bonus (was CC=18)
+_ALIGNMENT_PAIRS: Final[Tuple[Tuple[str, str, int, int], ...]] = (
+    # (tf1, tf2, pure_bonus, compat_bonus)
+    ("M",  "W",  15, 12),
+    ("D",  "4H", 10, 7),
+)
+
+
 def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
+    if direction not in ("Bullish", "Bearish"):
+        return 0
+    pure = "Bullish" if direction == "Bullish" else "Bearish"
+    compat = _bull_compat if direction == "Bullish" else _bear_compat
     bonus = 0
-    m, w = trends.get("M", ""), trends.get("W", "")
-    d, h4 = trends.get("D", ""), trends.get("4H", "")
-    if direction == "Bullish":
-        if m == "Bullish" and w == "Bullish":
-            bonus += 15
-        elif _bull_compat(m) and _bull_compat(w):
-            bonus += 12
-        if d == "Bullish" and h4 == "Bullish":
-            bonus += 10
-        elif _bull_compat(d) and _bull_compat(h4):
-            bonus += 7
-    else:
-        if m == "Bearish" and w == "Bearish":
-            bonus += 15
-        elif _bear_compat(m) and _bear_compat(w):
-            bonus += 12
-        if d == "Bearish" and h4 == "Bearish":
-            bonus += 10
-        elif _bear_compat(d) and _bear_compat(h4):
-            bonus += 7
+    for tf1, tf2, pure_b, compat_b in _ALIGNMENT_PAIRS:
+        t1, t2 = trends.get(tf1, ""), trends.get(tf2, "")
+        if t1 == pure and t2 == pure:
+            bonus += pure_b
+        elif compat(t1) and compat(t2):
+            bonus += compat_b
     return bonus
 
 
@@ -2534,6 +2753,8 @@ def _mtf_dispersion_penalty(trends: Mapping[str, str], direction: str) -> float:
     conflict_weight = 0.0
     total_weight = 0.0
     for tf, trend in trends.items():
+        if tf not in _MTF_WEIGHTS:
+            continue
         w = _MTF_WEIGHTS[tf]
         total_weight += w
         if direction == "Bullish" and _bear_compat(trend):
@@ -2550,7 +2771,7 @@ def _mtf_dispersion_penalty(trends: Mapping[str, str], direction: str) -> float:
 
 
 def score_mtf(
-    trends: Mapping[str, str], scores: Mapping[str, int]
+    trends: Mapping[str, str], scores: Mapping[str, int],
 ) -> Tuple[str, float, int]:
     """Returns (direction, score, active_tfs)."""
     w_bull, w_bear, active = _mtf_weighted_score(trends, scores)
@@ -2569,34 +2790,42 @@ def score_mtf(
     return direction, max(0.0, min(100.0, raw + bonus - penalty)), active
 
 
+def _nc_contribution(
+    trend: str, strength: int, mtf_dir: str,
+) -> float:
+    """Compute a single TF's NC contribution."""
+    is_strong_pure_bull = trend == "Bullish" and strength >= CFG.mtf.nc_pure_strength_min
+    is_strong_pure_bear = trend == "Bearish" and strength >= CFG.mtf.nc_pure_strength_min
+    if mtf_dir == "Bullish":
+        if is_strong_pure_bull:
+            return 1.0
+        if trend == "Retracement Bull":
+            return 0.25
+        if is_strong_pure_bear:
+            return -1.0
+        if trend == "Retracement Bear":
+            return -0.25
+    else:  # Bearish
+        if is_strong_pure_bear:
+            return 1.0
+        if trend == "Retracement Bear":
+            return 0.25
+        if is_strong_pure_bull:
+            return -1.0
+        if trend == "Retracement Bull":
+            return -0.25
+    return 0.0
+
+
 def _compute_nc_orthogonal(
-    trends: Mapping[str, str], scores: Mapping[str, int], mtf_dir: str
+    trends: Mapping[str, str], scores: Mapping[str, int], mtf_dir: str,
 ) -> int:
     if mtf_dir not in ("Bullish", "Bearish"):
         return 0
-    score_f = 0.0
-    for tf, trend in trends.items():
-        strength = scores.get(tf, 0)
-        is_strong_pure_bull = trend == "Bullish" and strength >= CFG.mtf.nc_pure_strength_min
-        is_strong_pure_bear = trend == "Bearish" and strength >= CFG.mtf.nc_pure_strength_min
-        if mtf_dir == "Bullish":
-            if is_strong_pure_bull:
-                score_f += 1.0
-            elif trend == "Retracement Bull":
-                score_f += 0.25
-            elif is_strong_pure_bear:
-                score_f -= 1.0
-            elif trend == "Retracement Bear":
-                score_f -= 0.25
-        else:
-            if is_strong_pure_bear:
-                score_f += 1.0
-            elif trend == "Retracement Bear":
-                score_f += 0.25
-            elif is_strong_pure_bull:
-                score_f -= 1.0
-            elif trend == "Retracement Bull":
-                score_f -= 0.25
+    score_f = sum(
+        _nc_contribution(trends[tf], scores.get(tf, 0), mtf_dir)
+        for tf in trends
+    )
     sign = 1 if score_f >= 0 else -1
     return sign * math.floor(abs(score_f))
 
@@ -2651,10 +2880,11 @@ def _empty_pair_result(pair: str, reason: str) -> Dict[str, Any]:
 def _build_pair_bundles(
     cache: Mapping[str, Any],
 ) -> Optional[Dict[str, IndicatorBundle]]:
-    """Pre-compute indicator bundles for all TFs. Returns None if any TF fails."""
     bundles: Dict[str, IndicatorBundle] = {}
     for tf in ("M", "W", "D", "4H", "1H", "15m"):
         intraday = tf in ("1H", "15m")
+        if tf not in cache or not isinstance(cache[tf], pd.DataFrame):
+            return None
         b = compute_indicator_bundle(cache[tf], intraday=intraday)
         if b is None:
             return None
@@ -2669,7 +2899,6 @@ def _compute_pair_trends(  # pylint: disable=too-many-arguments,too-many-positio
     spot_mid: Optional[float],
     stop_event: threading.Event,
 ) -> Optional[Tuple[Dict[str, str], Dict[str, int], Dict[str, float], bool]]:
-    """Returns (trends, scores, atrs, degraded_daily) or None on stop."""
     trends: Dict[str, str] = {}
     scores: Dict[str, int] = {}
     atrs: Dict[str, float] = {}
@@ -2707,6 +2936,38 @@ def _compute_pair_trends(  # pylint: disable=too-many-arguments,too-many-positio
     return trends, scores, atrs, degraded_daily
 
 
+def _assemble_pair_row(
+    pair: str,
+    trends: Mapping[str, str],
+    scores: Mapping[str, int],
+    atrs: Mapping[str, float],
+    mtf_dir: str,
+    mtf_score: float,
+    active_tfs: int,
+    degraded: bool,
+    stale_tfs: Tuple[str, ...],
+    nc: int,
+    age: str,
+) -> Dict[str, Any]:
+    return {
+        "Paire": pair.replace("_", "/"),
+        "M": trends["M"], "W": trends["W"], "D": trends["D"],
+        "4H": trends["4H"], "1H": trends["1H"], "15m": trends["15m"],
+        "MTF": f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != "Range" else "Range",
+        "_mtf_score": mtf_score,
+        "_mtf_dir": mtf_dir,
+        "_active_tfs": active_tfs,
+        "_degraded": degraded,
+        "_stale_tfs": stale_tfs,
+        "NC": nc,
+        "Age D1": age,
+        "ATR Daily": _fmt_atr(atrs["D"]),
+        "ATR H4": _fmt_atr(atrs["4H"]),
+        "ATR H1": _fmt_atr(atrs["1H"]),
+        "ATR 15m": _fmt_atr(atrs["15m"]),
+    }
+
+
 def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     pair: str,
     account_id: str,
@@ -2731,6 +2992,7 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         critical_gap = any(
             cache[tf].attrs.get("critical_gap", False)
             for tf in ("M", "W", "D", "4H", "1H", "15m")
+            if isinstance(cache.get(tf), pd.DataFrame)
         )
         degraded = bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
 
@@ -2757,23 +3019,10 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         age = trend_age_daily(cache["D"], bundles["D"])
         nc = _compute_nc_orthogonal(trends, scores, mtf_dir)
 
-        return {
-            "Paire": pair.replace("_", "/"),
-            "M": trends["M"], "W": trends["W"], "D": trends["D"],
-            "4H": trends["4H"], "1H": trends["1H"], "15m": trends["15m"],
-            "MTF": f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != "Range" else "Range",
-            "_mtf_score": mtf_score,
-            "_mtf_dir": mtf_dir,
-            "_active_tfs": active_tfs,
-            "_degraded": degraded,
-            "_stale_tfs": tuple(cache.get("_stale_tfs", [])),
-            "NC": nc,
-            "Age D1": age,
-            "ATR Daily": _fmt_atr(atrs["D"]),
-            "ATR H4": _fmt_atr(atrs["4H"]),
-            "ATR H1": _fmt_atr(atrs["1H"]),
-            "ATR 15m": _fmt_atr(atrs["15m"]),
-        }
+        return _assemble_pair_row(
+            pair, trends, scores, atrs, mtf_dir, mtf_score, active_tfs,
+            degraded, tuple(cache.get("_stale_tfs", [])), nc, age,
+        )
     except Exception as e:  # pylint: disable=broad-exception-caught
         _log_incident(
             IncidentCode.UNKNOWN, "analyze_pair exception",
@@ -2788,11 +3037,14 @@ def _drain_executor_strict(
     futures: Mapping[Future, str],
     stop_event: threading.Event,
 ) -> None:
-    """Stop-first, then cancel, then bounded wait — no busy loop."""
+    """Stop-first, cancel, then bounded wait. Always shut down executor."""
     stop_event.set()
     for f in futures:
         if not f.done():
-            f.cancel()
+            try:
+                f.cancel()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
     deadline = time.monotonic() + CFG.ops.pool_drain_grace_sec
     poll_event = threading.Event()
     while time.monotonic() < deadline:
@@ -2803,7 +3055,18 @@ def _drain_executor_strict(
     try:
         executor.shutdown(wait=True, cancel_futures=True)
     except TypeError:  # Python < 3.9
-        executor.shutdown(wait=True)
+        try:
+            executor.shutdown(wait=True)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log_incident(
+                IncidentCode.EXECUTOR_CANCEL, "executor shutdown failed",
+                err=type(exc).__name__, level=logging.ERROR,
+            )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _log_incident(
+            IncidentCode.EXECUTOR_CANCEL, "executor shutdown failed",
+            err=type(exc).__name__, level=logging.ERROR,
+        )
 
 
 def _process_completed_future(
@@ -2843,7 +3106,7 @@ def _safe_callback(cb: Optional[Callable], label: str, *args: Any) -> None:
         )
 
 
-def _collect_pair_results(
+def _collect_pair_results(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     futures: Dict[Future, str],
     dynamic_timeout: int,
     total: int,
@@ -2885,7 +3148,6 @@ def _finalize_run(
     meta: Dict[str, Any],
     warnings: List[str],
 ) -> Tuple[pd.DataFrame, List[str], Dict[str, Any], List[str]]:
-    """Compute grades, build final DataFrame."""
     errors_sorted = sorted(errors)
     if not results:
         return pd.DataFrame(), errors_sorted, meta, warnings
@@ -2923,7 +3185,8 @@ def analyze_all_core(
     warnings: List[str] = []
     total = len(INSTRUMENTS)
 
-    stop_event = _RUN_CONTROLLER.start_new_run()
+    run_controller = _get_run_controller()
+    stop_event = run_controller.start_new_run()
     registry = _get_session_registry()
     account_hash = _hash_account(account_id)
 
@@ -2962,15 +3225,9 @@ def analyze_all_core(
                 progress_cb, status_cb, results, errors, warnings,
             )
         finally:
-            try:
-                _drain_executor_strict(executor, futures, stop_event)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                _log_incident(
-                    IncidentCode.EXECUTOR_CANCEL, "executor drain failed",
-                    err=type(exc).__name__, level=logging.ERROR, exc_info=True,
-                )
+            _drain_executor_strict(executor, futures, stop_event)
     finally:
-        _RUN_CONTROLLER.finish_run(stop_event)
+        run_controller.finish_run(stop_event)
 
     meta["finished_at"] = datetime.now(UTC)
     meta["timed_out"] = timed_out
@@ -2995,52 +3252,22 @@ def analyze_all_core(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 19 — STREAMLIT CACHING (uniform wrapper with .clear())
+# SECTION 19 — ANALYSIS WRAPPER (NO STREAMLIT CACHE — manual rerun friendly)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _CachedAnalysisWrapper:
+def analyze_all(
+    account_id: str, token: SecretToken,
+) -> Tuple[pd.DataFrame, Dict[str, Any], List[str]]:
     """
-    Uniform interface for the cached analysis function.
-    Exposes .clear() in both Streamlit and non-Streamlit modes — eliminating
-    the AttributeError surface flagged by pylint E1101.
+    Direct wrapper around analyze_all_core.
+
+    DESIGN DECISION: No @st.cache_data here. The internal CandleCache provides
+    proper TTL-based caching at the granular HTTP layer. Wrapping the whole
+    analysis would prevent manual reruns and produce stale results when the
+    user explicitly clicks "Refresh".
     """
-
-    def __init__(self) -> None:
-        if _STREAMLIT_AVAILABLE:
-            self._cached = st.cache_data(
-                ttl=CFG.cache.ttl_d,
-                show_spinner=False,
-                hash_funcs={
-                    OandaCredentials: lambda c: (c.account_id, c.token.digest),
-                },
-            )(_CachedAnalysisWrapper._run)
-        else:
-            self._cached = _CachedAnalysisWrapper._run
-
-    @staticmethod
-    def _run(
-        creds: OandaCredentials,
-    ) -> Tuple[pd.DataFrame, List[str], Dict[str, Any], List[str]]:
-        return analyze_all_core(creds.account_id, creds.token)
-
-    def __call__(
-        self, creds: OandaCredentials,
-    ) -> Tuple[pd.DataFrame, List[str], Dict[str, Any], List[str]]:
-        return self._cached(creds)
-
-    def clear(self) -> None:
-        """Idempotent cache clear — safe to call in either mode."""
-        if _STREAMLIT_AVAILABLE and hasattr(self._cached, "clear"):
-            try:
-                self._cached.clear()
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                _log_incident(
-                    IncidentCode.UI_CALLBACK_ERROR, "cached analysis clear failed",
-                    err=type(e).__name__, level=logging.DEBUG,
-                )
-
-
-_run_analysis_cached: Final[_CachedAnalysisWrapper] = _CachedAnalysisWrapper()
+    df, _errors, meta, warnings = analyze_all_core(account_id, token)
+    return df, meta, warnings
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3062,13 +3289,43 @@ _PDF_GRADE_RGB: Final[Mapping[str, Tuple[int, int, int]]] = {
     "B":  (96, 165, 250),
 }
 
-_PDF_NC_BANDS: Final[Tuple[Tuple[Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int]], ...]] = (
+_PDF_NC_BANDS: Final[Tuple[
+    Tuple[Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int]], ...
+]] = (
     ((5, 99), (46, 204, 113), (255, 255, 255)),
     ((3, 4), (39, 174, 96), (255, 255, 255)),
     ((1, 2), (241, 196, 15), (0, 0, 0)),
     ((0, 0), (230, 126, 34), (255, 255, 255)),
     ((-99, -1), (231, 76, 60), (255, 255, 255)),
 )
+
+_PDF_TREND_COLORS: Final[Tuple[
+    Tuple[str, Tuple[int, int, int], Tuple[int, int, int]], ...
+]] = (
+    ("Retracement Bull", (125, 206, 160), (255, 255, 255)),
+    ("Retracement Bear", (241, 148, 138), (255, 255, 255)),
+    ("Bull",             (46, 204, 113),  (255, 255, 255)),
+    ("Bear",             (231, 76, 60),   (255, 255, 255)),
+    ("Range",            (149, 165, 166), (255, 255, 255)),
+)
+
+
+def _pdf_nc_color(val: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    try:
+        n = int(val)
+        for (lo, hi), fc, tc in _PDF_NC_BANDS:
+            if lo <= n <= hi:
+                return fc, tc
+    except (ValueError, TypeError):
+        pass
+    return (200, 200, 200), (0, 0, 0)
+
+
+def _pdf_trend_color(val: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    for needle, fc, tc in _PDF_TREND_COLORS:
+        if needle in val:
+            return fc, tc
+    return (255, 255, 255), (0, 0, 0)
 
 
 def _pdf_get_colors(
@@ -3081,25 +3338,8 @@ def _pdf_get_colors(
             return (231, 76, 60), (255, 255, 255)
         return (46, 204, 113), (255, 255, 255)
     if col == "NC":
-        try:
-            n = int(val)
-            for (lo, hi), fc, tc in _PDF_NC_BANDS:
-                if lo <= n <= hi:
-                    return fc, tc
-        except (ValueError, TypeError):
-            pass
-        return (200, 200, 200), (0, 0, 0)
-    if "Retracement Bull" in val:
-        return (125, 206, 160), (255, 255, 255)
-    if "Retracement Bear" in val:
-        return (241, 148, 138), (255, 255, 255)
-    if "Bull" in val:
-        return (46, 204, 113), (255, 255, 255)
-    if "Bear" in val:
-        return (231, 76, 60), (255, 255, 255)
-    if "Range" in val:
-        return (149, 165, 166), (255, 255, 255)
-    return (255, 255, 255), (0, 0, 0)
+        return _pdf_nc_color(val)
+    return _pdf_trend_color(val)
 
 
 def _encode_pdf_output(out: Any) -> bytes:
@@ -3110,7 +3350,20 @@ def _encode_pdf_output(out: Any) -> bytes:
     return bytes(out)
 
 
-def create_pdf(df: pd.DataFrame) -> BytesIO:  # pylint: disable=too-many-locals
+def _pdf_render_header(
+    pdf: Any, cols: List[str], widths: Mapping[str, int],
+) -> None:
+    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_fill_color(30, 58, 138)
+    pdf.set_text_color(255, 255, 255)
+    for col in cols:
+        pdf.cell(widths[col], 7, _pdf_cell_text(col),
+                 border=1, align="C", fill=True)
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 6.5)
+
+
+def create_pdf(df: pd.DataFrame) -> BytesIO:
     base_cols = [
         "Paire", "M", "W", "D", "4H", "1H", "15m", "MTF", "Quality", "Tradable",
         "NC", "Age D1", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
@@ -3141,21 +3394,11 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:  # pylint: disable=too-many-locals
         ), ln=True, align="C")
         pdf.ln(4)
 
-        def header() -> None:
-            pdf.set_font("Helvetica", "B", 7)
-            pdf.set_fill_color(30, 58, 138)
-            pdf.set_text_color(255, 255, 255)
-            for col in cols:
-                pdf.cell(widths[col], 7, _pdf_cell_text(col),
-                         border=1, align="C", fill=True)
-            pdf.ln()
-            pdf.set_font("Helvetica", "", 6.5)
-
-        header()
+        _pdf_render_header(pdf, cols, widths)
         for _, row in df.iterrows():
             if pdf.get_y() + rh > 287 - 15:
                 pdf.add_page()
-                header()
+                _pdf_render_header(pdf, cols, widths)
             for col in cols:
                 val = str(row.get(col, ""))
                 fc, tc = _pdf_get_colors(col, val)
@@ -3194,7 +3437,9 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:  # pylint: disable=too-many-locals
 # SECTION 21 — SECRETS LOADING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_OANDA_ACCOUNT_PATTERN: Final[re.Pattern] = re.compile(r"^\d{3}-\d{3}-\d{4,}-\d{3,}$")
+_OANDA_ACCOUNT_PATTERN: Final[re.Pattern] = re.compile(
+    r"^\d{3}-\d{3}-\d{4,}-\d{3,}$"
+)
 
 
 def _validate_secret_format(account_id: str, token: str) -> bool:
@@ -3301,15 +3546,6 @@ def _style_nc(s: pd.Series) -> List[str]:
     return out
 
 
-def analyze_all(
-    account_id: str, token: SecretToken,
-) -> Tuple[pd.DataFrame, Dict[str, Any], List[str]]:
-    """Streamlit-aware wrapper. UI side-effects only happen in main()."""
-    creds = OandaCredentials(account_id=account_id, token=token)
-    df, _errors, meta, warnings = _run_analysis_cached(creds)
-    return df, meta, warnings
-
-
 def _sidebar_config() -> bool:
     with st.sidebar:
         st.header("⚙️ Configuration")
@@ -3327,12 +3563,17 @@ def _sidebar_config() -> bool:
         st.markdown("---")
         if st.button("🗑️ Vider le cache", use_container_width=True):
             _get_candle_cache().clear()
-            _run_analysis_cached.clear()
             if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
                 try:
                     st.cache_resource.clear()
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     _log.debug("Streamlit cache_resource clear failed: %s", e)
+                try:
+                    st.cache_data.clear()
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    _log.debug("Streamlit cache_data clear failed: %s", e)
+            for key in ("df", "df_ts", "df_meta", "pdf_buf", "pdf_buf_hash"):
+                st.session_state.pop(key, None)
             st.success("Cache vidé.")
     return only_best
 
@@ -3360,8 +3601,21 @@ def _emit_warnings(warnings: List[str], meta: Dict[str, Any]) -> None:
         st.warning(f"⚠️ {w}")
 
 
+def _hash_dataframe_for_pdf(df: pd.DataFrame) -> str:
+    """Deterministic hash for PDF caching."""
+    try:
+        h = hashlib.sha256()
+        h.update(str(len(df)).encode())
+        for col in ("Paire", "Quality", "MTF", "NC"):
+            if col in df.columns:
+                h.update(col.encode())
+                h.update(str(df[col].tolist()).encode())
+        return h.hexdigest()
+    except Exception:  # pylint: disable=broad-exception-caught
+        return str(time.time())
+
+
 def _run_analysis_action(acc: str, tok: SecretToken) -> None:
-    """Execute a single analysis run; encapsulates session_state lifecycle."""
     run_id = datetime.now(UTC).isoformat()
     st.session_state["_analysis_running"] = True
     st.session_state["_analysis_started_at"] = datetime.now(UTC)
@@ -3374,7 +3628,11 @@ def _run_analysis_action(acc: str, tok: SecretToken) -> None:
                 st.session_state["df"] = df
                 st.session_state["df_ts"] = datetime.now(UTC)
                 st.session_state["df_meta"] = meta
-                st.session_state["pdf_buf"] = create_pdf(df)
+                # PDF generation cached by df hash to avoid regen on rerun
+                df_hash = _hash_dataframe_for_pdf(df)
+                if st.session_state.get("pdf_buf_hash") != df_hash:
+                    st.session_state["pdf_buf"] = create_pdf(df)
+                    st.session_state["pdf_buf_hash"] = df_hash
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _log_incident(
             IncidentCode.UNKNOWN, "main analysis failed",
@@ -3389,17 +3647,17 @@ def _run_analysis_action(acc: str, tok: SecretToken) -> None:
 
 
 def _prepare_display_df(only_best: bool) -> pd.DataFrame:
-    df = st.session_state["df"].copy()
+    df = st.session_state["df"].copy(deep=True)
     if only_best:
-        df = df[df["Quality"].isin(["A+", "A"])].copy()
+        df = df[df["Quality"].isin(["A+", "A"])].copy(deep=True)
 
     grade_order = ["A+", "A", "B+", "B"]
-    df = df[df["Quality"].isin(grade_order)].copy()
+    df = df[df["Quality"].isin(grade_order)].copy(deep=True)
     df["Quality"] = pd.Categorical(df["Quality"], categories=grade_order, ordered=True)
     sort_cols = [c for c in ["Quality", "NC", "_mtf_score"] if c in df.columns]
     ascending = [True, False, False][:len(sort_cols)]
     if sort_cols:
-        df = df.sort_values(sort_cols, ascending=ascending)
+        df = df.sort_values(sort_cols, ascending=ascending, kind="mergesort")
 
     return df.drop(
         columns=[
@@ -3407,13 +3665,15 @@ def _prepare_display_df(only_best: bool) -> pd.DataFrame:
             "_stale_tfs", "_error_reason",
         ],
         errors="ignore",
-    ).copy()
+    ).copy(deep=True)
 
 
 def _render_downloads(df_clean: pd.DataFrame, cols_present: List[str]) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     c1, c2, c3 = st.columns(3)
-    pdf_buf = st.session_state.get("pdf_buf") or create_pdf(df_clean)
+    pdf_buf = st.session_state.get("pdf_buf")
+    if pdf_buf is None:
+        pdf_buf = create_pdf(df_clean)
     with c1:
         st.download_button(
             "📄 PDF", data=pdf_buf,
@@ -3438,6 +3698,17 @@ def _render_downloads(df_clean: pd.DataFrame, cols_present: List[str]) -> None:
         )
 
 
+def _init_session_state() -> None:
+    defaults = {
+        "_analysis_run_id": None,
+        "_analysis_running": False,
+        "_analysis_started_at": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
 def main() -> None:
     _configure_streamlit_ui()
 
@@ -3458,10 +3729,7 @@ def main() -> None:
         )
         st.stop()
 
-    for key in ("_analysis_run_id", "_analysis_running", "_analysis_started_at"):
-        if key not in st.session_state:
-            st.session_state[key] = None if key != "_analysis_running" else False
-
+    _init_session_state()
     _check_running_flag_ttl()
     only_best = _sidebar_config()
 
@@ -3488,6 +3756,10 @@ def main() -> None:
             )
 
     df_clean = _prepare_display_df(only_best)
+    if df_clean.empty:
+        st.info("Aucun résultat à afficher pour les filtres actuels.")
+        return
+
     _render_metrics(df_clean)
 
     display = [
