@@ -767,14 +767,16 @@ def _dmi(
     return _safe_float(pdi.iloc[-1]), _safe_float(mdi.iloc[-1])
 
 
-def _fmt_atr(val: Optional[float]) -> str:
+def _fmt_atr(val: Optional[float]) -> Optional[float]:
+    # GPS-1: return None (JSON null) instead of the string "N/A" when unavailable.
+    # Returns a rounded float otherwise so the merger gets a numeric type directly.
     if val is None or val <= 0:
-        return "N/A"
+        return None
     if val >= 10:
-        return f"{val:.2f}"
+        return round(val, 2)
     if val >= 1:
-        return f"{val:.3f}"
-    return f"{val:.4f}"
+        return round(val, 3)
+    return round(val, 4)
 
 
 def _find_extrema_scipy(
@@ -2661,17 +2663,19 @@ def trend_intraday(
     return _classify_intraday(vb, vbr, max_votes, cur, e9, e21, e50_cur, zlema, atr_val)
 
 
-def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> str:
+def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> Optional[int]:
+    # GPS-1: return None (JSON null) instead of the string "N/A" when unavailable.
+    # Returns an int >= 0 otherwise.
     if len(df) < 55 or bundle.has_nan:
-        return "N/A"
+        return None
     c = df["Close"]
     e50 = bundle.ema_long_series
     above = c > e50
     for i in range(len(above) - 1, 0, -1):
         if bool(above.iloc[i]) != bool(above.iloc[i - 1]):
             age = len(above) - 1 - i
-            return str(age) if age > 0 else "0"
-    return f">{len(above)}"
+            return age if age > 0 else 0
+    return len(above)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2857,22 +2861,29 @@ def grade_hybrid(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _empty_pair_result(pair: str, reason: str) -> Dict[str, Any]:
+    # GPS-5: bias TF fields are null (not "Range") for ERROR instruments,
+    #        so downstream can distinguish "Range calculated" vs "no data".
+    # GPS-1: Age D1 and ATR fields are null (not the string "N/A").
+    # GPS-4: current_price is null when unavailable.
     return {
         "Paire": pair.replace("_", "/"),
-        "M": "Range", "W": "Range", "D": "Range",
-        "4H": "Range", "1H": "Range", "15m": "Range",
+        "M": None, "W": None, "D": None,
+        "4H": None, "1H": None, "15m": None,
         "MTF": "Range",
+        "MTF_direction": "Range",
+        "MTF_pct": 0,
         "_mtf_score": 0.0,
         "_mtf_dir": "Range",
         "_active_tfs": 0,
         "_degraded": True,
         "_stale_tfs": (),
-        "NC": 0,
-        "Age D1": "N/A",
-        "ATR Daily": "N/A",
-        "ATR H4": "N/A",
-        "ATR H1": "N/A",
-        "ATR 15m": "N/A",
+        "NC": None,
+        "Age D1": None,
+        "ATR Daily": None,
+        "ATR H4": None,
+        "ATR H1": None,
+        "ATR 15m": None,
+        "current_price": None,
         "_error_reason": reason,
     }
 
@@ -2947,13 +2958,21 @@ def _assemble_pair_row(
     degraded: bool,
     stale_tfs: Tuple[str, ...],
     nc: int,
-    age: str,
+    age: Optional[int],
+    current_price: Optional[float] = None,
 ) -> Dict[str, Any]:
+    # GPS-3: keep legacy MTF string for backward compat, but also emit
+    #        MTF_direction (str) and MTF_pct (int) so the merger doesn't
+    #        need to regex-parse the combined string.
+    mtf_str = f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != "Range" else "Range"
+    mtf_pct = int(round(mtf_score)) if mtf_dir != "Range" else 0
     return {
         "Paire": pair.replace("_", "/"),
         "M": trends["M"], "W": trends["W"], "D": trends["D"],
         "4H": trends["4H"], "1H": trends["1H"], "15m": trends["15m"],
-        "MTF": f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != "Range" else "Range",
+        "MTF": mtf_str,
+        "MTF_direction": mtf_dir,
+        "MTF_pct": mtf_pct,
         "_mtf_score": mtf_score,
         "_mtf_dir": mtf_dir,
         "_active_tfs": active_tfs,
@@ -2965,6 +2984,8 @@ def _assemble_pair_row(
         "ATR H4": _fmt_atr(atrs["4H"]),
         "ATR H1": _fmt_atr(atrs["1H"]),
         "ATR 15m": _fmt_atr(atrs["15m"]),
+        # GPS-4: current_price captured at OANDA fetch time
+        "current_price": current_price,
     }
 
 
@@ -3022,6 +3043,7 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         return _assemble_pair_row(
             pair, trends, scores, atrs, mtf_dir, mtf_score, active_tfs,
             degraded, tuple(cache.get("_stale_tfs", [])), nc, age,
+            current_price=spot_mid,
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
         _log_incident(
@@ -3163,10 +3185,13 @@ def _finalize_run(
     for r, g, deg in zip(results, grades, degraded_list):
         if "_error_reason" in r:
             r["Quality"] = "B"
-            r["Tradable"] = f"✗ ERROR ({r['_error_reason']})"
+            # GPS-2: Tradable is now a boolean; cause encoded in Tradable_reason.
+            r["Tradable"] = False
+            r["Tradable_reason"] = "gap_open_market"
         else:
             r["Quality"] = g
-            r["Tradable"] = "✓" if not deg else "✗ NOT_TRADEABLE"
+            r["Tradable"] = not deg
+            r["Tradable_reason"] = None
 
     df = pd.DataFrame(results)
     df.attrs["meta"] = meta
@@ -3334,7 +3359,8 @@ def _pdf_get_colors(
     if col == "Quality":
         return _PDF_GRADE_RGB.get(val, (156, 163, 175)), (0, 0, 0)
     if col == "Tradable":
-        if "ERROR" in val or "✗" in val:
+        # GPS-2: Tradable is now a boolean; False = not tradable (red), True = green.
+        if val is False or val == "False" or str(val).lower() in ("false", "0"):
             return (231, 76, 60), (255, 255, 255)
         return (46, 204, 113), (255, 255, 255)
     if col == "NC":
