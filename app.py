@@ -3789,8 +3789,11 @@ def main() -> None:
     _render_metrics(df_clean)
 
     display = [
-        "Paire", "M", "W", "D", "4H", "1H", "15m", "MTF", "Quality", "Tradable",
-        "NC", "Age D1", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
+        "Paire", "M", "W", "D", "4H", "1H", "15m",
+        "MTF", "MTF_direction", "MTF_pct",
+        "Quality", "Tradable", "Tradable_reason",
+        "NC", "Age D1", "current_price",
+        "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
     ]
     cols_present = [col for col in display if col in df_clean.columns]
 
