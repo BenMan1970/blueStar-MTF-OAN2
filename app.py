@@ -779,6 +779,27 @@ def _fmt_atr(val: Optional[float]) -> Optional[float]:
     return round(val, 4)
 
 
+def _fmt_display_num(val: Any) -> str:
+    # GPS-6: on-screen display formatter ONLY (UI cosmetic fix).
+    # Renders a float at its natural precision instead of Streamlit's
+    # default float64 column padding (e.g. "55.000000" -> "55",
+    # "679.32000" -> "679.32"). Does NOT touch the underlying numeric
+    # dtype: df_clean (CSV/JSON/PDF exports) keeps raw float/int values,
+    # only this Styler-rendered view is affected. Pure presentation layer.
+    try:
+        if pd.isna(val):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+    try:
+        xf = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if xf.is_integer():
+        return str(int(xf))
+    return f"{xf:.6f}".rstrip("0").rstrip(".")
+
+
 def _find_extrema_scipy(
     arr: np.ndarray, wing: int, min_idx: int, prominence: Optional[float], invert: bool,
 ) -> List[int]:
@@ -3577,7 +3598,6 @@ def _sidebar_config() -> bool:
         st.header("⚙️ Configuration")
         only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
         st.info(
-            f"Env : {_OANDA_ENV.upper()}\n\n"
             f"Workers : {CFG.ops.max_workers} · Timeout : {CFG.ops.analysis_timeout_sec}s\n\n"
             f"Cache TTL : M={CFG.cache.ttl_m // 60}m W={CFG.cache.ttl_w // 60}m "
             f"D={CFG.cache.ttl_d // 60}m"
@@ -3741,7 +3761,7 @@ def main() -> None:
     st.markdown(
         f"<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V{APP_VERSION}</h1>"
         f"<p style='margin:0;font-size:0.85em;opacity:0.8'>"
-        f"Institutional · Env: {_OANDA_ENV.upper()}"
+        "Institutional"
         "</p></div>",
         unsafe_allow_html=True,
     )
@@ -3797,8 +3817,18 @@ def main() -> None:
     ]
     cols_present = [col for col in display if col in df_clean.columns]
 
+    # GPS-6: numeric columns whose float64 dtype (forced by NaN upcasting
+    # on ERROR rows) causes Streamlit's default renderer to pad decimals
+    # inconsistently across columns. Display-only — df_clean keeps the
+    # original numeric values for CSV/JSON/PDF exports below.
+    _num_display_cols = [
+        c for c in ("Age D1", "current_price", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m")
+        if c in cols_present
+    ]
+
     styled = (
         df_clean[cols_present].style
+        .format({c: _fmt_display_num for c in _num_display_cols}, na_rep="—")
         .apply(_style_quality, axis=0)
         .apply(_style_nc, axis=0)
         .map(_style_trend)
