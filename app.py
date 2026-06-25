@@ -672,6 +672,32 @@ def is_us_market_holiday(dt: datetime) -> bool:
     return ny_dt.date() in _get_us_holiday_set(ny_dt.year)
 
 
+@functools.lru_cache(maxsize=8)
+def _get_de_holiday_set(year: int) -> FrozenSet[Any]:
+    """Cached German market holiday set for DE30_EUR."""  # HOTFIX-6
+    if not _HAS_HOLIDAYS or _holidays_lib is None:
+        return frozenset()
+    try:
+        return frozenset(_holidays_lib.country_holidays("DE", years=[year]).keys())
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _log_incident(
+            IncidentCode.DATA_VALIDATION, "DE holiday lookup failed",
+            year=year, err=type(exc).__name__, level=logging.DEBUG,
+        )
+        return frozenset()
+
+
+def is_market_holiday_for(instrument: str, dt: datetime) -> bool:
+    """True if `dt` is a market holiday for `instrument`.  # HOTFIX-6
+    DE30_EUR uses German calendar; all other instruments use US calendar."""
+    if not _HAS_HOLIDAYS:
+        return False
+    if instrument == "DE30_EUR":
+        de_dt = dt.astimezone(ZoneInfo("Europe/Berlin"))
+        return de_dt.date() in _get_de_holiday_set(de_dt.year)
+    return is_us_market_holiday(dt)
+
+
 def _is_weekend_closed(wd: int, hr: int) -> bool:
     if wd == 5:                # Saturday
         return True
@@ -1621,15 +1647,20 @@ def _validate_dataframe_schema(
 
 def _count_market_open_days_in_gap(
     gs_ny: datetime, ge_ny: datetime,
+    instrument: str = "",  # HOTFIX-6: pour sélectionner le bon calendrier
 ) -> Tuple[int, int]:
     """Returns (holiday_or_weekend_days, total_days). Bounded scan."""
     current = gs_ny.date()
     end_date = ge_ny.date()
     holiday_or_weekend = 0
     total = 0
+    # HOTFIX-6: calendrier DE pour DE30_EUR, US pour tous les autres
+    _get_holiday_set = (
+        _get_de_holiday_set if instrument == "DE30_EUR" else _get_us_holiday_set
+    )
     try:
         while current <= end_date and total < 10:
-            if current.weekday() >= 5 or current in _get_us_holiday_set(current.year):
+            if current.weekday() >= 5 or current in _get_holiday_set(current.year):  # CHANGED
                 holiday_or_weekend += 1
             total += 1
             current = current + timedelta(days=1)
@@ -1653,45 +1684,48 @@ def _detect_critical_gap(
     deltas = df.index.to_series().diff().dropna()
     if deltas.empty:
         return False
-    max_idx = deltas.idxmax()
-    max_gap = deltas.loc[max_idx]
-    if max_gap <= tolerance:
+    # HOTFIX-2: itérer sur TOUS les gaps dépassant la tolérance, pas seulement le max
+    candidate_gaps = deltas[deltas > tolerance]
+    if candidate_gaps.empty:
         return False
 
-    gap_start_utc = max_idx - max_gap
-    gap_end_utc = max_idx
-    try:
-        gs_ny = gap_start_utc.tz_convert(NY_TZ)
-        ge_ny = gap_end_utc.tz_convert(NY_TZ)
-    except (TypeError, AttributeError):
+    for max_idx, max_gap in candidate_gaps.items():
+        gap_start_utc = max_idx - max_gap
+        gap_end_utc = max_idx
         try:
-            gs_ny = gap_start_utc.to_pydatetime().astimezone(NY_TZ)
-            ge_ny = gap_end_utc.to_pydatetime().astimezone(NY_TZ)
-        except Exception:  # pylint: disable=broad-exception-caught
-            return True  # Conservative: treat as critical if conversion fails
+            gs_ny = gap_start_utc.tz_convert(NY_TZ)
+            ge_ny = gap_end_utc.tz_convert(NY_TZ)
+        except (TypeError, AttributeError):
+            try:
+                gs_ny = gap_start_utc.to_pydatetime().astimezone(NY_TZ)
+                ge_ny = gap_end_utc.to_pydatetime().astimezone(NY_TZ)
+            except Exception:  # pylint: disable=broad-exception-caught
+                return True  # Conservative: treat as critical if conversion fails
 
-    is_weekend = (gs_ny.weekday() in (4, 5, 6)) and (ge_ny.weekday() in (6, 0, 1))
-    is_holiday_bridge = False
-    if _HAS_HOLIDAYS:
-        holiday_days, total_days = _count_market_open_days_in_gap(gs_ny, ge_ny)
-        if total_days > 0 and holiday_days / total_days >= 0.6:
-            is_holiday_bridge = True
+        is_weekend = (gs_ny.weekday() in (4, 5, 6)) and (ge_ny.weekday() in (6, 0, 1))
+        is_holiday_bridge = False
+        if _HAS_HOLIDAYS:
+            holiday_days, total_days = _count_market_open_days_in_gap(gs_ny, ge_ny, instrument)  # CHANGED: passer instrument
+            if total_days > 0 and holiday_days / total_days >= 0.6:
+                is_holiday_bridge = True
 
-    if is_weekend or is_holiday_bridge:
+        if is_weekend or is_holiday_bridge:
+            _log_incident(
+                IncidentCode.DATA_GAPS, "tolerated weekend/holiday gap",
+                instrument=instrument, granularity=granularity,
+                max_gap_sec=int(max_gap.total_seconds()), level=logging.INFO,
+            )
+            continue  # HOTFIX-2: continuer vers les autres gaps
+
         _log_incident(
-            IncidentCode.DATA_GAPS, "tolerated weekend/holiday gap",
+            IncidentCode.DATA_GAPS, "critical gap during market open",
             instrument=instrument, granularity=granularity,
-            max_gap_sec=int(max_gap.total_seconds()), level=logging.INFO,
+            max_gap_sec=int(max_gap.total_seconds()),
+            tolerance_sec=int(tolerance.total_seconds()),
         )
-        return False
+        return True
 
-    _log_incident(
-        IncidentCode.DATA_GAPS, "critical gap during market open",
-        instrument=instrument, granularity=granularity,
-        max_gap_sec=int(max_gap.total_seconds()),
-        tolerance_sec=int(tolerance.total_seconds()),
-    )
-    return True
+    return False  # HOTFIX-2: tous les gaps candidats sont tolérés
 
 
 def _fallback_bid_ask(candle: Any) -> Optional[Dict[str, float]]:
@@ -2262,7 +2296,7 @@ def _vote_swing_structure(
 @DAILY_VOTES.register(uid="ema_stack")
 def _vote_ema_stack(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
     name = "ema_stack"
-    cur = ctx.get("cur")
+    cur = ctx.get("cur_struct") or ctx.get("cur")  # HOTFIX-1: priorité au close structurel
     e21 = ctx.get("e21")
     e50_cur = ctx.get("e50_cur")
     if cur is None or e21 is None or e50_cur is None:
@@ -2375,7 +2409,7 @@ def _vote_prev_midpoint(
     mid_j1 = (h_j1 + lo_j1) / 2.0
     direction = Direction.BULLISH if c_j1 > mid_j1 else Direction.BEARISH
 
-    if is_index:
+    if is_index or instrument == "XAU_USD":  # HOTFIX-7: XAU → chemin indices (body_ratio, pas volume tick)
         return _vote_prev_midpoint_indices(h_j1, lo_j1, c_j1, ctx, direction)
     return _vote_prev_midpoint_fx(ctx.get("vol_series"), direction)
 
@@ -2495,6 +2529,7 @@ def trend_daily(
 
     ctx: Dict[str, Any] = {
         "cur": cur,
+        "cur_struct": _safe_float(c.iloc[-1]),  # HOTFIX-1: close consolidé, indépendant du spot
         "e21": bundle.ema_short,
         "e50_cur": bundle.ema_long_cur,
         "e50": bundle.ema_long_series,
@@ -2565,13 +2600,14 @@ def _trend_4h_score(
     cur: float, e50_cur: float, current_day_open: Optional[float],
 ) -> int:
     score = 0
-    if e50_cur != 0:
-        score += 1 if cur > e50_cur else -1
+    close_last = _safe_float(c.iloc[-1])  # HOTFIX-4: close consolidé pour vote structurel EMA50
+    if e50_cur != 0 and close_last is not None:
+        score += 1 if close_last > e50_cur else -1  # CHANGED: close_last au lieu de cur
     pdi, mdi = _dmi(h, lo, c, CFG.ind.atr_period)
     if pdi is not None and mdi is not None:
         score += 1 if pdi > mdi else -1
     if current_day_open is not None:
-        score += 1 if cur > current_day_open else -1
+        score += 1 if cur > current_day_open else -1  # cur (spot) conservé ici: vote positionnel
     return score
 
 
@@ -2599,7 +2635,7 @@ def trend_4h(
 def _intraday_volume_vote(
     df: pd.DataFrame, instrument: str, bull_zlema: bool, bear_zlema: bool,
 ) -> Tuple[Optional[bool], Optional[bool]]:
-    if instrument in INDICES or "Volume" not in df.columns:
+    if instrument in INDICES or instrument == "XAU_USD" or "Volume" not in df.columns:  # HOTFIX-7: XAU chemin indice
         return None, None
     vol = df["Volume"]
     vol_nz = vol[vol > 0]
@@ -2692,11 +2728,15 @@ def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> Optional[int]:
     c = df["Close"]
     e50 = bundle.ema_long_series
     above = c > e50
-    for i in range(len(above) - 1, 0, -1):
-        if bool(above.iloc[i]) != bool(above.iloc[i - 1]):
-            age = len(above) - 1 - i
+    # HOTFIX-5 (v2): masquer les CFG.ind.ema_long premières barres (instabilité EWM
+    # adjust=False — l'EMA n'est pas stable avant ema_long barres d'historique).
+    warmup = CFG.ind.ema_long  # CHANGED: ema_long barres pour stabilité complète
+    above_stable = above.iloc[warmup:]  # CHANGED: fenêtre stable uniquement
+    for i in range(len(above_stable) - 1, 0, -1):
+        if bool(above_stable.iloc[i]) != bool(above_stable.iloc[i - 1]):
+            age = len(above_stable) - 1 - i
             return age if age > 0 else 0
-    return len(above)
+    return len(above_stable)  # CHANGED: longueur de la fenêtre stable (censored)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2900,6 +2940,7 @@ def _empty_pair_result(pair: str, reason: str) -> Dict[str, Any]:
         "_stale_tfs": (),
         "NC": None,
         "Age D1": None,
+        "Age D1_censored": False,  # HOTFIX-5: False par défaut sur résultat vide (pas de données)
         "ATR Daily": None,
         "ATR H4": None,
         "ATR H1": None,
@@ -2981,6 +3022,7 @@ def _assemble_pair_row(
     nc: int,
     age: Optional[int],
     current_price: Optional[float] = None,
+    age_censored: bool = False,  # HOTFIX-5: flag de censure EWM (True = aucun croisement trouvé)
 ) -> Dict[str, Any]:
     # GPS-3: keep legacy MTF string for backward compat, but also emit
     #        MTF_direction (str) and MTF_pct (int) so the merger doesn't
@@ -3001,6 +3043,7 @@ def _assemble_pair_row(
         "_stale_tfs": stale_tfs,
         "NC": nc,
         "Age D1": age,
+        "Age D1_censored": age_censored,  # HOTFIX-5: True = série censurée (pas de croisement EMA50 dans la fenêtre stable)
         "ATR Daily": _fmt_atr(atrs["D"]),
         "ATR H4": _fmt_atr(atrs["4H"]),
         "ATR H1": _fmt_atr(atrs["1H"]),
@@ -3059,12 +3102,15 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
 
         mtf_dir, mtf_score, active_tfs = score_mtf(trends, scores)
         age = trend_age_daily(cache["D"], bundles["D"])
+        stable_window = max(0, len(cache["D"]) - CFG.ind.ema_long)  # HOTFIX-5: fenêtre stable après warmup EWM
+        age_censored = age is not None and age >= stable_window and stable_window > 0  # HOTFIX-5: censuré si aucun croisement
         nc = _compute_nc_orthogonal(trends, scores, mtf_dir)
 
         return _assemble_pair_row(
             pair, trends, scores, atrs, mtf_dir, mtf_score, active_tfs,
             degraded, tuple(cache.get("_stale_tfs", [])), nc, age,
             current_price=spot_mid,
+            age_censored=age_censored,  # HOTFIX-5
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
         _log_incident(
