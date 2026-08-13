@@ -478,6 +478,28 @@ class TrendConfig:
 CFG: Final[TrendConfig] = TrendConfig()
 
 
+# AUDIT-P0-3 (2026-08-13) : masse totale possible du collège de votes daily, à
+# fiabilité maximale par vote (constantes lues dans les fonctions de vote elles-
+# mêmes : swing=0.90, ema_stack=0.75, weekly_open=0.90, prev_midpoint<=0.80,
+# ema50_slope=0.70). Recoupe le calcul manuel de l'audit senior (4.55).
+# Usage : uniquement pour le champ diagnostique _daily_strength_norm_diag
+# (voir _aggregate_votes) — n'alimente PAS le calcul de `strength` en production.
+_DAILY_VOTE_MAX_RELIABILITY: Final[Mapping[str, float]] = {
+    "swing_structure": 0.90,
+    "ema_stack": 0.75,
+    "weekly_open": 0.90,
+    "prev_midpoint": 0.80,
+    "ema50_slope": 0.70,
+}
+_DAILY_VOTE_TOTAL_POSSIBLE_MASS: Final[float] = (
+    CFG.vote.weight_swing_structure * _DAILY_VOTE_MAX_RELIABILITY["swing_structure"]
+    + CFG.vote.weight_ema_stack * _DAILY_VOTE_MAX_RELIABILITY["ema_stack"]
+    + CFG.vote.weight_weekly_open * _DAILY_VOTE_MAX_RELIABILITY["weekly_open"]
+    + CFG.vote.weight_prev_midpoint * _DAILY_VOTE_MAX_RELIABILITY["prev_midpoint"]
+    + CFG.vote.weight_ema50_slope * _DAILY_VOTE_MAX_RELIABILITY["ema50_slope"]
+)
+
+
 _CACHE_TTL: Final[Mapping[str, int]] = {
     "M": CFG.cache.ttl_m,
     "W": CFG.cache.ttl_w,
@@ -579,6 +601,20 @@ class DailyTrendResult:
     votes: Tuple[VoteSignal, ...]
     min_votes_met: bool
     degraded: bool = False
+    # AUDIT-P0-3 (2026-08-13) : champ diagnostique additif, calculé en parallèle
+    # de `strength` mais qui ne le remplace pas et n'est lu par aucun autre
+    # composant du pipeline (MTF, NC, Quality, Tradable restent inchangés).
+    # `strength` normalise par la masse des SEULS votes déclenchés
+    # (fired_possible), ce qui produit ~90 dès qu'une direction émerge, y
+    # compris sur un vote unique. `strength_norm_diag` normalise par la masse
+    # TOTALE possible du collège (_DAILY_VOTE_TOTAL_POSSIBLE_MASS, 4.55) et
+    # exige au moins 3 votes distincts déclenchés (comme recommandé par les
+    # deux audits) ; sinon il retombe à strength_min_range. C'est une mesure
+    # de preuve, pas seulement de pureté directionnelle. À comparer au
+    # `strength` de production avant toute décision de recalibration — voir
+    # note de méthode.
+    strength_norm_diag: Optional[int] = None
+    fired_votes_count_diag: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1191,7 +1227,12 @@ def _get_session_registry() -> SessionRegistry:
 # SECTION 10 — CACHE ENGINE (LRU, single-flight, TTL-cleaned handoffs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CacheKey = Tuple[str, AccountHash, str, str, int, Optional[str]]
+# AUDIT-P0-1 (2026-08-13) : to_iso retiré de la clé persistante — voir fetch_cached().
+# Le paramètre to_iso continue de piloter la requête OANDA (cohérence temporelle du run),
+# mais n'entre plus dans l'identité de l'entrée de cache, sinon chaque run génère une
+# clé unique (microseconde) et le TTL/stale-fallback/single-flight ne peuvent jamais
+# servir de hit inter-run (198 requêtes HTTP à chaque exécution, résilience nulle).
+CacheKey = Tuple[str, AccountHash, str, str, int]
 LiveOpenKey = Tuple[str, AccountHash, str, str]
 PricingKey = Tuple[str, AccountHash, str]
 
@@ -2061,7 +2102,8 @@ def fetch_cached(  # pylint: disable=too-many-arguments,too-many-positional-argu
     registry: SessionRegistry,
     to_iso: Optional[str] = None,
 ) -> FetchResult:
-    key: CacheKey = (_OANDA_ENV, account_hash, instrument, granularity, count, to_iso)
+    # AUDIT-P0-1 : to_iso exclu de la clé (voir définition de CacheKey plus haut).
+    key: CacheKey = (_OANDA_ENV, account_hash, instrument, granularity, count)
     ttl = _CACHE_TTL.get(granularity, CFG.cache.ttl_default)
     leader_budget = CFG.http.timeout_sec * (CFG.http.retry_total + 1) * 1.5 + 5.0
     return _get_candle_cache().get_candles(
@@ -2454,10 +2496,33 @@ def _aggregate_votes(
     winning_score = max(bull_score, bear_score)
     min_votes_met = winning_score >= CFG.vote.min_reliable_score
 
+    # AUDIT-P0-3 (2026-08-13) diagnostic — voir docstring de DailyTrendResult.
+    # `strength` de production (calculé plus bas, INCHANGÉ) normalise par
+    # fired_possible : un seul vote déclenché (ex. swing_structure seul,
+    # masse 1.8) donne déjà ratio=1.0 -> strength=90, tout comme 4 votes
+    # corrélés déclenchés. `strength_norm_diag` normalise par la masse totale
+    # possible du collège et exige >= 3 votes distincts déclenchés.
+    fired_votes_count_diag = sum(1 for v in votes if v.fired)
+    _MIN_DISTINCT_VOTES_DIAG = 3
+    if (bull_score == bear_score or not min_votes_met
+            or fired_votes_count_diag < _MIN_DISTINCT_VOTES_DIAG):
+        strength_norm_diag = CFG.vote.strength_min_range
+    else:
+        ratio_total_diag = (
+            winning_score / _DAILY_VOTE_TOTAL_POSSIBLE_MASS
+            if _DAILY_VOTE_TOTAL_POSSIBLE_MASS > 0 else 0.0
+        )
+        strength_norm_diag = int(min(
+            CFG.vote.strength_max,
+            max(CFG.vote.strength_min_range, ratio_total_diag * CFG.vote.strength_scaler),
+        ))
+
     if bull_score == bear_score or not min_votes_met:
         return DailyTrendResult(
             Direction.RANGE, CFG.vote.strength_min_range, atr_val,
             bull_score, bear_score, votes, False, degraded,
+            strength_norm_diag=strength_norm_diag,
+            fired_votes_count_diag=fired_votes_count_diag,
         )
     direction = Direction.BULLISH if bull_score > bear_score else Direction.BEARISH
     ratio = winning_score / fired_possible if fired_possible > 0 else 0.0
@@ -2468,6 +2533,8 @@ def _aggregate_votes(
     return DailyTrendResult(
         direction, strength, atr_val, bull_score, bear_score, votes,
         True, degraded,
+        strength_norm_diag=strength_norm_diag,
+        fired_votes_count_diag=fired_votes_count_diag,
     )
 
 
@@ -2947,6 +3014,10 @@ def _empty_pair_result(pair: str, reason: str) -> Dict[str, Any]:
         "ATR 15m": None,
         "current_price": None,
         "_error_reason": reason,
+        # AUDIT-P0-3: cohérence de schéma avec _assemble_pair_row (colonne
+        # présente mais vide sur les lignes en erreur).
+        "_daily_strength_norm_diag": None,
+        "_daily_fired_votes_diag": None,
     }
 
 
@@ -2971,7 +3042,8 @@ def _compute_pair_trends(  # pylint: disable=too-many-arguments,too-many-positio
     pair: str,
     spot_mid: Optional[float],
     stop_event: threading.Event,
-) -> Optional[Tuple[Dict[str, str], Dict[str, int], Dict[str, float], bool]]:
+) -> Optional[Tuple[Dict[str, str], Dict[str, int], Dict[str, float], bool,
+                     Optional[int], Optional[int]]]:
     trends: Dict[str, str] = {}
     scores: Dict[str, int] = {}
     atrs: Dict[str, float] = {}
@@ -2993,6 +3065,9 @@ def _compute_pair_trends(  # pylint: disable=too-many-arguments,too-many-positio
     atrs["D"] = daily_result.atr_val
     if daily_result.degraded:
         degraded_daily = True
+    # AUDIT-P0-3: transporté jusqu'à _assemble_pair_row en tant que diagnostic.
+    daily_strength_norm_diag = daily_result.strength_norm_diag
+    daily_fired_votes_diag = daily_result.fired_votes_count_diag
 
     tr4 = trend_4h(
         cache["4H"], bundles["4H"], spot_mid,
@@ -3006,7 +3081,8 @@ def _compute_pair_trends(  # pylint: disable=too-many-arguments,too-many-positio
         tri = trend_intraday(cache[tf], pair, bundles[tf], spot_mid)
         trends[tf], scores[tf], atrs[tf] = tri.direction, tri.strength, tri.atr_val
 
-    return trends, scores, atrs, degraded_daily
+    return (trends, scores, atrs, degraded_daily,
+            daily_strength_norm_diag, daily_fired_votes_diag)
 
 
 def _assemble_pair_row(
@@ -3023,6 +3099,8 @@ def _assemble_pair_row(
     age: Optional[int],
     current_price: Optional[float] = None,
     age_censored: bool = False,  # HOTFIX-5: flag de censure EWM (True = aucun croisement trouvé)
+    daily_strength_norm_diag: Optional[int] = None,  # AUDIT-P0-3: diagnostic seulement
+    daily_fired_votes_diag: Optional[int] = None,  # AUDIT-P0-3: diagnostic seulement
 ) -> Dict[str, Any]:
     # GPS-3: keep legacy MTF string for backward compat, but also emit
     #        MTF_direction (str) and MTF_pct (int) so the merger doesn't
@@ -3050,6 +3128,10 @@ def _assemble_pair_row(
         "ATR 15m": _fmt_atr(atrs["15m"]),
         # GPS-4: current_price captured at OANDA fetch time
         "current_price": current_price,
+        # AUDIT-P0-3 (2026-08-13): champs diagnostiques, non consommés par le
+        # scoring/grading, exclus de l'export (voir _prepare_display_df).
+        "_daily_strength_norm_diag": daily_strength_norm_diag,
+        "_daily_fired_votes_diag": daily_fired_votes_diag,
     }
 
 
@@ -3073,6 +3155,18 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         if cache.get("is_incomplete"):
             return _empty_pair_result(pair, cache.get("error_reason", "Fetch failed"))
 
+        # AUDIT-P0-2 (2026-08-13) : _snapshot_drift_exceeded mesurait l'écart entre les
+        # horodatages d'appel HTTP (fetched_at) par TF, pas la cohérence des données —
+        # or tous les TF partagent le même paramètre to=, donc les données sont déjà
+        # cohérentes par construction. Ce check confondait latence réseau/retry et
+        # invalidité des données, et rejetait silencieusement des paires sous charge
+        # avec un motif erroné. Couplé à AUDIT-P0-1 (cache désormais réutilisable
+        # inter-run) : un TF servi depuis le cache peut légitimement avoir un
+        # fetched_at ancien (jusqu'à son TTL propre) pendant qu'un autre TF vient
+        # d'être re-fetché — ce n'est pas une anomalie, c'est le fonctionnement voulu
+        # d'un cache à TTL étagé par granularité. Le signal est donc conservé à titre
+        # de dégradation douce (Tradable=False, mais la paire reste calculée et visible)
+        # plutôt que de provoquer un rejet total et silencieux de la paire.
         drift_exceeded = bool(cache.get("_snapshot_drift_exceeded"))
         critical_gap = any(
             cache[tf].attrs.get("critical_gap", False)
@@ -3081,9 +3175,8 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         )
         degraded = bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
 
-        if drift_exceeded or critical_gap:
-            reason = "Drift exceeded" if drift_exceeded else "Critical gap in open market"
-            return _empty_pair_result(pair, reason)
+        if critical_gap:
+            return _empty_pair_result(pair, "Critical gap in open market")
 
         bundles = _build_pair_bundles(cache)
         if bundles is None:
@@ -3096,7 +3189,8 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         computed = _compute_pair_trends(cache, bundles, pair, spot_mid, stop_event)
         if computed is None:
             return None
-        trends, scores, atrs, degraded_daily = computed
+        (trends, scores, atrs, degraded_daily,
+         daily_strength_norm_diag, daily_fired_votes_diag) = computed
         if degraded_daily:
             degraded = True
 
@@ -3111,6 +3205,8 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
             degraded, tuple(cache.get("_stale_tfs", [])), nc, age,
             current_price=spot_mid,
             age_censored=age_censored,  # HOTFIX-5
+            daily_strength_norm_diag=daily_strength_norm_diag,  # AUDIT-P0-3
+            daily_fired_votes_diag=daily_fired_votes_diag,  # AUDIT-P0-3
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
         _log_incident(
@@ -3231,6 +3327,37 @@ def _collect_pair_results(  # pylint: disable=too-many-arguments,too-many-positi
     return timed_out
 
 
+def _normalize_tradable_reason(raw_reason: str) -> str:
+    """AUDIT-P0-5 (2026-08-13) : vocabulaire fermé, honnête, pour Tradable_reason.
+
+    Avant correction, _finalize_run codait en dur "gap_open_market" pour TOUTE
+    cause d'échec (fetch échoué, barres insuffisantes, NaN indicateurs, gap
+    critique, exception interne), tandis que la vraie cause (_error_reason)
+    était calculée puis jetée avant export. Validé empiriquement sur 6 causes
+    réelles différentes : les 6 ressortaient identiquement "gap_open_market".
+
+    Cette fonction traduit le message libre interne (_error_reason, qui reste
+    interne/non exporté — comportement inchangé) vers un petit vocabulaire
+    fermé et stable, adapté à un contrat de sortie consommable par pipeline.
+    """
+    r = raw_reason or ""
+    if r.startswith("Fetch failed"):
+        return "fetch_failed"
+    if r.startswith("Insufficient bars"):
+        return "insufficient_bars"
+    if r == "Indicator NaN":
+        return "indicator_nan"
+    if r == "Critical gap in open market":
+        return "critical_gap"
+    if r == "Drift exceeded":  # conservé si jamais réintroduit comme motif dur
+        return "drift_exceeded"
+    if r == "Stop requested":
+        return "stop_requested"
+    if r.startswith("Analysis failed"):
+        return "analysis_exception"
+    return "unknown_error"
+
+
 def _finalize_run(
     results: List[Dict[str, Any]],
     errors: Iterable[str],
@@ -3253,8 +3380,10 @@ def _finalize_run(
         if "_error_reason" in r:
             r["Quality"] = "B"
             # GPS-2: Tradable is now a boolean; cause encoded in Tradable_reason.
+            # AUDIT-P0-5: motif honnête (vocabulaire fermé) au lieu du hardcode
+            # "gap_open_market" appliqué précédemment à toute cause d'échec.
             r["Tradable"] = False
-            r["Tradable_reason"] = "gap_open_market"
+            r["Tradable_reason"] = _normalize_tradable_reason(r["_error_reason"])
         else:
             r["Quality"] = g
             r["Tradable"] = not deg
@@ -3321,10 +3450,29 @@ def analyze_all_core(
     finally:
         run_controller.finish_run(stop_event)
 
+    # AUDIT-P0-4 (2026-08-13) : _empty_pair_result() renvoie un dict non vide, donc
+    # _process_completed_future() l'ajoutait à `results` (jamais à `errors`) — une paire
+    # dont le fetch/l'analyse a échoué était comptée comme un succès. Conséquence :
+    # meta["errors_count"] restait ~0 et meta["completeness"] ~1.0 même si la quasi-
+    # totalité des instruments avaient échoué, désactivant de fait le garde-fou
+    # NOT_TRADEABLE à completeness_min_tradable (85%). Validé empiriquement : un run
+    # simulé à 30/33 échecs affichait completeness=100%, errors_count=0.
+    # Correction : distinguer analyzed_ok (résultat exploitable) de analyzed_error
+    # (résultat renvoyé mais porteur de _error_reason) ; `errors` (not_returned) garde
+    # son sens actuel inchangé (futures jamais revenues / exception / timeout) pour ne
+    # pas modifier le texte d'avertissement existant. completeness se calcule
+    # désormais sur analyzed_ok uniquement.
+    analyzed_error_count = sum(1 for r in results if "_error_reason" in r)
+    analyzed_ok_count = len(results) - analyzed_error_count
+    not_returned_count = len(errors)
+
     meta["finished_at"] = datetime.now(UTC)
     meta["timed_out"] = timed_out
     meta["errors_count"] = len(errors)
-    meta["completeness"] = len(results) / total if total > 0 else 0.0
+    meta["analyzed_ok_count"] = analyzed_ok_count
+    meta["analyzed_error_count"] = analyzed_error_count
+    meta["not_returned_count"] = not_returned_count
+    meta["completeness"] = analyzed_ok_count / total if total > 0 else 0.0
     meta["degraded_pairs"] = sorted(
         r["Paire"] for r in results
         if r.get("_degraded") and "_error_reason" not in r
@@ -3334,6 +3482,12 @@ def analyze_all_core(
         sample = ", ".join(e.replace("_", "/") for e in sorted(errors)[:10])
         ellipsis = " …" if len(errors) > 10 else ""
         warnings.append(f"{len(errors)} paire(s) non analysée(s) : {sample}{ellipsis}")
+
+    if analyzed_error_count:
+        warnings.append(
+            f"{analyzed_error_count} paire(s) analysée(s) en erreur "
+            f"(données insuffisantes/rejetées) — voir Tradable_reason."
+        )
 
     if meta["completeness"] < CFG.ops.completeness_min_tradable and results:
         warnings.append(
@@ -3755,6 +3909,9 @@ def _prepare_display_df(only_best: bool) -> pd.DataFrame:
         columns=[
             "_mtf_score", "_mtf_dir", "_active_tfs", "_degraded",
             "_stale_tfs", "_error_reason",
+            # AUDIT-P0-3: diagnostics internes, ne doivent pas apparaître dans
+            # l'export CSV/JSON/PDF (contrat de sortie inchangé).
+            "_daily_strength_norm_diag", "_daily_fired_votes_diag",
         ],
         errors="ignore",
     ).copy(deep=True)
