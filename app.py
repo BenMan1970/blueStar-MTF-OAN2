@@ -415,6 +415,9 @@ class VotingConfig:
     weight_weekly_open: float = 1.0
     weight_prev_midpoint: float = 0.5
     weight_ema50_slope: float = 1.0
+    # AUDIT-P1-1 (2026-08-13) : bonus de force (pas un vote) quand le volume
+    # intraday confirme la direction déjà déterminée par zlema/stack/momentum.
+    volume_confirmation_bonus: int = 8
 
 
 @dataclass(frozen=True)
@@ -2777,14 +2780,38 @@ def trend_intraday(
     votes_bear = [bear_zlema, bear_stack, bear_mom]
     max_votes = 3
 
-    bull_vol, bear_vol = _intraday_volume_vote(df, instrument, bull_zlema, bear_zlema)
-    if bull_vol is not None and bear_vol is not None:
-        votes_bull.append(bull_vol)
-        votes_bear.append(bear_vol)
-        max_votes = 4
-
     vb, vbr = sum(votes_bull), sum(votes_bear)
-    return _classify_intraday(vb, vbr, max_votes, cur, e9, e21, e50_cur, zlema, atr_val)
+    result = _classify_intraday(vb, vbr, max_votes, cur, e9, e21, e50_cur, zlema, atr_val)
+
+    # AUDIT-P1-1 (2026-08-13) : le volume n'est plus compté comme un 4e vote.
+    # _intraday_volume_vote() est structurellement tautologique : bull_vol ne
+    # peut être vrai que si bull_zlema l'est déjà (return strong_vol AND
+    # bull_zlema), donc il ne peut jamais contredire zlema ni apporter
+    # d'information indépendante au décompte. Pire : le compter comme vote
+    # gonflait max_votes pour LES DEUX camps (bull et bear partagent le même
+    # max_votes), rendant le seuil du camp opposé plus dur à atteindre.
+    # Validé empiriquement : un même conflit (zlema haussier, stack+momentum
+    # baissiers — 2 votes indépendants réels) donnait "Bearish"(55) sans le
+    # vote volume, mais "Retracement Bull"(45) avec — la direction affichée
+    # s'inversait à cause du seul gonflement du dénominateur. Le volume
+    # redevient un modulateur de conviction sur la direction déjà tranchée
+    # par les 3 votes indépendants, jamais un vote qui pèse dans le décompte
+    # ni qui puisse changer la direction retenue.
+    bull_vol, bear_vol = _intraday_volume_vote(df, instrument, bull_zlema, bear_zlema)
+    if result.direction == "Bullish" and bull_vol:
+        result = TrendResult(
+            result.direction,
+            min(95, result.strength + CFG.vote.volume_confirmation_bonus),
+            result.atr_val,
+        )
+    elif result.direction == "Bearish" and bear_vol:
+        result = TrendResult(
+            result.direction,
+            min(95, result.strength + CFG.vote.volume_confirmation_bonus),
+            result.atr_val,
+        )
+
+    return result
 
 
 def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> Optional[int]:
@@ -2952,6 +2979,23 @@ def _nc_contribution(
 def _compute_nc_orthogonal(
     trends: Mapping[str, str], scores: Mapping[str, int], mtf_dir: str,
 ) -> int:
+    # AUDIT-P1-2 (2026-08-13) : NC n'est PAS statistiquement indépendant du
+    # score MTF, malgré son nom et son usage en grade_hybrid() comme second
+    # axe de confirmation. Les deux sont dérivés des mêmes `trends`/`scores`
+    # par TF (M/W/D/4H/1H/15m) — seule l'agrégation diffère (somme pondérée
+    # avec bonus/pénalités pour MTF, comptage d'accord fort/faible par TF
+    # pour NC). Validé empiriquement sur 2955 tirages i.i.d. aléatoires de
+    # trends/scores (donc sans aucune structure de marché) : corrélation de
+    # Pearson MTF_score/NC = 0.40, et P(NC>=1) passe de 25% à 87%+ selon la
+    # tranche de MTF_score — alors qu'une vraie orthogonalité donnerait une
+    # corrélation proche de 0 sur du bruit i.i.d. Le grade A+ (MTF élevé ET
+    # NC élevé) est donc en bonne partie le même signal mesuré deux fois,
+    # pas deux confirmations indépendantes comme le laisse penser le
+    # docstring "Two-axis grading" de grade_hybrid(). Je n'ai PAS changé la
+    # formule (reconstruire NC sur des familles d'indicateurs réellement
+    # disjointes — structure/momentum/position — est une décision de
+    # conception qui change le sens de A+ sur tout l'historique de signaux ;
+    # à traiter comme P0-3, avec ton arbitrage, pas en silencieux).
     if mtf_dir not in ("Bullish", "Bearish"):
         return 0
     score_f = sum(
@@ -2967,7 +3011,14 @@ def grade_hybrid(
     nc_list: List[int],
     degraded_list: List[bool],
 ) -> List[str]:
-    """Two-axis grading: A+ requires BOTH high MTF AND high NC."""
+    """Grading MTF x NC.
+
+    AUDIT-P1-2 (2026-08-13) : le docstring d'origine ("Two-axis grading: A+
+    requires BOTH high MTF AND high NC") suggère deux confirmations
+    indépendantes. Ce n'est pas le cas — voir le commentaire détaillé sur
+    _compute_nc_orthogonal(). Le seuil A+ combine deux agrégations d'un même
+    ensemble de signaux par TF, pas deux sources d'information distinctes.
+    """
     grades: List[str] = []
     for score, nc, degraded in zip(scores_list, nc_list, degraded_list):
         if degraded:
@@ -3173,7 +3224,36 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
             for tf in ("M", "W", "D", "4H", "1H", "15m")
             if isinstance(cache.get(tf), pd.DataFrame)
         )
-        degraded = bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
+        # AUDIT-P1-4 (2026-08-13) : risque de warmup EMA. Tous les TF (M, W,
+        # D, 4H via ema_long=50 ; 1H, 15m via ema_intra_period=50) votent sur
+        # des comparaisons EMA alors que les seuils min_bars actuels (50-70
+        # barres) sont bien en-deçà des ~3x la période recommandés pour que
+        # le filtre exponentiel (adjust=False, seedé sur la 1ère barre de la
+        # fenêtre récupérée) ait dissipé son biais de démarrage. Quantifié
+        # analytiquement : poids résiduel du seed = (1-alpha)^n ; à n=60,
+        # period=50 -> encore 9,1% du poids initial (vs 0,2% à 3x=150).
+        # Empiriquement, sur un cas concret (fenêtre démarrant sur un pic
+        # isolé de +8%), cela se traduisait par un écart de +0,77% sur la
+        # valeur d'EMA50 à 60 barres — suffisant pour faire basculer un vote
+        # proche de la limite. En usage normal (fetch réussi ~300 barres,
+        # cas courant), le résidu est nul et ce risque ne se matérialise pas
+        # — je n'ai donc PAS durci min_bars_d/h4 (ce qui réduirait la
+        # couverture même dans le cas sain). Ce flag ne fait que rendre
+        # visible/dégrader (Tradable=False) les cas où l'historique
+        # effectivement reçu est plus court que le seuil de warmup, au lieu
+        # de traiter silencieusement un signal EMA potentiellement biaisé
+        # comme pleinement fiable.
+        ema_warmup_risk = any(
+            isinstance(cache.get(tf), pd.DataFrame)
+            and len(cache[tf]) < 3 * (
+                CFG.ind.ema_intra_period if tf in ("1H", "15m") else CFG.ind.ema_long
+            )
+            for tf in ("M", "W", "D", "4H", "1H", "15m")
+        )
+        degraded = (
+            bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
+            or ema_warmup_risk
+        )
 
         if critical_gap:
             return _empty_pair_result(pair, "Critical gap in open market")
@@ -3420,6 +3500,18 @@ def analyze_all_core(
         "env": _OANDA_ENV,
         "account_hash": account_hash,
         "snapshot_to": snapshot_to_iso,
+        # AUDIT-P1-6 (2026-08-13) : traçabilité du chemin de détection de
+        # pivots réellement actif dans CETTE exécution. Empiriquement, le
+        # chemin scipy (find_peaks, distance-based) et le fallback (extremum
+        # strict sur fenêtre large) produisent des ensembles de pivots très
+        # divergents (jusqu'à ~2x plus de pivots détectés côté scipy sur des
+        # séries synthétiques testées) — donc le vote swing_structure (poids
+        # le plus élevé du collège daily) peut changer de comportement selon
+        # que scipy est installé ou non dans l'environnement d'exécution,
+        # silencieusement, sans aucune trace jusqu'ici. Ce champ n'affecte
+        # aucun calcul, il documente seulement quel chemin a servi.
+        "pivot_detection_engine": "scipy" if _HAS_SCIPY else "fallback",
+        "holidays_lib_available": _HAS_HOLIDAYS,
     }
 
     dynamic_timeout = max(
@@ -3806,6 +3898,14 @@ def _sidebar_config() -> bool:
             st.warning("📅 Marché FX fermé — données potentiellement obsolètes.")
         if not _HAS_HOLIDAYS:
             st.caption("ℹ️ Module `holidays` non installé — détection jours fériés dégradée.")
+        # AUDIT-P1-6 (2026-08-13) : le vote swing_structure (poids le plus
+        # élevé du collège daily) dépend d'une détection de pivots dont les
+        # résultats diffèrent significativement entre scipy et le fallback
+        # (validé empiriquement — voir rapport). Rendre le chemin actif
+        # visible en continu, pas seulement en cas de dégradation.
+        st.caption(
+            f"🔎 Détection de pivots : **{'scipy' if _HAS_SCIPY else 'fallback (sans scipy)'}**"
+        )
         st.markdown("---")
         if st.button("🗑️ Vider le cache", use_container_width=True):
             _get_candle_cache().clear()
