@@ -2896,6 +2896,24 @@ def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
         return 0
     pure = "Bullish" if direction == "Bullish" else "Bearish"
     compat = _bull_compat if direction == "Bullish" else _bear_compat
+    opposite_compat = _bear_compat if direction == "Bullish" else _bull_compat
+    # AUDIT-MTF-1 (2026-08-14) : le bonus ne porte que sur les paires (M,W) et
+    # (D,4H) — il est structurellement aveugle à 1H/15m. Validé empiriquement
+    # via score_mtf() : avec M/W/D/4H bullish forts, le score MTF affichait
+    # 100% aussi bien quand 1H/15m étaient neutres QUE quand 1H/15m étaient
+    # Bearish forts (opposition active et totale sur les deux TF les plus
+    # courtes) — la pénalité de dispersion ne peut pas compenser, car son
+    # ratio dilue le poids de 1H+15m (2,5/18 = 13,9% du total) sur
+    # l'ensemble des 6 TF, alors que le bonus (jusqu'à +25) ne regarde même
+    # pas ces deux TF. Un bonus de confirmation ne doit jamais pouvoir
+    # masquer une opposition active ailleurs dans le tableau, même sur une TF
+    # qu'il ne regarde pas lui-même. Règle : le bonus ne s'applique pas si
+    # une TF quelconque (y compris hors des paires ci-dessus) s'oppose
+    # activement (Bearish/Retracement Bear si direction=Bullish, et
+    # inversement) à la direction retenue. Aucun poids/seuil existant n'est
+    # modifié — seule une condition de garde est ajoutée.
+    if any(opposite_compat(t) for t in trends.values()):
+        return 0
     bonus = 0
     for tf1, tf2, pure_b, compat_b in _ALIGNMENT_PAIRS:
         t1, t2 = trends.get(tf1, ""), trends.get(tf2, "")
