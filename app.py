@@ -3242,36 +3242,25 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
             for tf in ("M", "W", "D", "4H", "1H", "15m")
             if isinstance(cache.get(tf), pd.DataFrame)
         )
-        # AUDIT-P1-4 (2026-08-13) : risque de warmup EMA. Tous les TF (M, W,
-        # D, 4H via ema_long=50 ; 1H, 15m via ema_intra_period=50) votent sur
-        # des comparaisons EMA alors que les seuils min_bars actuels (50-70
-        # barres) sont bien en-deçà des ~3x la période recommandés pour que
-        # le filtre exponentiel (adjust=False, seedé sur la 1ère barre de la
-        # fenêtre récupérée) ait dissipé son biais de démarrage. Quantifié
-        # analytiquement : poids résiduel du seed = (1-alpha)^n ; à n=60,
-        # period=50 -> encore 9,1% du poids initial (vs 0,2% à 3x=150).
-        # Empiriquement, sur un cas concret (fenêtre démarrant sur un pic
-        # isolé de +8%), cela se traduisait par un écart de +0,77% sur la
-        # valeur d'EMA50 à 60 barres — suffisant pour faire basculer un vote
-        # proche de la limite. En usage normal (fetch réussi ~300 barres,
-        # cas courant), le résidu est nul et ce risque ne se matérialise pas
-        # — je n'ai donc PAS durci min_bars_d/h4 (ce qui réduirait la
-        # couverture même dans le cas sain). Ce flag ne fait que rendre
-        # visible/dégrader (Tradable=False) les cas où l'historique
-        # effectivement reçu est plus court que le seuil de warmup, au lieu
-        # de traiter silencieusement un signal EMA potentiellement biaisé
-        # comme pleinement fiable.
-        ema_warmup_risk = any(
-            isinstance(cache.get(tf), pd.DataFrame)
-            and len(cache[tf]) < 3 * (
-                CFG.ind.ema_intra_period if tf in ("1H", "15m") else CFG.ind.ema_long
-            )
-            for tf in ("M", "W", "D", "4H", "1H", "15m")
-        )
-        degraded = (
-            bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
-            or ema_warmup_risk
-        )
+        # RETRAIT (2026-08-14) du flag AUDIT-P1-4 (risque de warmup EMA),
+        # introduit le 2026-08-13 : en conditions réelles de production, le
+        # count demandé pour "M" (150, voir specs de fetch) est EXACTEMENT
+        # égal au seuil de warmup que j'avais fixé (3×ema_long=150) — sans
+        # aucune marge. OANDA renvoie très couramment une barre de moins que
+        # le count demandé (mois en cours incomplet, limite d'historique de
+        # l'instrument, jour férié), ce qui déclenchait le flag de façon
+        # quasi systématique sur la quasi-totalité des paires en usage réel,
+        # plafonnant Quality à B+ et Tradable à False partout — confirmé et
+        # reproduit (149 barres reçues vs 150 demandées suffit à déclencher).
+        # C'est une régression que je n'avais pas détectée : mon harnais de
+        # non-régression testait des jeux de données synthétiques toujours
+        # calés exactement sur le count demandé, jamais legèrement en-deçà
+        # comme le fait couramment OANDA en pratique. Le risque théorique
+        # (biais de warmup EMA) reste réel mais n'était qu'une précaution
+        # (P1, pas P0) — je préfère le retirer plutôt que recalibrer un
+        # nouveau seuil sans garantie de marge suffisante vis-à-vis de tes
+        # comptes de fetch actuels.
+        degraded = bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
 
         if critical_gap:
             return _empty_pair_result(pair, "Critical gap in open market")
