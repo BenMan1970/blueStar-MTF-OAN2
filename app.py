@@ -1191,7 +1191,9 @@ def _get_session_registry() -> SessionRegistry:
 # SECTION 10 — CACHE ENGINE (LRU, single-flight, TTL-cleaned handoffs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CacheKey = Tuple[str, AccountHash, str, str, int, Optional[str]]
+# P0-1 FIX (audit forensique 14/08/2026): to_iso retiré de la clé — voir le
+# commentaire détaillé sur fetch_cached() ci-dessous pour le raisonnement complet.
+CacheKey = Tuple[str, AccountHash, str, str, int]
 LiveOpenKey = Tuple[str, AccountHash, str, str]
 PricingKey = Tuple[str, AccountHash, str]
 
@@ -2061,7 +2063,21 @@ def fetch_cached(  # pylint: disable=too-many-arguments,too-many-positional-argu
     registry: SessionRegistry,
     to_iso: Optional[str] = None,
 ) -> FetchResult:
-    key: CacheKey = (_OANDA_ENV, account_hash, instrument, granularity, count, to_iso)
+    # P0-1 FIX (audit forensique 14/08/2026): to_iso était généré à la
+    # microseconde à chaque run (voir analyze_all_core -> snapshot_to_iso),
+    # donc jamais identique entre deux runs consécutifs. La clé de cache ne
+    # matchait donc jamais une entrée d'un run précédent, et TTL/stale-
+    # fallback/single-flight étaient inopérants ENTRE runs (confirmé
+    # empiriquement dans l'audit : 2 runs à 20ms d'écart -> 2 appels réseau
+    # réels au lieu d'1 attendu ; 198 requêtes HTTP à chaque clic).
+    # to_iso reste transmis à _fetch_candles_raw pour la requête elle-même
+    # (la cohérence temporelle au sein d'un run est garantie par le `to=`
+    # partagé entre les 6 TF — voir docstring de fetch_all_data), mais n'a
+    # plus sa place dans la clé : la fraîcheur inter-run est déjà le rôle du
+    # TTL par granularité (_CACHE_TTL) appliqué à fetched_at — c'est
+    # exactement le mécanisme conçu pour ça, mais qui restait inatteignable
+    # tant que la clé changeait à chaque appel.
+    key: CacheKey = (_OANDA_ENV, account_hash, instrument, granularity, count)
     ttl = _CACHE_TTL.get(granularity, CFG.cache.ttl_default)
     leader_budget = CFG.http.timeout_sec * (CFG.http.retry_total + 1) * 1.5 + 5.0
     return _get_candle_cache().get_candles(
@@ -2192,6 +2208,27 @@ def fetch_all_data(  # pylint: disable=too-many-arguments,too-many-positional-ar
     if ts_list:
         drift = (max(ts_list) - min(ts_list)).total_seconds()
         cache["_snapshot_drift_sec"] = drift
+        # P0-2 (couplé à P0-1, audit forensique 14/08/2026) : ce champ mesure
+        # l'écart entre les fetched_at des 6 TF — c'est-à-dire la latence
+        # d'appel HTTP, pas la cohérence des données. La vraie cohérence
+        # temporelle vient du `to=` partagé entre tous les TF d'un run (voir
+        # docstring ci-dessus), garanti par construction, indépendamment du
+        # cache. Une fois P0-1 appliqué (cache réutilisable entre runs via
+        # TTL par granularité), un TF peut légitimement provenir d'un cache
+        # hit vieux de plusieurs minutes (M: TTL=4h, W: TTL=1h, D: TTL=10min)
+        # pendant qu'un autre vient d'être fetché à l'instant — un écart de
+        # fetched_at qui ne reflète RIEN d'anormal, juste des TTL différents
+        # calibrés par granularité. Comparer cet écart à un seuil unique de
+        # 30s (snapshot_drift_max_sec) provoquerait un rejet quasi systématique
+        # sur M/W/D/4H/1H dès que le cache serait effectivement réutilisé —
+        # confirmé par l'audit comme risque direct de corriger P0-1 seul.
+        # La vraie fraîcheur par TF est déjà correctement suivie par
+        # is_stale/_stale_tfs (basé sur le TTL propre à chaque granularité,
+        # avec marge stale_max_age_multiplier) — c'est le bon mécanisme, déjà
+        # en place, déjà utilisé dans `degraded` ci-dessous. On garde donc le
+        # calcul de drift comme signal diagnostique exposé dans `cache` (utile
+        # pour un futur monitoring/KPI, dans l'esprit des deux audits), mais
+        # on ne l'utilise plus comme motif de rejet — voir analyze_pair().
         cache["_snapshot_drift_exceeded"] = drift > CFG.ops.snapshot_drift_max_sec
 
     cache["_spot_mid"] = fetch_pricing_mid(
@@ -2633,9 +2670,22 @@ def trend_4h(
 
 
 def _intraday_volume_vote(
-    df: pd.DataFrame, instrument: str, bull_zlema: bool, bear_zlema: bool,
+    df: pd.DataFrame, instrument: str,
 ) -> Tuple[Optional[bool], Optional[bool]]:
+    # P1-1 FIX (audit forensique 14/08/2026): ce vote recevait bull_zlema/
+    # bear_zlema en paramètres et faisait `strong_vol and bull_zlema` — comme
+    # bull_zlema est DEJA un des 3 votes de base (votes_bull = [bull_zlema,
+    # bull_stack, bull_mom]), ce "4e vote" ne pouvait jamais contredire
+    # bull_zlema (duplicata tautologique), tout en faisant passer max_votes
+    # de 3 à 4 dès que Volume était disponible — ce qui déplace le seuil de
+    # majorité/quasi-majorité utilisé plus bas. L'audit a démontré que cela
+    # pouvait inverser la direction affichée sur un même conflit de données.
+    # Nouveau signal, réellement indépendant : le mouvement de prix propre de
+    # la dernière bougie (close vs close précédent), confirmé par un volume
+    # au-dessus de la moyenne — n'a aucun lien mécanique avec le vote ZLEMA.
     if instrument in INDICES or instrument == "XAU_USD" or "Volume" not in df.columns:  # HOTFIX-7: XAU chemin indice
+        return None, None
+    if len(df) < 2:
         return None, None
     vol = df["Volume"]
     vol_nz = vol[vol > 0]
@@ -2645,8 +2695,14 @@ def _intraday_volume_vote(
     vol_cur = _safe_float(vol.iloc[-1])
     if vol_avg is None or vol_avg <= 0 or vol_cur is None:
         return None, None
+    close_cur = _safe_float(df["Close"].iloc[-1])
+    close_prev = _safe_float(df["Close"].iloc[-2])
+    if close_cur is None or close_prev is None:
+        return None, None
     strong_vol = vol_cur > vol_avg * CFG.vote.volume_ratio_strong_intraday
-    return strong_vol and bull_zlema, strong_vol and bear_zlema
+    bull_bar = close_cur > close_prev
+    bear_bar = close_cur < close_prev
+    return strong_vol and bull_bar, strong_vol and bear_bar
 
 
 def _classify_intraday(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -2710,7 +2766,7 @@ def trend_intraday(
     votes_bear = [bear_zlema, bear_stack, bear_mom]
     max_votes = 3
 
-    bull_vol, bear_vol = _intraday_volume_vote(df, instrument, bull_zlema, bear_zlema)
+    bull_vol, bear_vol = _intraday_volume_vote(df, instrument)
     if bull_vol is not None and bear_vol is not None:
         votes_bull.append(bull_vol)
         votes_bear.append(bear_vol)
@@ -2802,6 +2858,19 @@ def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
         return 0
     pure = "Bullish" if direction == "Bullish" else "Bearish"
     compat = _bull_compat if direction == "Bullish" else _bear_compat
+    # MTF-1 FIX (découverte Ben, audit forensique 14/08/2026): _ALIGNMENT_PAIRS
+    # ne teste que (M,W) et (D,4H) — un score affichait le même bonus (et
+    # pouvait saturer à 100%) que 1H/15m soient neutres OU frontalement
+    # opposées à `direction`. La pénalité de dispersion pèse bien 1H/15m,
+    # mais son plafond (dispersion_penalty_max=15) est structurellement
+    # inférieur au bonus max (25), donc elle ne compense pas toujours.
+    # Veto ciblé : si les TF les plus rapides s'opposent ACTIVEMENT à la
+    # direction (pas juste neutres/Range), on retire le bonus de confirmation
+    # des TF plus hautes — comportement inchangé pour tous les autres cas
+    # (1H/15m neutres ou alignées).
+    opposite_compat = _bear_compat if direction == "Bullish" else _bull_compat
+    if any(opposite_compat(trends.get(tf, "")) for tf in ("1H", "15m")):
+        return 0
     bonus = 0
     for tf1, tf2, pure_b, compat_b in _ALIGNMENT_PAIRS:
         t1, t2 = trends.get(tf1, ""), trends.get(tf2, "")
@@ -3073,17 +3142,23 @@ def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-argu
         if cache.get("is_incomplete"):
             return _empty_pair_result(pair, cache.get("error_reason", "Fetch failed"))
 
-        drift_exceeded = bool(cache.get("_snapshot_drift_exceeded"))
+        # P0-2 FIX (couplé à P0-1, audit forensique 14/08/2026): drift_exceeded
+        # retiré du rejet et de `degraded` — voir le commentaire détaillé dans
+        # fetch_all_data() sur pourquoi ce signal devient trompeur une fois le
+        # cache réutilisable entre runs (P0-1). La fraîcheur par TF reste
+        # correctement gérée par _stale_tfs (is_stale, basé sur le TTL propre
+        # à chaque granularité) ; critical_gap reste un motif de rejet dur
+        # inchangé. _snapshot_drift_exceeded reste calculé et disponible dans
+        # `cache` à titre diagnostique (non exploité ici).
         critical_gap = any(
             cache[tf].attrs.get("critical_gap", False)
             for tf in ("M", "W", "D", "4H", "1H", "15m")
             if isinstance(cache.get(tf), pd.DataFrame)
         )
-        degraded = bool(cache.get("_stale_tfs")) or drift_exceeded or critical_gap
+        degraded = bool(cache.get("_stale_tfs")) or critical_gap
 
-        if drift_exceeded or critical_gap:
-            reason = "Drift exceeded" if drift_exceeded else "Critical gap in open market"
-            return _empty_pair_result(pair, reason)
+        if critical_gap:
+            return _empty_pair_result(pair, "Critical gap in open market")
 
         bundles = _build_pair_bundles(cache)
         if bundles is None:
@@ -3254,7 +3329,13 @@ def _finalize_run(
             r["Quality"] = "B"
             # GPS-2: Tradable is now a boolean; cause encoded in Tradable_reason.
             r["Tradable"] = False
-            r["Tradable_reason"] = "gap_open_market"
+            # P0-5 FIX (audit forensique 14/08/2026): la vraie cause était calculée
+            # dans _error_reason puis jetée au profit d'un literal hardcodé — les 6
+            # causes distinctes ("Fetch failed on X", "Insufficient bars...",
+            # "Drift exceeded", "Critical gap in open market", "Indicator NaN",
+            # "Analysis failed: ...", "Stop requested") ressortaient toutes
+            # identiquement "gap_open_market". On propage désormais la cause réelle.
+            r["Tradable_reason"] = r["_error_reason"]
         else:
             r["Quality"] = g
             r["Tradable"] = not deg
@@ -3323,8 +3404,19 @@ def analyze_all_core(
 
     meta["finished_at"] = datetime.now(UTC)
     meta["timed_out"] = timed_out
-    meta["errors_count"] = len(errors)
-    meta["completeness"] = len(results) / total if total > 0 else 0.0
+    # P0-4 FIX (audit forensique 14/08/2026): analyze_pair() ne retourne jamais
+    # None/False sur échec — il retourne _empty_pair_result(), un dict non-vide,
+    # donc les paires en échec finissaient toujours dans `results` et jamais dans
+    # `errors`. completeness = len(results)/total restait donc ~100% même avec
+    # 30/33 échecs (reproduit empiriquement dans l'audit), et le garde-fou
+    # NOT_TRADEABLE (ligne ci-dessous) ne se déclenchait quasiment jamais.
+    # On compte les lignes portant "_error_reason" comme des échecs pour les
+    # métriques de run, sans toucher à `results` ni à l'affichage par ligne
+    # (déjà géré correctement plus bas via _finalize_run).
+    soft_errors = sum(1 for r in results if "_error_reason" in r)
+    meta["errors_count"] = len(errors) + soft_errors
+    successes = len(results) - soft_errors
+    meta["completeness"] = successes / total if total > 0 else 0.0
     meta["degraded_pairs"] = sorted(
         r["Paire"] for r in results
         if r.get("_degraded") and "_error_reason" not in r
@@ -3891,5 +3983,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
