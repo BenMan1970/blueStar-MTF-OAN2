@@ -430,6 +430,16 @@ class MtfConfig:
     nc_pure_strength_min: int = 70
     nc_mtf_min_for_a_plus: float = 70.0
     nc_min_for_a_plus: int = 3
+    # MTF-1 (audit forensique 14/08/2026, recalibré 16/08/2026) : facteur
+    # appliqué au bonus d'alignement (M/W, D/4H) quand 1H ou 15m est en
+    # opposition "douce" (Retracement Bear/Bull) à la direction, PAS en
+    # opposition franche (Bearish/Bullish littéral). 0.0 = veto total
+    # (comportement du premier correctif), 1.0 = aucune pénalité (comportement
+    # pré-correctif). Valeur de départ 0.5 — à calibrer empiriquement contre
+    # le journal de signaux via le harnais institutionnel (§5.4 synthèse).
+    # L'opposition franche (1H/15m littéralement Bearish/Bullish contre la
+    # direction) reste vetée à 0 dans tous les cas — non concernée par ce facteur.
+    fast_tf_soft_opposition_factor: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -2858,19 +2868,36 @@ def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
         return 0
     pure = "Bullish" if direction == "Bullish" else "Bearish"
     compat = _bull_compat if direction == "Bullish" else _bear_compat
-    # MTF-1 FIX (découverte Ben, audit forensique 14/08/2026): _ALIGNMENT_PAIRS
-    # ne teste que (M,W) et (D,4H) — un score affichait le même bonus (et
-    # pouvait saturer à 100%) que 1H/15m soient neutres OU frontalement
-    # opposées à `direction`. La pénalité de dispersion pèse bien 1H/15m,
-    # mais son plafond (dispersion_penalty_max=15) est structurellement
-    # inférieur au bonus max (25), donc elle ne compense pas toujours.
-    # Veto ciblé : si les TF les plus rapides s'opposent ACTIVEMENT à la
-    # direction (pas juste neutres/Range), on retire le bonus de confirmation
-    # des TF plus hautes — comportement inchangé pour tous les autres cas
-    # (1H/15m neutres ou alignées).
+    # MTF-1 FIX (découverte Ben, audit forensique 14/08/2026, RECALIBRÉ 16/08/2026
+    # sur données réelles Bluestar_GPS_20260815_2327 : le veto binaire initial
+    # affectait 17/32 paires tradables du scan, dont les 3 seules A+/A, en
+    # traitant "Retracement Bear/Bull" (opposition douce, pullback probable
+    # dans la tendance) exactement comme "Bearish/Bullish" littéral (opposition
+    # franche) — ex. XAU/USD (1H=Bullish, 15m=Retracement Bear seul) tombait à
+    # bonus=0 comme GBP/CAD (1H ET 15m franchement Bearish), alors que les deux
+    # cas n'ont manifestement pas la même gravité.
+    # _ALIGNMENT_PAIRS ne teste que (M,W) et (D,4H) — un score affichait le
+    # même bonus (et pouvait saturer à 100%) que 1H/15m soient neutres OU
+    # opposées à `direction`. La pénalité de dispersion pèse bien 1H/15m, mais
+    # son plafond (dispersion_penalty_max=15) est structurellement inférieur
+    # au bonus max (25), donc elle ne compense pas toujours seule.
+    # Sévérité désormais graduée sur les TF rapides (1H, 15m) :
+    #   - opposition FRANCHE (littéralement Bearish/Bullish contre la
+    #     direction) -> véto total, bonus=0 (comportement inchangé, cas le
+    #     plus grave : ex. GBP/CAD, 1H+15m tous deux Bearish sous Bullish).
+    #   - opposition DOUCE (Retracement Bear/Bull seulement, jamais franche
+    #     sur aucun des deux TF rapides) -> bonus réduit par
+    #     fast_tf_soft_opposition_factor (0.5 par défaut, calibrable), pas
+    #     annulé -> ex. XAU/USD, NAS100/USD.
+    #   - neutre (Range) ou alignée -> bonus plein, inchangé.
+    opposite_pure = "Bearish" if direction == "Bullish" else "Bullish"
     opposite_compat = _bear_compat if direction == "Bullish" else _bull_compat
-    if any(opposite_compat(trends.get(tf, "")) for tf in ("1H", "15m")):
-        return 0
+    fast_trends = [trends.get(tf, "") for tf in ("1H", "15m")]
+    frontal_opposition = any(t == opposite_pure for t in fast_trends)
+    soft_opposition = (
+        not frontal_opposition
+        and any(opposite_compat(t) for t in fast_trends)
+    )
     bonus = 0
     for tf1, tf2, pure_b, compat_b in _ALIGNMENT_PAIRS:
         t1, t2 = trends.get(tf1, ""), trends.get(tf2, "")
@@ -2878,6 +2905,10 @@ def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
             bonus += pure_b
         elif compat(t1) and compat(t2):
             bonus += compat_b
+    if frontal_opposition:
+        return 0
+    if soft_opposition:
+        return round(bonus * CFG.mtf.fast_tf_soft_opposition_factor)
     return bonus
 
 
