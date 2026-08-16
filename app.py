@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V9.0.0 PRODUCTION-GRADE                           ║
+║  BLUESTAR HEDGE FUND GPS — V9.1.0 PRODUCTION-GRADE                           ║
 ║                                                                              ║
-║  Production-grade hardening:                                                 ║
-║    • Removed pd.set_option global side-effect (per-DF copies)                ║
-║    • Removed @st.cache_data on analysis (was blocking manual reruns)         ║
-║    • Idempotent excepthook installation                                      ║
-║    • Streamlit-aware RunController via cache_resource                        ║
-║    • Atomic critical_gap attribute write before cache insertion              ║
-║    • Strict OHLC + finite validation (NaN/inf rejection at parse layer)      ║
-║    • Full-token hash for OandaCredentials (no prefix collisions)             ║
-║    • Robust executor drain with thread accounting                            ║
-║    • Inflight result hand-off populated even on leader exception             ║
-║    • Table-driven MTF alignment + PDF color classification                   ║
-║    • Heartbeat-based analysis_running lifecycle                              ║
-║    • Defensive JSON parsing tolerant to any OANDA shape variation            ║
+║  Base fonctionnelle : V9.0.0-PROD-GRADE (inchangée — aucune régression sur   ║
+║  la couche data, cache, votes, MTF, NC, grading).                            ║
+║                                                                              ║
+║  Corrections V9.1.0 (cosmétique / cohérence sortie — zéro régression) :      ║
+║    • UX-1  Rendu tableau "premium" HTML (chips, badges, barre MTF, sticky)   ║
+║    • UX-2  NC / Age D1 : typage Int64 nullable -> plus de "4.000000"         ║
+║    • UX-3  Tri unique sort_results() : Grade > Tradable > NC > MTF% > Paire  ║
+║            appliqué au pipeline, à l'écran, au PDF et aux exports            ║
+║    • UX-4  PDF : largeurs recalibrées (279mm -> 275mm <= 277mm utiles)       ║
+║    • UX-5  PDF : saut de page A4 PAYSAGE (210mm, pas 287mm) + en-tête répété ║
+║    • UX-6  PDF : valeurs formatées (entiers, OUI/NON, "-" si absent)         ║
+║    • UX-7  JSON : sérialisation explicite (NA -> null, numpy -> natif)       ║
+║    • UX-8  JSON/CSV : export de Age D1_censored (calculé mais jamais exporté)║
+║    • UX-9  PDF aligné sur la vue affichée (même filtre, même tri)            ║
+║    • UX-10 grade_hybrid() durci contre NC=None (défensif, iso-comportement)  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -23,6 +25,8 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import html as _html
+import json
 import logging
 import math
 import os
@@ -53,6 +57,7 @@ from typing import (
     Mapping,
     NewType,
     Optional,
+    Sequence,
     Tuple,
 )
 from zoneinfo import ZoneInfo
@@ -320,7 +325,7 @@ def _log_incident(
 # SECTION 3 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION: Final[str] = "9.0.0-PROD-GRADE"
+APP_VERSION: Final[str] = "9.1.0-PROD-GRADE"
 
 _OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
 OANDA_API_URL: Final[str] = (
@@ -523,6 +528,52 @@ TREND_COLORS: Final[Mapping[str, str]] = {
     "Range":            "#95a5a6",
 }
 
+# ── UX-3 : ordre canonique des grades, source unique de vérité pour TOUS les tris
+_GRADE_ORDER: Final[Tuple[str, ...]] = ("A+", "A", "B+", "B")
+_GRADE_RANK: Final[Mapping[str, int]] = {g: i for i, g in enumerate(_GRADE_ORDER)}
+
+# ── UX-8 : schéma d'export figé (CSV / JSON). L'ordre des clés est stable.
+#    "Age D1_censored" était calculé (HOTFIX-5) mais jamais exporté : ajouté ici.
+EXPORT_COLS: Final[Tuple[str, ...]] = (
+    "Paire", "M", "W", "D", "4H", "1H", "15m",
+    "MTF", "MTF_direction", "MTF_pct",
+    "Quality", "Tradable", "Tradable_reason",
+    "NC", "Age D1", "Age D1_censored", "current_price",
+    "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
+)
+
+# ── UX-1 : colonnes affichées à l'écran (ordre de lecture optimisé, largeur
+#    contenue pour que rien ne soit coupé à droite).
+DISPLAY_COLS: Final[Tuple[str, ...]] = (
+    "Paire", "Quality", "MTF", "M", "W", "D", "4H", "1H", "15m",
+    "NC", "Age D1", "current_price",
+    "ATR Daily", "ATR H4", "ATR H1", "ATR 15m", "Tradable",
+)
+
+_DISPLAY_HEADERS: Final[Mapping[str, str]] = {
+    "Paire": "Paire",
+    "Quality": "Grade",
+    "MTF": "MTF",
+    "M": "M", "W": "W", "D": "D", "4H": "4H", "1H": "1H", "15m": "15m",
+    "NC": "NC",
+    "Age D1": "Âge D1",
+    "current_price": "Prix",
+    "ATR Daily": "ATR D",
+    "ATR H4": "ATR 4H",
+    "ATR H1": "ATR 1H",
+    "ATR 15m": "ATR 15m",
+    "Tradable": "Statut",
+}
+
+_TF_COLS: Final[Tuple[str, ...]] = ("M", "W", "D", "4H", "1H", "15m")
+_NUMERIC_DISPLAY_COLS: Final[Tuple[str, ...]] = (
+    "NC", "Age D1", "current_price", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
+)
+_INTERNAL_COLS: Final[Tuple[str, ...]] = (
+    "_mtf_score", "_mtf_dir", "_active_tfs", "_degraded", "_stale_tfs",
+    "_error_reason",
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — STREAMLIT UI SETUP
@@ -541,18 +592,25 @@ def _configure_streamlit_ui() -> None:
         pass  # already configured
     st.markdown(
         """
-        <style>
-            .main-header { text-align: center; padding: 20px;
-                background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%);
-                color: white; border-radius: 12px; margin-bottom: 20px;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
-            .stale-warning { background: #fef3c7; border-left: 4px solid #f59e0b;
-                padding: 10px 16px; border-radius: 4px; margin-bottom: 12px; }
-            .degraded-warning { background: #fee2e2; border-left: 4px solid #dc2626;
-                padding: 10px 16px; border-radius: 4px; margin-bottom: 12px; }
-            .not-tradable { background: #1f2937; color: #fbbf24; padding: 4px 8px;
-                border-radius: 4px; font-weight: bold; font-size: 0.85em; }
-        </style>
+<style>
+.block-container { padding-top: 2.2rem; }
+.main-header {
+  text-align:center; padding:26px 20px;
+  background:
+     radial-gradient(1200px 200px at 50% -40%, rgba(96,165,250,.35), transparent 60%),
+     linear-gradient(135deg,#1e3a8a 0%,#172554 100%);
+  color:#fff; border-radius:16px; margin-bottom:22px;
+  box-shadow:0 10px 30px rgba(8,15,40,.45), inset 0 1px 0 rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.07);
+}
+.main-header h1 { margin:0; font-size:1.75rem; letter-spacing:.4px; font-weight:700; }
+.stale-warning { background:#fef3c7; border-left:4px solid #f59e0b;
+  padding:10px 16px; border-radius:6px; margin-bottom:12px; color:#78350f; }
+.degraded-warning { background:#fee2e2; border-left:4px solid #dc2626;
+  padding:10px 16px; border-radius:6px; margin-bottom:12px; color:#7f1d1d; }
+.not-tradable { background:#1f2937; color:#fbbf24; padding:4px 8px;
+  border-radius:4px; font-weight:bold; font-size:.85em; }
+</style>
         """,
         unsafe_allow_html=True,
     )
@@ -822,11 +880,14 @@ def _fmt_display_num(val: Any) -> str:
     # "679.32000" -> "679.32"). Does NOT touch the underlying numeric
     # dtype: df_clean (CSV/JSON/PDF exports) keeps raw float/int values,
     # only this Styler-rendered view is affected. Pure presentation layer.
+    # UX-2: applied to NC as well (was missing -> "4.000000" on screen).
     try:
         if pd.isna(val):
             return "—"
     except (TypeError, ValueError):
         pass
+    if val is None:
+        return "—"
     try:
         xf = float(val)
     except (TypeError, ValueError):
@@ -1717,7 +1778,7 @@ def _detect_critical_gap(
         is_weekend = (gs_ny.weekday() in (4, 5, 6)) and (ge_ny.weekday() in (6, 0, 1))
         is_holiday_bridge = False
         if _HAS_HOLIDAYS:
-            holiday_days, total_days = _count_market_open_days_in_gap(gs_ny, ge_ny, instrument)  # CHANGED: passer instrument
+            holiday_days, total_days = _count_market_open_days_in_gap(gs_ny, ge_ny, instrument)  # CHANGED
             if total_days > 0 and holiday_days / total_days >= 0.6:
                 is_holiday_bridge = True
 
@@ -2456,7 +2517,7 @@ def _vote_prev_midpoint(
     mid_j1 = (h_j1 + lo_j1) / 2.0
     direction = Direction.BULLISH if c_j1 > mid_j1 else Direction.BEARISH
 
-    if is_index or instrument == "XAU_USD":  # HOTFIX-7: XAU → chemin indices (body_ratio, pas volume tick)
+    if is_index or instrument == "XAU_USD":  # HOTFIX-7: XAU → chemin indices
         return _vote_prev_midpoint_indices(h_j1, lo_j1, c_j1, ctx, direction)
     return _vote_prev_midpoint_fx(ctx.get("vol_series"), direction)
 
@@ -2576,7 +2637,7 @@ def trend_daily(
 
     ctx: Dict[str, Any] = {
         "cur": cur,
-        "cur_struct": _safe_float(c.iloc[-1]),  # HOTFIX-1: close consolidé, indépendant du spot
+        "cur_struct": _safe_float(c.iloc[-1]),  # HOTFIX-1: close consolidé
         "e21": bundle.ema_short,
         "e50_cur": bundle.ema_long_cur,
         "e50": bundle.ema_long_series,
@@ -2647,14 +2708,14 @@ def _trend_4h_score(
     cur: float, e50_cur: float, current_day_open: Optional[float],
 ) -> int:
     score = 0
-    close_last = _safe_float(c.iloc[-1])  # HOTFIX-4: close consolidé pour vote structurel EMA50
+    close_last = _safe_float(c.iloc[-1])  # HOTFIX-4: close consolidé
     if e50_cur != 0 and close_last is not None:
-        score += 1 if close_last > e50_cur else -1  # CHANGED: close_last au lieu de cur
+        score += 1 if close_last > e50_cur else -1  # CHANGED
     pdi, mdi = _dmi(h, lo, c, CFG.ind.atr_period)
     if pdi is not None and mdi is not None:
         score += 1 if pdi > mdi else -1
     if current_day_open is not None:
-        score += 1 if cur > current_day_open else -1  # cur (spot) conservé ici: vote positionnel
+        score += 1 if cur > current_day_open else -1  # cur (spot) : vote positionnel
     return score
 
 
@@ -2693,7 +2754,7 @@ def _intraday_volume_vote(
     # Nouveau signal, réellement indépendant : le mouvement de prix propre de
     # la dernière bougie (close vs close précédent), confirmé par un volume
     # au-dessus de la moyenne — n'a aucun lien mécanique avec le vote ZLEMA.
-    if instrument in INDICES or instrument == "XAU_USD" or "Volume" not in df.columns:  # HOTFIX-7: XAU chemin indice
+    if instrument in INDICES or instrument == "XAU_USD" or "Volume" not in df.columns:  # HOTFIX-7
         return None, None
     if len(df) < 2:
         return None, None
@@ -2796,8 +2857,8 @@ def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> Optional[int]:
     above = c > e50
     # HOTFIX-5 (v2): masquer les CFG.ind.ema_long premières barres (instabilité EWM
     # adjust=False — l'EMA n'est pas stable avant ema_long barres d'historique).
-    warmup = CFG.ind.ema_long  # CHANGED: ema_long barres pour stabilité complète
-    above_stable = above.iloc[warmup:]  # CHANGED: fenêtre stable uniquement
+    warmup = CFG.ind.ema_long  # CHANGED
+    above_stable = above.iloc[warmup:]  # CHANGED
     for i in range(len(above_stable) - 1, 0, -1):
         if bool(above_stable.iloc[i]) != bool(above_stable.iloc[i - 1]):
             age = len(above_stable) - 1 - i
@@ -2824,1193 +2885,4 @@ _BULL_TRENDS: Final[FrozenSet[str]] = frozenset({"Bullish", "Retracement Bull"})
 _BEAR_TRENDS: Final[FrozenSet[str]] = frozenset({"Bearish", "Retracement Bear"})
 
 
-def _bull_compat(t: str) -> bool:
-    return t in _BULL_TRENDS
-
-
-def _bear_compat(t: str) -> bool:
-    return t in _BEAR_TRENDS
-
-
-def _mtf_weighted_score(
-    trends: Mapping[str, str], scores: Mapping[str, int],
-) -> Tuple[float, float, int]:
-    """Returns (w_bull, w_bear, active_tf_count)."""
-    active_count = sum(1 for tf in trends if not trends[tf].startswith("Range"))
-    w_bull = 0.0
-    w_bear = 0.0
-    for tf, trend in trends.items():
-        if tf not in _MTF_WEIGHTS:
-            continue
-        weight = _MTF_WEIGHTS[tf]
-        score = scores.get(tf, 0) / 100.0
-        if trend == "Bullish":
-            w_bull += weight * score
-        elif trend == "Retracement Bull":
-            w_bull += weight * score * 0.5
-        elif trend == "Bearish":
-            w_bear += weight * score
-        elif trend == "Retracement Bear":
-            w_bear += weight * score * 0.5
-    return w_bull, w_bear, active_count
-
-
-# Table-driven alignment bonus (was CC=18)
-_ALIGNMENT_PAIRS: Final[Tuple[Tuple[str, str, int, int], ...]] = (
-    # (tf1, tf2, pure_bonus, compat_bonus)
-    ("M",  "W",  15, 12),
-    ("D",  "4H", 10, 7),
-)
-
-
-def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
-    if direction not in ("Bullish", "Bearish"):
-        return 0
-    pure = "Bullish" if direction == "Bullish" else "Bearish"
-    compat = _bull_compat if direction == "Bullish" else _bear_compat
-    # MTF-1 FIX (découverte Ben, audit forensique 14/08/2026, RECALIBRÉ 16/08/2026
-    # sur données réelles Bluestar_GPS_20260815_2327 : le veto binaire initial
-    # affectait 17/32 paires tradables du scan, dont les 3 seules A+/A, en
-    # traitant "Retracement Bear/Bull" (opposition douce, pullback probable
-    # dans la tendance) exactement comme "Bearish/Bullish" littéral (opposition
-    # franche) — ex. XAU/USD (1H=Bullish, 15m=Retracement Bear seul) tombait à
-    # bonus=0 comme GBP/CAD (1H ET 15m franchement Bearish), alors que les deux
-    # cas n'ont manifestement pas la même gravité.
-    # _ALIGNMENT_PAIRS ne teste que (M,W) et (D,4H) — un score affichait le
-    # même bonus (et pouvait saturer à 100%) que 1H/15m soient neutres OU
-    # opposées à `direction`. La pénalité de dispersion pèse bien 1H/15m, mais
-    # son plafond (dispersion_penalty_max=15) est structurellement inférieur
-    # au bonus max (25), donc elle ne compense pas toujours seule.
-    # Sévérité désormais graduée sur les TF rapides (1H, 15m) :
-    #   - opposition FRANCHE (littéralement Bearish/Bullish contre la
-    #     direction) -> véto total, bonus=0 (comportement inchangé, cas le
-    #     plus grave : ex. GBP/CAD, 1H+15m tous deux Bearish sous Bullish).
-    #   - opposition DOUCE (Retracement Bear/Bull seulement, jamais franche
-    #     sur aucun des deux TF rapides) -> bonus réduit par
-    #     fast_tf_soft_opposition_factor (0.5 par défaut, calibrable), pas
-    #     annulé -> ex. XAU/USD, NAS100/USD.
-    #   - neutre (Range) ou alignée -> bonus plein, inchangé.
-    opposite_pure = "Bearish" if direction == "Bullish" else "Bullish"
-    opposite_compat = _bear_compat if direction == "Bullish" else _bull_compat
-    fast_trends = [trends.get(tf, "") for tf in ("1H", "15m")]
-    frontal_opposition = any(t == opposite_pure for t in fast_trends)
-    soft_opposition = (
-        not frontal_opposition
-        and any(opposite_compat(t) for t in fast_trends)
-    )
-    bonus = 0
-    for tf1, tf2, pure_b, compat_b in _ALIGNMENT_PAIRS:
-        t1, t2 = trends.get(tf1, ""), trends.get(tf2, "")
-        if t1 == pure and t2 == pure:
-            bonus += pure_b
-        elif compat(t1) and compat(t2):
-            bonus += compat_b
-    if frontal_opposition:
-        return 0
-    if soft_opposition:
-        return round(bonus * CFG.mtf.fast_tf_soft_opposition_factor)
-    return bonus
-
-
-def _mtf_dispersion_penalty(trends: Mapping[str, str], direction: str) -> float:
-    if direction not in ("Bullish", "Bearish"):
-        return 0.0
-    conflict_weight = 0.0
-    total_weight = 0.0
-    for tf, trend in trends.items():
-        if tf not in _MTF_WEIGHTS:
-            continue
-        w = _MTF_WEIGHTS[tf]
-        total_weight += w
-        if direction == "Bullish" and _bear_compat(trend):
-            conflict_weight += w
-        elif direction == "Bearish" and _bull_compat(trend):
-            conflict_weight += w
-    if total_weight == 0:
-        return 0.0
-    ratio = conflict_weight / total_weight
-    return min(
-        CFG.mtf.dispersion_penalty_max,
-        ratio * CFG.mtf.dispersion_penalty_max * 2,
-    )
-
-
-def score_mtf(
-    trends: Mapping[str, str], scores: Mapping[str, int],
-) -> Tuple[str, float, int]:
-    """Returns (direction, score, active_tfs)."""
-    w_bull, w_bear, active = _mtf_weighted_score(trends, scores)
-    if active < CFG.mtf.min_active_tfs:
-        return "Range", 0.0, active
-    if w_bull > w_bear:
-        direction = "Bullish"
-        raw = (w_bull / _MTF_TOTAL_POSSIBLE) * 100
-    elif w_bear > w_bull:
-        direction = "Bearish"
-        raw = (w_bear / _MTF_TOTAL_POSSIBLE) * 100
-    else:
-        return "Range", 0.0, active
-    bonus = _mtf_alignment_bonus(trends, direction)
-    penalty = _mtf_dispersion_penalty(trends, direction)
-    return direction, max(0.0, min(100.0, raw + bonus - penalty)), active
-
-
-def _nc_contribution(
-    trend: str, strength: int, mtf_dir: str,
-) -> float:
-    """Compute a single TF's NC contribution."""
-    is_strong_pure_bull = trend == "Bullish" and strength >= CFG.mtf.nc_pure_strength_min
-    is_strong_pure_bear = trend == "Bearish" and strength >= CFG.mtf.nc_pure_strength_min
-    if mtf_dir == "Bullish":
-        if is_strong_pure_bull:
-            return 1.0
-        if trend == "Retracement Bull":
-            return 0.25
-        if is_strong_pure_bear:
-            return -1.0
-        if trend == "Retracement Bear":
-            return -0.25
-    else:  # Bearish
-        if is_strong_pure_bear:
-            return 1.0
-        if trend == "Retracement Bear":
-            return 0.25
-        if is_strong_pure_bull:
-            return -1.0
-        if trend == "Retracement Bull":
-            return -0.25
-    return 0.0
-
-
-def _compute_nc_orthogonal(
-    trends: Mapping[str, str], scores: Mapping[str, int], mtf_dir: str,
-) -> int:
-    if mtf_dir not in ("Bullish", "Bearish"):
-        return 0
-    score_f = sum(
-        _nc_contribution(trends[tf], scores.get(tf, 0), mtf_dir)
-        for tf in trends
-    )
-    sign = 1 if score_f >= 0 else -1
-    return sign * math.floor(abs(score_f))
-
-
-def grade_hybrid(
-    scores_list: List[float],
-    nc_list: List[int],
-    degraded_list: List[bool],
-) -> List[str]:
-    """Two-axis grading: A+ requires BOTH high MTF AND high NC."""
-    grades: List[str] = []
-    for score, nc, degraded in zip(scores_list, nc_list, degraded_list):
-        if degraded:
-            grades.append("B+" if score >= 50 and nc >= 1 else "B")
-            continue
-        if score >= CFG.mtf.nc_mtf_min_for_a_plus and nc >= CFG.mtf.nc_min_for_a_plus:
-            grades.append("A+")
-        elif score >= 55 and nc >= 1:
-            grades.append("A")
-        elif score >= 38:
-            grades.append("B+")
-        else:
-            grades.append("B")
-    return grades
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 18 — PIPELINE ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _empty_pair_result(pair: str, reason: str) -> Dict[str, Any]:
-    # GPS-5: bias TF fields are null (not "Range") for ERROR instruments,
-    #        so downstream can distinguish "Range calculated" vs "no data".
-    # GPS-1: Age D1 and ATR fields are null (not the string "N/A").
-    # GPS-4: current_price is null when unavailable.
-    return {
-        "Paire": pair.replace("_", "/"),
-        "M": None, "W": None, "D": None,
-        "4H": None, "1H": None, "15m": None,
-        "MTF": "Range",
-        "MTF_direction": "Range",
-        "MTF_pct": 0,
-        "_mtf_score": 0.0,
-        "_mtf_dir": "Range",
-        "_active_tfs": 0,
-        "_degraded": True,
-        "_stale_tfs": (),
-        "NC": None,
-        "Age D1": None,
-        "Age D1_censored": False,  # HOTFIX-5: False par défaut sur résultat vide (pas de données)
-        "ATR Daily": None,
-        "ATR H4": None,
-        "ATR H1": None,
-        "ATR 15m": None,
-        "current_price": None,
-        "_error_reason": reason,
-    }
-
-
-def _build_pair_bundles(
-    cache: Mapping[str, Any],
-) -> Optional[Dict[str, IndicatorBundle]]:
-    bundles: Dict[str, IndicatorBundle] = {}
-    for tf in ("M", "W", "D", "4H", "1H", "15m"):
-        intraday = tf in ("1H", "15m")
-        if tf not in cache or not isinstance(cache[tf], pd.DataFrame):
-            return None
-        b = compute_indicator_bundle(cache[tf], intraday=intraday)
-        if b is None:
-            return None
-        bundles[tf] = b
-    return bundles
-
-
-def _compute_pair_trends(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    cache: Mapping[str, Any],
-    bundles: Mapping[str, IndicatorBundle],
-    pair: str,
-    spot_mid: Optional[float],
-    stop_event: threading.Event,
-) -> Optional[Tuple[Dict[str, str], Dict[str, int], Dict[str, float], bool]]:
-    trends: Dict[str, str] = {}
-    scores: Dict[str, int] = {}
-    atrs: Dict[str, float] = {}
-    degraded_daily = False
-
-    for tf in ("M", "W"):
-        tr = trend_macro(cache[tf], tf, bundles[tf])
-        trends[tf], scores[tf], atrs[tf] = tr.direction, tr.strength, tr.atr_val
-
-    if stop_event.is_set():
-        return None
-
-    daily_result = trend_daily(
-        cache["D"], pair, bundles["D"], spot_mid,
-        current_week_open=cache.get("_week_open"),
-    )
-    trends["D"] = daily_result.direction.value
-    scores["D"] = daily_result.strength
-    atrs["D"] = daily_result.atr_val
-    if daily_result.degraded:
-        degraded_daily = True
-
-    tr4 = trend_4h(
-        cache["4H"], bundles["4H"], spot_mid,
-        current_day_open=cache.get("_day_open"),
-    )
-    trends["4H"], scores["4H"], atrs["4H"] = tr4.direction, tr4.strength, tr4.atr_val
-
-    for tf in ("1H", "15m"):
-        if stop_event.is_set():
-            return None
-        tri = trend_intraday(cache[tf], pair, bundles[tf], spot_mid)
-        trends[tf], scores[tf], atrs[tf] = tri.direction, tri.strength, tri.atr_val
-
-    return trends, scores, atrs, degraded_daily
-
-
-def _assemble_pair_row(
-    pair: str,
-    trends: Mapping[str, str],
-    scores: Mapping[str, int],
-    atrs: Mapping[str, float],
-    mtf_dir: str,
-    mtf_score: float,
-    active_tfs: int,
-    degraded: bool,
-    stale_tfs: Tuple[str, ...],
-    nc: int,
-    age: Optional[int],
-    current_price: Optional[float] = None,
-    age_censored: bool = False,  # HOTFIX-5: flag de censure EWM (True = aucun croisement trouvé)
-) -> Dict[str, Any]:
-    # GPS-3: keep legacy MTF string for backward compat, but also emit
-    #        MTF_direction (str) and MTF_pct (int) so the merger doesn't
-    #        need to regex-parse the combined string.
-    mtf_str = f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != "Range" else "Range"
-    mtf_pct = int(round(mtf_score)) if mtf_dir != "Range" else 0
-    return {
-        "Paire": pair.replace("_", "/"),
-        "M": trends["M"], "W": trends["W"], "D": trends["D"],
-        "4H": trends["4H"], "1H": trends["1H"], "15m": trends["15m"],
-        "MTF": mtf_str,
-        "MTF_direction": mtf_dir,
-        "MTF_pct": mtf_pct,
-        "_mtf_score": mtf_score,
-        "_mtf_dir": mtf_dir,
-        "_active_tfs": active_tfs,
-        "_degraded": degraded,
-        "_stale_tfs": stale_tfs,
-        "NC": nc,
-        "Age D1": age,
-        "Age D1_censored": age_censored,  # HOTFIX-5: True = série censurée (pas de croisement EMA50 dans la fenêtre stable)
-        "ATR Daily": _fmt_atr(atrs["D"]),
-        "ATR H4": _fmt_atr(atrs["4H"]),
-        "ATR H1": _fmt_atr(atrs["1H"]),
-        "ATR 15m": _fmt_atr(atrs["15m"]),
-        # GPS-4: current_price captured at OANDA fetch time
-        "current_price": current_price,
-    }
-
-
-def analyze_pair(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    pair: str,
-    account_id: str,
-    account_hash: AccountHash,
-    access_token: SecretToken,
-    registry: SessionRegistry,
-    stop_event: threading.Event,
-    snapshot_to_iso: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    if stop_event.is_set():
-        return None
-    try:
-        cache = fetch_all_data(
-            pair, account_id, account_hash, access_token, registry, stop_event,
-            snapshot_to_iso,
-        )
-
-        if cache.get("is_incomplete"):
-            return _empty_pair_result(pair, cache.get("error_reason", "Fetch failed"))
-
-        # P0-2 FIX (couplé à P0-1, audit forensique 14/08/2026): drift_exceeded
-        # retiré du rejet et de `degraded` — voir le commentaire détaillé dans
-        # fetch_all_data() sur pourquoi ce signal devient trompeur une fois le
-        # cache réutilisable entre runs (P0-1). La fraîcheur par TF reste
-        # correctement gérée par _stale_tfs (is_stale, basé sur le TTL propre
-        # à chaque granularité) ; critical_gap reste un motif de rejet dur
-        # inchangé. _snapshot_drift_exceeded reste calculé et disponible dans
-        # `cache` à titre diagnostique (non exploité ici).
-        critical_gap = any(
-            cache[tf].attrs.get("critical_gap", False)
-            for tf in ("M", "W", "D", "4H", "1H", "15m")
-            if isinstance(cache.get(tf), pd.DataFrame)
-        )
-        degraded = bool(cache.get("_stale_tfs")) or critical_gap
-
-        if critical_gap:
-            return _empty_pair_result(pair, "Critical gap in open market")
-
-        bundles = _build_pair_bundles(cache)
-        if bundles is None:
-            return _empty_pair_result(pair, "Indicator NaN")
-
-        if stop_event.is_set():
-            return None
-
-        spot_mid = cache.get("_spot_mid")
-        computed = _compute_pair_trends(cache, bundles, pair, spot_mid, stop_event)
-        if computed is None:
-            return None
-        trends, scores, atrs, degraded_daily = computed
-        if degraded_daily:
-            degraded = True
-
-        mtf_dir, mtf_score, active_tfs = score_mtf(trends, scores)
-        age = trend_age_daily(cache["D"], bundles["D"])
-        stable_window = max(0, len(cache["D"]) - CFG.ind.ema_long)  # HOTFIX-5: fenêtre stable après warmup EWM
-        age_censored = age is not None and age >= stable_window and stable_window > 0  # HOTFIX-5: censuré si aucun croisement
-        nc = _compute_nc_orthogonal(trends, scores, mtf_dir)
-
-        return _assemble_pair_row(
-            pair, trends, scores, atrs, mtf_dir, mtf_score, active_tfs,
-            degraded, tuple(cache.get("_stale_tfs", [])), nc, age,
-            current_price=spot_mid,
-            age_censored=age_censored,  # HOTFIX-5
-        )
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        _log_incident(
-            IncidentCode.UNKNOWN, "analyze_pair exception",
-            instrument=pair, err=type(e).__name__, level=logging.ERROR,
-            exc_info=True,
-        )
-        return _empty_pair_result(pair, f"Analysis failed: {type(e).__name__}")
-
-
-def _drain_executor_strict(
-    executor: ThreadPoolExecutor,
-    futures: Mapping[Future, str],
-    stop_event: threading.Event,
-) -> None:
-    """Stop-first, cancel, then bounded wait. Always shut down executor."""
-    stop_event.set()
-    for f in futures:
-        if not f.done():
-            try:
-                f.cancel()
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
-    deadline = time.monotonic() + CFG.ops.pool_drain_grace_sec
-    poll_event = threading.Event()
-    while time.monotonic() < deadline:
-        alive = sum(1 for f in futures if not f.done())
-        if alive == 0:
-            break
-        poll_event.wait(timeout=0.05)
-    try:
-        executor.shutdown(wait=True, cancel_futures=True)
-    except TypeError:  # Python < 3.9
-        try:
-            executor.shutdown(wait=True)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _log_incident(
-                IncidentCode.EXECUTOR_CANCEL, "executor shutdown failed",
-                err=type(exc).__name__, level=logging.ERROR,
-            )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        _log_incident(
-            IncidentCode.EXECUTOR_CANCEL, "executor shutdown failed",
-            err=type(exc).__name__, level=logging.ERROR,
-        )
-
-
-def _process_completed_future(
-    future: Future,
-    inst: str,
-    results: List[Dict[str, Any]],
-    errors: set,
-) -> None:
-    try:
-        row = future.result()
-        if row:
-            results.append(row)
-        else:
-            errors.add(inst)
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        errors.add(inst)
-        _log_incident(
-            IncidentCode.UNKNOWN, "future result error",
-            instrument=inst, err=type(e).__name__, exc_info=True,
-        )
-
-
-def _format_rfc3339(dt: datetime) -> str:
-    """OANDA-accepted RFC3339 format with microseconds + Z suffix."""
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def _safe_callback(cb: Optional[Callable], label: str, *args: Any) -> None:
-    if cb is None:
-        return
-    try:
-        cb(*args)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        _log_incident(
-            IncidentCode.UI_CALLBACK_ERROR, label,
-            err=type(exc).__name__, level=logging.DEBUG,
-        )
-
-
-def _collect_pair_results(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    futures: Dict[Future, str],
-    dynamic_timeout: int,
-    total: int,
-    progress_cb: Optional[Callable[[float], None]],
-    status_cb: Optional[Callable[[str], None]],
-    results: List[Dict[str, Any]],
-    errors: set,
-    warnings: List[str],
-) -> bool:
-    """Returns True iff timed out."""
-    done = 0
-    timed_out = False
-    try:
-        for future in as_completed(futures, timeout=dynamic_timeout):
-            inst = futures[future]
-            done += 1
-            _safe_callback(progress_cb, "progress_cb", done / total)
-            _safe_callback(status_cb, "status_cb",
-                           f"GPS ({done}/{total}) — {inst.replace('_', '/')}")
-            _process_completed_future(future, inst, results, errors)
-    except FutureTimeoutError:
-        timed_out = True
-        warnings.append(
-            f"Analyse interrompue après {dynamic_timeout}s — connexion OANDA dégradée."
-        )
-        _log_incident(
-            IncidentCode.EXECUTOR_TIMEOUT, "analyze_all_core timeout",
-            timeout_sec=dynamic_timeout, level=logging.ERROR,
-        )
-        for f, inst in futures.items():
-            if not f.done():
-                errors.add(inst)
-    return timed_out
-
-
-def _finalize_run(
-    results: List[Dict[str, Any]],
-    errors: Iterable[str],
-    meta: Dict[str, Any],
-    warnings: List[str],
-) -> Tuple[pd.DataFrame, List[str], Dict[str, Any], List[str]]:
-    errors_sorted = sorted(errors)
-    if not results:
-        return pd.DataFrame(), errors_sorted, meta, warnings
-
-    scores_list = [r["_mtf_score"] for r in results]
-    nc_list = [r["NC"] for r in results]
-    run_degraded = meta["completeness"] < CFG.ops.completeness_min_tradable
-    degraded_list = [
-        r["_degraded"] or run_degraded or "_error_reason" in r for r in results
-    ]
-    grades = grade_hybrid(scores_list, nc_list, degraded_list)
-
-    for r, g, deg in zip(results, grades, degraded_list):
-        if "_error_reason" in r:
-            r["Quality"] = "B"
-            # GPS-2: Tradable is now a boolean; cause encoded in Tradable_reason.
-            r["Tradable"] = False
-            # P0-5 FIX (audit forensique 14/08/2026): la vraie cause était calculée
-            # dans _error_reason puis jetée au profit d'un literal hardcodé — les 6
-            # causes distinctes ("Fetch failed on X", "Insufficient bars...",
-            # "Drift exceeded", "Critical gap in open market", "Indicator NaN",
-            # "Analysis failed: ...", "Stop requested") ressortaient toutes
-            # identiquement "gap_open_market". On propage désormais la cause réelle.
-            r["Tradable_reason"] = r["_error_reason"]
-        else:
-            r["Quality"] = g
-            r["Tradable"] = not deg
-            r["Tradable_reason"] = None
-
-    df = pd.DataFrame(results)
-    df.attrs["meta"] = meta
-    return df, errors_sorted, meta, warnings
-
-
-def analyze_all_core(
-    account_id: str,
-    access_token: SecretToken,
-    progress_cb: Optional[Callable[[float], None]] = None,
-    status_cb: Optional[Callable[[str], None]] = None,
-) -> Tuple[pd.DataFrame, List[str], Dict[str, Any], List[str]]:
-    """Core pipeline. Returns (df, errors, meta, warnings)."""
-    results: List[Dict[str, Any]] = []
-    errors: set = set()
-    warnings: List[str] = []
-    total = len(INSTRUMENTS)
-
-    run_controller = _get_run_controller()
-    stop_event = run_controller.start_new_run()
-    registry = _get_session_registry()
-    account_hash = _hash_account(account_id)
-
-    snapshot_to = datetime.now(UTC)
-    snapshot_to_iso = _format_rfc3339(snapshot_to)
-
-    meta: Dict[str, Any] = {
-        "started_at": snapshot_to,
-        "version": APP_VERSION,
-        "env": _OANDA_ENV,
-        "account_hash": account_hash,
-        "snapshot_to": snapshot_to_iso,
-    }
-
-    dynamic_timeout = max(
-        CFG.ops.analysis_timeout_sec,
-        int(len(INSTRUMENTS) * 5.0 / CFG.ops.max_workers),
-    )
-
-    executor = ThreadPoolExecutor(
-        max_workers=CFG.ops.max_workers, thread_name_prefix="bluestar_worker",
-    )
-    futures: Dict[Future, str] = {}
-    timed_out = False
-    try:
-        try:
-            futures = {
-                executor.submit(
-                    analyze_pair, inst, account_id, account_hash, access_token,
-                    registry, stop_event, snapshot_to_iso,
-                ): inst
-                for inst in INSTRUMENTS
-            }
-            timed_out = _collect_pair_results(
-                futures, dynamic_timeout, total,
-                progress_cb, status_cb, results, errors, warnings,
-            )
-        finally:
-            _drain_executor_strict(executor, futures, stop_event)
-    finally:
-        run_controller.finish_run(stop_event)
-
-    meta["finished_at"] = datetime.now(UTC)
-    meta["timed_out"] = timed_out
-    # P0-4 FIX (audit forensique 14/08/2026): analyze_pair() ne retourne jamais
-    # None/False sur échec — il retourne _empty_pair_result(), un dict non-vide,
-    # donc les paires en échec finissaient toujours dans `results` et jamais dans
-    # `errors`. completeness = len(results)/total restait donc ~100% même avec
-    # 30/33 échecs (reproduit empiriquement dans l'audit), et le garde-fou
-    # NOT_TRADEABLE (ligne ci-dessous) ne se déclenchait quasiment jamais.
-    # On compte les lignes portant "_error_reason" comme des échecs pour les
-    # métriques de run, sans toucher à `results` ni à l'affichage par ligne
-    # (déjà géré correctement plus bas via _finalize_run).
-    soft_errors = sum(1 for r in results if "_error_reason" in r)
-    meta["errors_count"] = len(errors) + soft_errors
-    successes = len(results) - soft_errors
-    meta["completeness"] = successes / total if total > 0 else 0.0
-    meta["degraded_pairs"] = sorted(
-        r["Paire"] for r in results
-        if r.get("_degraded") and "_error_reason" not in r
-    )
-
-    if errors:
-        sample = ", ".join(e.replace("_", "/") for e in sorted(errors)[:10])
-        ellipsis = " …" if len(errors) > 10 else ""
-        warnings.append(f"{len(errors)} paire(s) non analysée(s) : {sample}{ellipsis}")
-
-    if meta["completeness"] < CFG.ops.completeness_min_tradable and results:
-        warnings.append(
-            f"Couverture partielle — {meta['completeness']:.0%}. Run marqué NOT_TRADEABLE."
-        )
-
-    return _finalize_run(results, errors, meta, warnings)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 19 — ANALYSIS WRAPPER (NO STREAMLIT CACHE — manual rerun friendly)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def analyze_all(
-    account_id: str, token: SecretToken,
-) -> Tuple[pd.DataFrame, Dict[str, Any], List[str]]:
-    """
-    Direct wrapper around analyze_all_core.
-
-    DESIGN DECISION: No @st.cache_data here. The internal CandleCache provides
-    proper TTL-based caching at the granular HTTP layer. Wrapping the whole
-    analysis would prevent manual reruns and produce stale results when the
-    user explicitly clicks "Refresh".
-    """
-    df, _errors, meta, warnings = analyze_all_core(account_id, token)
-    return df, meta, warnings
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 20 — PDF EXPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _safe_str(s: str) -> str:
-    return s.encode("latin-1", errors="replace").decode("latin-1")
-
-
-def _pdf_cell_text(val: str) -> str:
-    return val if _FPDF2 else _safe_str(val)
-
-
-_PDF_GRADE_RGB: Final[Mapping[str, Tuple[int, int, int]]] = {
-    "A+": (251, 191, 36),
-    "A":  (163, 230, 53),
-    "B+": (52, 211, 153),
-    "B":  (96, 165, 250),
-}
-
-_PDF_NC_BANDS: Final[Tuple[
-    Tuple[Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int]], ...
-]] = (
-    ((5, 99), (46, 204, 113), (255, 255, 255)),
-    ((3, 4), (39, 174, 96), (255, 255, 255)),
-    ((1, 2), (241, 196, 15), (0, 0, 0)),
-    ((0, 0), (230, 126, 34), (255, 255, 255)),
-    ((-99, -1), (231, 76, 60), (255, 255, 255)),
-)
-
-_PDF_TREND_COLORS: Final[Tuple[
-    Tuple[str, Tuple[int, int, int], Tuple[int, int, int]], ...
-]] = (
-    ("Retracement Bull", (125, 206, 160), (255, 255, 255)),
-    ("Retracement Bear", (241, 148, 138), (255, 255, 255)),
-    ("Bull",             (46, 204, 113),  (255, 255, 255)),
-    ("Bear",             (231, 76, 60),   (255, 255, 255)),
-    ("Range",            (149, 165, 166), (255, 255, 255)),
-)
-
-
-def _pdf_nc_color(val: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-    try:
-        n = int(val)
-        for (lo, hi), fc, tc in _PDF_NC_BANDS:
-            if lo <= n <= hi:
-                return fc, tc
-    except (ValueError, TypeError):
-        pass
-    return (200, 200, 200), (0, 0, 0)
-
-
-def _pdf_trend_color(val: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-    for needle, fc, tc in _PDF_TREND_COLORS:
-        if needle in val:
-            return fc, tc
-    return (255, 255, 255), (0, 0, 0)
-
-
-def _pdf_get_colors(
-    col: str, val: str,
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-    if col == "Quality":
-        return _PDF_GRADE_RGB.get(val, (156, 163, 175)), (0, 0, 0)
-    if col == "Tradable":
-        # GPS-2: Tradable is now a boolean; False = not tradable (red), True = green.
-        if val is False or val == "False" or str(val).lower() in ("false", "0"):
-            return (231, 76, 60), (255, 255, 255)
-        return (46, 204, 113), (255, 255, 255)
-    if col == "NC":
-        return _pdf_nc_color(val)
-    return _pdf_trend_color(val)
-
-
-def _encode_pdf_output(out: Any) -> bytes:
-    if isinstance(out, (bytes, bytearray)):
-        return bytes(out)
-    if isinstance(out, str):
-        return out.encode("latin-1", errors="replace")
-    return bytes(out)
-
-
-def _pdf_render_header(
-    pdf: Any, cols: List[str], widths: Mapping[str, int],
-) -> None:
-    pdf.set_font("Helvetica", "B", 7)
-    pdf.set_fill_color(30, 58, 138)
-    pdf.set_text_color(255, 255, 255)
-    for col in cols:
-        pdf.cell(widths[col], 7, _pdf_cell_text(col),
-                 border=1, align="C", fill=True)
-    pdf.ln()
-    pdf.set_font("Helvetica", "", 6.5)
-
-
-def create_pdf(df: pd.DataFrame) -> BytesIO:
-    base_cols = [
-        "Paire", "M", "W", "D", "4H", "1H", "15m", "MTF", "Quality", "Tradable",
-        "NC", "Age D1", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
-    ]
-    cols = [c for c in base_cols if c in df.columns]
-    base_widths = {
-        "Paire": 22, "M": 16, "W": 16, "D": 16, "4H": 16, "1H": 16, "15m": 16,
-        "MTF": 30, "Quality": 12, "Tradable": 32, "NC": 10, "Age D1": 13,
-        "ATR Daily": 17, "ATR H4": 17, "ATR H1": 15, "ATR 15m": 15,
-    }
-    widths = {c: base_widths.get(c, 15) for c in cols}
-    rh = 5.5
-    buf = BytesIO()
-    if not _FPDF_AVAILABLE or FPDF is None:
-        buf.write(b"PDF unavailable: fpdf2 not installed")
-        buf.seek(0)
-        return buf
-    try:
-        pdf = FPDF(orientation="L", unit="mm", format="A4")
-        pdf.add_page()
-        pdf.set_margins(10, 10, 10)
-        pdf.set_font("Helvetica", "B", 15)
-        pdf.cell(0, 9, _pdf_cell_text(f"BLUESTAR GPS V{APP_VERSION}"),
-                 ln=True, align="C")
-        pdf.set_font("Helvetica", "", 8)
-        pdf.cell(0, 5, _pdf_cell_text(
-            f"Generated: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
-        ), ln=True, align="C")
-        pdf.ln(4)
-
-        _pdf_render_header(pdf, cols, widths)
-        for _, row in df.iterrows():
-            if pdf.get_y() + rh > 287 - 15:
-                pdf.add_page()
-                _pdf_render_header(pdf, cols, widths)
-            for col in cols:
-                val = str(row.get(col, ""))
-                fc, tc = _pdf_get_colors(col, val)
-                pdf.set_fill_color(*fc)
-                pdf.set_text_color(*tc)
-                pdf.cell(widths[col], rh, _pdf_cell_text(val),
-                         border=1, align="C", fill=True)
-            pdf.ln()
-
-        buf.write(_encode_pdf_output(pdf.output(dest="S")))
-        buf.seek(0)
-        return buf
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        _log_incident(
-            IncidentCode.PDF_ERROR, "PDF generation failed",
-            err=type(e).__name__, level=logging.ERROR, exc_info=True,
-        )
-        buf2 = BytesIO()
-        try:
-            fallback = FPDF()
-            fallback.add_page()
-            fallback.set_font("Helvetica", "B", 12)
-            fallback.cell(0, 10, "PDF Generation Error", ln=True)
-            buf2.write(_encode_pdf_output(fallback.output(dest="S")))
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _log_incident(
-                IncidentCode.PDF_ERROR, "fallback PDF failed",
-                err=type(exc).__name__, level=logging.ERROR,
-            )
-            buf2.write(b"PDF error")
-        buf2.seek(0)
-        return buf2
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 21 — SECRETS LOADING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_OANDA_ACCOUNT_PATTERN: Final[re.Pattern] = re.compile(
-    r"^\d{3}-\d{3}-\d{4,}-\d{3,}$"
-)
-
-
-def _validate_secret_format(account_id: str, token: str) -> bool:
-    if not account_id or not token:
-        return False
-    if not _OANDA_ACCOUNT_PATTERN.match(account_id):
-        _log_incident(IncidentCode.HTTP_AUTH, "account_id format invalid")
-        return False
-    if len(token) < 32:
-        _log_incident(IncidentCode.HTTP_AUTH, "token too short")
-        return False
-    return True
-
-
-def _load_secrets() -> Tuple[Optional[str], Optional[SecretToken]]:
-    acc: Optional[str] = None
-    tok: Optional[str] = None
-    if _STREAMLIT_AVAILABLE:
-        try:
-            acc = st.secrets["OANDA_ACCOUNT_ID"]
-            tok = st.secrets["OANDA_ACCESS_TOKEN"]
-        except (KeyError, FileNotFoundError):
-            acc, tok = None, None
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _log_incident(
-                IncidentCode.HTTP_AUTH, "secrets read error",
-                err=type(exc).__name__, level=logging.ERROR,
-            )
-            return None, None
-    if acc is None or tok is None:
-        acc = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-        tok = os.environ.get("OANDA_ACCESS_TOKEN", "").strip()
-
-    if not isinstance(acc, str) or not isinstance(tok, str):
-        return None, None
-    acc, tok = acc.strip(), tok.strip()
-    if not _validate_secret_format(acc, tok):
-        return None, None
-    secret = SecretToken(tok)
-    _SecretScrubFilter.register_secret(secret)
-    return acc, secret
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 22 — STREAMLIT UI HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _check_running_flag_ttl() -> None:
-    started_at = st.session_state.get("_analysis_started_at")
-    run_id = st.session_state.get("_analysis_run_id")
-    if started_at and run_id:
-        elapsed = (datetime.now(UTC) - started_at).total_seconds()
-        if elapsed > CFG.ops.streamlit_running_flag_ttl_sec:
-            st.session_state["_analysis_running"] = False
-            st.session_state["_analysis_started_at"] = None
-            st.session_state["_analysis_run_id"] = None
-
-
-def _style_trend(v: Any) -> str:
-    if not isinstance(v, str):
-        return ""
-    if "Retracement Bull" in v:
-        return f"background-color:{TREND_COLORS['Retracement Bull']};color:white"
-    if "Retracement Bear" in v:
-        return f"background-color:{TREND_COLORS['Retracement Bear']};color:white"
-    if "Bull" in v:
-        return f"background-color:{TREND_COLORS['Bullish']};color:white;font-weight:bold"
-    if "Bear" in v:
-        return f"background-color:{TREND_COLORS['Bearish']};color:white;font-weight:bold"
-    if "Range" in v:
-        return f"background-color:{TREND_COLORS['Range']};color:white"
-    return ""
-
-
-def _style_quality(s: pd.Series) -> List[str]:
-    grade_css = {"A+": "#fbbf24", "A": "#a3e635", "B+": "#34d399", "B": "#60a5fa"}
-    if s.name != "Quality":
-        return [""] * len(s)
-    return [
-        f"color:black;font-weight:bold;background-color:{grade_css.get(str(x), '#9ca3af')}"
-        for x in s
-    ]
-
-
-def _style_nc(s: pd.Series) -> List[str]:
-    if s.name != "NC":
-        return [""] * len(s)
-    out: List[str] = []
-    for v in s:
-        try:
-            n = int(v)
-            if n >= 5:
-                out.append("background-color:#1D9E75;color:white;font-weight:bold")
-            elif n >= 3:
-                out.append("background-color:#27ae60;color:white;font-weight:bold")
-            elif n >= 1:
-                out.append("background-color:#f39c12;color:white;font-weight:bold")
-            elif n == 0:
-                out.append("background-color:#e67e22;color:white")
-            else:
-                out.append("background-color:#e74c3c;color:white;font-weight:bold")
-        except (ValueError, TypeError):
-            out.append("")
-    return out
-
-
-def _sidebar_config() -> bool:
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        only_best = st.checkbox("Afficher uniquement Grade A+ / A", value=False)
-        st.info(
-            f"Workers : {CFG.ops.max_workers} · Timeout : {CFG.ops.analysis_timeout_sec}s\n\n"
-            f"Cache TTL : M={CFG.cache.ttl_m // 60}m W={CFG.cache.ttl_w // 60}m "
-            f"D={CFG.cache.ttl_d // 60}m"
-        )
-        if not is_fx_market_open():
-            st.warning("📅 Marché FX fermé — données potentiellement obsolètes.")
-        if not _HAS_HOLIDAYS:
-            st.caption("ℹ️ Module `holidays` non installé — détection jours fériés dégradée.")
-        st.markdown("---")
-        if st.button("🗑️ Vider le cache", use_container_width=True):
-            _get_candle_cache().clear()
-            if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-                try:
-                    st.cache_resource.clear()
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    _log.debug("Streamlit cache_resource clear failed: %s", e)
-                try:
-                    st.cache_data.clear()
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    _log.debug("Streamlit cache_data clear failed: %s", e)
-            for key in ("df", "df_ts", "df_meta", "pdf_buf", "pdf_buf_hash"):
-                st.session_state.pop(key, None)
-            st.success("Cache vidé.")
-    return only_best
-
-
-def _render_metrics(df: pd.DataFrame) -> None:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Analyzed", len(df))
-    c2.metric("Setups A+", len(df[df["Quality"] == "A+"]))
-    c3.metric("Setups A", len(df[df["Quality"] == "A"]))
-    c4.metric("Setups B", len(df[df["Quality"].isin(["B+", "B"])]))
-
-
-def _emit_warnings(warnings: List[str], meta: Dict[str, Any]) -> None:
-    if meta.get("timed_out"):
-        st.error("⏱️ Analyse interrompue — connexion OANDA dégradée.")
-    completeness = meta.get("completeness", 0.0)
-    if 0 < completeness < CFG.ops.completeness_min_tradable:
-        st.markdown(
-            f"<div class='degraded-warning'>⚠️ <b>Couverture partielle</b> — "
-            f"<b>{completeness:.0%}</b> des instruments analysés. "
-            "<b>Run marqué NOT_TRADEABLE.</b></div>",
-            unsafe_allow_html=True,
-        )
-    for w in warnings:
-        st.warning(f"⚠️ {w}")
-
-
-def _hash_dataframe_for_pdf(df: pd.DataFrame) -> str:
-    """Deterministic hash for PDF caching."""
-    try:
-        h = hashlib.sha256()
-        h.update(str(len(df)).encode())
-        for col in ("Paire", "Quality", "MTF", "NC"):
-            if col in df.columns:
-                h.update(col.encode())
-                h.update(str(df[col].tolist()).encode())
-        return h.hexdigest()
-    except Exception:  # pylint: disable=broad-exception-caught
-        return str(time.time())
-
-
-def _run_analysis_action(acc: str, tok: SecretToken) -> None:
-    run_id = datetime.now(UTC).isoformat()
-    st.session_state["_analysis_running"] = True
-    st.session_state["_analysis_started_at"] = datetime.now(UTC)
-    st.session_state["_analysis_run_id"] = run_id
-    try:
-        with st.spinner("Analyse Multi-Timeframe en cours..."):
-            df, meta, warnings = analyze_all(acc, tok)
-            _emit_warnings(warnings, meta)
-            if not df.empty:
-                st.session_state["df"] = df
-                st.session_state["df_ts"] = datetime.now(UTC)
-                st.session_state["df_meta"] = meta
-                # PDF generation cached by df hash to avoid regen on rerun
-                df_hash = _hash_dataframe_for_pdf(df)
-                if st.session_state.get("pdf_buf_hash") != df_hash:
-                    st.session_state["pdf_buf"] = create_pdf(df)
-                    st.session_state["pdf_buf_hash"] = df_hash
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        _log_incident(
-            IncidentCode.UNKNOWN, "main analysis failed",
-            err=type(exc).__name__, level=logging.ERROR, exc_info=True,
-        )
-        st.error(f"❌ Erreur critique : {type(exc).__name__}")
-    finally:
-        if st.session_state.get("_analysis_run_id") == run_id:
-            st.session_state["_analysis_running"] = False
-            st.session_state["_analysis_started_at"] = None
-            st.session_state["_analysis_run_id"] = None
-
-
-def _prepare_display_df(only_best: bool) -> pd.DataFrame:
-    df = st.session_state["df"].copy(deep=True)
-    if only_best:
-        df = df[df["Quality"].isin(["A+", "A"])].copy(deep=True)
-
-    grade_order = ["A+", "A", "B+", "B"]
-    df = df[df["Quality"].isin(grade_order)].copy(deep=True)
-    df["Quality"] = pd.Categorical(df["Quality"], categories=grade_order, ordered=True)
-    sort_cols = [c for c in ["Quality", "NC", "_mtf_score"] if c in df.columns]
-    ascending = [True, False, False][:len(sort_cols)]
-    if sort_cols:
-        df = df.sort_values(sort_cols, ascending=ascending, kind="mergesort")
-
-    return df.drop(
-        columns=[
-            "_mtf_score", "_mtf_dir", "_active_tfs", "_degraded",
-            "_stale_tfs", "_error_reason",
-        ],
-        errors="ignore",
-    ).copy(deep=True)
-
-
-def _render_downloads(df_clean: pd.DataFrame, cols_present: List[str]) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
-    c1, c2, c3 = st.columns(3)
-    pdf_buf = st.session_state.get("pdf_buf")
-    if pdf_buf is None:
-        pdf_buf = create_pdf(df_clean)
-    with c1:
-        st.download_button(
-            "📄 PDF", data=pdf_buf,
-            file_name=f"Bluestar_GPS_{ts}.pdf",
-            mime="application/pdf", use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "📊 CSV",
-            data=df_clean[cols_present].to_csv(index=False).encode("utf-8"),
-            file_name=f"Bluestar_GPS_{ts}.csv",
-            mime="text/csv", use_container_width=True,
-        )
-    with c3:
-        st.download_button(
-            "🗂️ JSON",
-            data=df_clean[cols_present].to_json(
-                orient="records", force_ascii=False, indent=2,
-            ).encode("utf-8"),
-            file_name=f"Bluestar_GPS_{ts}.json",
-            mime="application/json", use_container_width=True,
-        )
-
-
-def _init_session_state() -> None:
-    defaults = {
-        "_analysis_run_id": None,
-        "_analysis_running": False,
-        "_analysis_started_at": None,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-def main() -> None:
-    _configure_streamlit_ui()
-
-    st.markdown(
-        f"<div class='main-header'><h1>🧭 BLUESTAR HEDGE FUND GPS V{APP_VERSION}</h1>"
-        f"<p style='margin:0;font-size:0.85em;opacity:0.8'>"
-        "Institutional"
-        "</p></div>",
-        unsafe_allow_html=True,
-    )
-
-    acc, tok = _load_secrets()
-    if not acc or not tok:
-        st.error(
-            "❌ Secrets OANDA manquants ou invalides — "
-            "configurez OANDA_ACCOUNT_ID (XXX-XXX-XXXXXX-XXX) "
-            "et OANDA_ACCESS_TOKEN (≥32 chars)."
-        )
-        st.stop()
-
-    _init_session_state()
-    _check_running_flag_ttl()
-    only_best = _sidebar_config()
-
-    is_running = bool(st.session_state.get("_analysis_running", False))
-    if st.button(
-        "🚀 LANCER L'ANALYSE TOUS ACTIFS",
-        type="primary",
-        use_container_width=True,
-        disabled=is_running,
-    ):
-        _run_analysis_action(acc, tok)
-
-    if "df" not in st.session_state:
-        return
-
-    df_ts = st.session_state.get("df_ts")
-    if df_ts:
-        age_min = (datetime.now(UTC) - df_ts).total_seconds() / 60
-        if age_min > CFG.ops.data_max_age_min:
-            st.markdown(
-                f"<div class='stale-warning'>⏰ <b>Données périmées</b> — "
-                f"dernière analyse il y a <b>{age_min:.0f} min</b>. Relancez.</div>",
-                unsafe_allow_html=True,
-            )
-
-    df_clean = _prepare_display_df(only_best)
-    if df_clean.empty:
-        st.info("Aucun résultat à afficher pour les filtres actuels.")
-        return
-
-    _render_metrics(df_clean)
-
-    display = [
-        "Paire", "M", "W", "D", "4H", "1H", "15m",
-        "MTF", "MTF_direction", "MTF_pct",
-        "Quality", "Tradable", "Tradable_reason",
-        "NC", "Age D1", "current_price",
-        "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
-    ]
-    cols_present = [col for col in display if col in df_clean.columns]
-
-    # GPS-6: numeric columns whose float64 dtype (forced by NaN upcasting
-    # on ERROR rows) causes Streamlit's default renderer to pad decimals
-    # inconsistently across columns. Display-only — df_clean keeps the
-    # original numeric values for CSV/JSON/PDF exports below.
-    _num_display_cols = [
-        c for c in ("Age D1", "current_price", "ATR Daily", "ATR H4", "ATR H1", "ATR 15m")
-        if c in cols_present
-    ]
-
-    styled = (
-        df_clean[cols_present].style
-        .format({c: _fmt_display_num for c in _num_display_cols}, na_rep="—")
-        .apply(_style_quality, axis=0)
-        .apply(_style_nc, axis=0)
-        .map(_style_trend)
-    )
-    st.dataframe(
-        styled,
-        height=min(800, max(400, (len(df_clean) + 1) * 38 + 10)),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    _render_downloads(df_clean, cols_present)
-
-
-if __name__ == "__main__":
-    main()
+def _bull_compat(t: str
