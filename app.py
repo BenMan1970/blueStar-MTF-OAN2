@@ -1846,8 +1846,6 @@ def _parse_oanda_json(
         return []
 
     is_index = instrument in INDICES
-    market_open = is_fx_market_open()
-    allow_zero_volume = is_index or not market_open
 
     rows: List[Dict[str, Any]] = []
     total = 0
@@ -1861,6 +1859,23 @@ def _parse_oanda_json(
         if not include_incomplete and not candle.get("complete"):
             continue
         total += 1
+        # Volume=0 n'est légitime que si LA BOUGIE elle-même est tombée hors
+        # marché — pas si le marché est fermé au moment de l'appel API. Un
+        # flag global basé sur "maintenant" relâcherait la validation pour
+        # tout le lot (potentiellement des mois d'historique) dès que le scan
+        # tourne un week-end ou en dehors des heures de marché.
+        candle_dt = None
+        time_raw = candle.get("time")
+        if isinstance(time_raw, str):
+            try:
+                ts = pd.Timestamp(time_raw)
+                candle_dt = (ts.tz_localize("UTC") if ts.tzinfo is None else ts).to_pydatetime()
+            except (ValueError, TypeError):
+                candle_dt = None
+        market_open_at_candle = (
+            is_fx_market_open(candle_dt) if candle_dt is not None else True
+        )
+        allow_zero_volume = is_index or not market_open_at_candle
         row = _parse_candle_row(candle, allow_zero_volume)
         if row is None:
             errors += 1
@@ -3108,7 +3123,11 @@ def analyze_pair(
             for tf in ("M", "W", "D", "4H", "1H", "15m")
             if isinstance(cache.get(tf), pd.DataFrame)
         )
-        degraded = bool(cache.get("_stale_tfs")) or critical_gap
+        degraded = (
+            bool(cache.get("_stale_tfs"))
+            or critical_gap
+            or bool(cache.get("_snapshot_drift_exceeded"))
+        )
 
         if critical_gap:
             return _empty_pair_result(pair, "Critical gap in open market")
