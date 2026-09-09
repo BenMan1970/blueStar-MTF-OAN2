@@ -1,23 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V9.1.0 PRODUCTION-GRADE                           ║
+║  BLUESTAR HEDGE FUND GPS — V9.3.0 PRODUCTION-GRADE                           ║
 ║                                                                              ║
-║  Base fonctionnelle : V9.0.0-PROD-GRADE (inchangée — aucune régression sur   ║
-║  la couche data, cache, votes, MTF, NC, grading).                            ║
+║  Base fonctionnelle : V9.1.0 (couche data, cache, votes, MTF, NC,            ║
+║  grading inchangée hors corrections ci-dessous).                             ║
 ║                                                                              ║
-║  Corrections V9.1.0 (cosmétique / cohérence sortie — zéro régression) :      ║
-║    • UX-1  Rendu tableau "premium" HTML (chips, badges, barre MTF, sticky)   ║
-║    • UX-2  NC / Age D1 : typage Int64 nullable -> plus de "4.000000"         ║
-║    • UX-3  Tri unique sort_results() : Grade > Tradable > NC > MTF% > Paire  ║
-║            appliqué au pipeline, à l'écran, au PDF et aux exports            ║
-║    • UX-4  PDF : largeurs recalibrées (279mm -> 275mm <= 277mm utiles)       ║
-║    • UX-5  PDF : saut de page A4 PAYSAGE (210mm, pas 287mm) + en-tête répété ║
-║    • UX-6  PDF : valeurs formatées (entiers, OUI/NON, "-" si absent)         ║
-║    • UX-7  JSON : sérialisation explicite (NA -> null, numpy -> natif)       ║
-║    • UX-8  JSON/CSV : export de Age D1_censored (calculé mais jamais exporté)║
-║    • UX-9  PDF aligné sur la vue affichée (même filtre, même tri)            ║
-║    • UX-10 grade_hybrid() durci contre NC=None (défensif, iso-comportement)  ║
+║  V9.3.0 — doctrine « direction seule » (audit empirique OANDA                ║
+║  practice : 33 instruments, 4 ans de bougies 2022-10 → 2026-09,              ║
+║  rejeu de 1 097 runs jour par jour) :                                        ║
+║  • AUCUN calendrier dans le MTF — week-end, fériés, pauses et                ║
+║    tolérances de gap sont retirés (v9.2.0 inclus) : ces décisions            ║
+║    appartiennent au module calendrier du pipeline amont.                     ║
+║  • Retirés : détection de gap critique + table de tolérances,                ║
+║    exemptions calendaires v9.2.0, kill-switch de couverture,                 ║
+║    champ critical_gap, dépendance holidays (pytz/oandapyV20 et               ║
+║    is_market_holiday_for déjà retirés en v9.2.0).                            ║
+║  • Chaque paire reçoit sa direction calculée sur les données                 ║
+║    disponibles — jamais remplacée par une ligne vide pour motif              ║
+║    calendaire.                                                               ║
+║  • Flags de qualité de données par paire (TF obsolètes, dérive               ║
+║    snapshot, D1 en repli, fetch incomplet, indicateurs NaN) :                ║
+║    seuls motifs de Tradable=false ; raison jamais null.                      ║
+║  • Export JSON enveloppe {meta, assets} pour merge_app >= 3.6.2 ;            ║
+║    liste plate toujours acceptée.                                            ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -43,7 +49,7 @@ from concurrent.futures import (
     as_completed,
 )
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from io import BytesIO
 from typing import (
@@ -325,7 +331,7 @@ def _log_incident(
 # SECTION 3 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION: Final[str] = "9.1.0-PROD-GRADE"
+APP_VERSION: Final[str] = "9.3.0-PROD-GRADE"
 
 _OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
 OANDA_API_URL: Final[str] = (
@@ -456,7 +462,6 @@ class OperationalConfig:
     streamlit_running_flag_ttl_sec: int = 300
     max_workers: int = 5
     pool_drain_grace_sec: float = 10.0
-    completeness_min_tradable: float = 0.85
     prior_run_drain_timeout_sec: float = 3.0
 
 
@@ -500,15 +505,6 @@ _LIVE_OPEN_MAX_AGE: Final[Mapping[str, pd.Timedelta]] = {
     "H4": pd.Timedelta(hours=4),
     "H1": pd.Timedelta(hours=1),
     "M15": pd.Timedelta(minutes=15),
-}
-
-_GAP_TOLERANCE: Final[Mapping[str, pd.Timedelta]] = {
-    "M": pd.Timedelta(days=45),
-    "W": pd.Timedelta(days=10),
-    "D": pd.Timedelta(days=4),
-    "H4": pd.Timedelta(hours=12),
-    "H1": pd.Timedelta(hours=6),
-    "M15": pd.Timedelta(hours=2),
 }
 
 TREND_COLORS: Final[Mapping[str, str]] = {
@@ -650,7 +646,6 @@ class FetchResult:
     df: pd.DataFrame
     is_stale: bool = False
     fetched_at: Optional[datetime] = None
-    critical_gap: bool = False
 
 
 @dataclass(frozen=True)
@@ -696,21 +691,6 @@ _FX_FULL_CLOSURE_HOLIDAYS_US: Final[FrozenSet[str]] = frozenset({
 
 
 @functools.lru_cache(maxsize=8)
-def _get_us_holiday_set(year: int) -> FrozenSet[Any]:
-    """Cached US market holiday set for fast lookup."""
-    if not _HAS_HOLIDAYS or _holidays_lib is None:
-        return frozenset()
-    try:
-        return frozenset(_holidays_lib.country_holidays("US", years=[year]).keys())
-    except Exception as exc:
-        _log_incident(
-            IncidentCode.DATA_VALIDATION, "holiday lookup failed",
-            year=year, err=type(exc).__name__, level=logging.DEBUG,
-        )
-        return frozenset()
-
-
-@functools.lru_cache(maxsize=8)
 def _get_us_holiday_map(year: int) -> Mapping[Any, str]:
     """Date → holiday name map."""
     if not _HAS_HOLIDAYS or _holidays_lib is None:
@@ -719,39 +699,6 @@ def _get_us_holiday_map(year: int) -> Mapping[Any, str]:
         return dict(_holidays_lib.country_holidays("US", years=[year]))
     except Exception:
         return {}
-
-
-def is_us_market_holiday(dt: datetime) -> bool:
-    """True if `dt` is a US public holiday (NY local date)."""
-    if not _HAS_HOLIDAYS:
-        return False
-    ny_dt = dt.astimezone(NY_TZ)
-    return ny_dt.date() in _get_us_holiday_set(ny_dt.year)
-
-
-@functools.lru_cache(maxsize=8)
-def _get_de_holiday_set(year: int) -> FrozenSet[Any]:
-    """Cached German market holiday set for DE30_EUR."""
-    if not _HAS_HOLIDAYS or _holidays_lib is None:
-        return frozenset()
-    try:
-        return frozenset(_holidays_lib.country_holidays("DE", years=[year]).keys())
-    except Exception as exc:
-        _log_incident(
-            IncidentCode.DATA_VALIDATION, "DE holiday lookup failed",
-            year=year, err=type(exc).__name__, level=logging.DEBUG,
-        )
-        return frozenset()
-
-
-def is_market_holiday_for(instrument: str, dt: datetime) -> bool:
-    """True if `dt` is a market holiday for `instrument`."""
-    if not _HAS_HOLIDAYS:
-        return False
-    if instrument == "DE30_EUR":
-        de_dt = dt.astimezone(ZoneInfo("Europe/Berlin"))
-        return de_dt.date() in _get_de_holiday_set(de_dt.year)
-    return is_us_market_holiday(dt)
 
 
 def _is_weekend_closed(wd: int, hr: int) -> bool:
@@ -1295,7 +1242,6 @@ class CandleCache:
         df = _defensive_copy(entry[1])
         return FetchResult(
             df=df, is_stale=False, fetched_at=entry[0],
-            critical_gap=bool(df.attrs.get("critical_gap", False)),
         )
 
     def _build_stale_result(
@@ -1304,7 +1250,6 @@ class CandleCache:
         df = _defensive_copy(entry[1])
         return FetchResult(
             df=df, is_stale=True, fetched_at=entry[0],
-            critical_gap=bool(df.attrs.get("critical_gap", False)),
         )
 
     def get_candles(
@@ -1358,7 +1303,6 @@ class CandleCache:
                         df=_defensive_copy(handoff.df),
                         is_stale=handoff.is_stale,
                         fetched_at=handoff.fetched_at,
-                        critical_gap=handoff.critical_gap,
                     )
             entry = self._data.get(key)
             if entry is not None:
@@ -1406,12 +1350,10 @@ class CandleCache:
                         datetime.now(UTC),
                         FetchResult(
                             df=result.df, is_stale=False, fetched_at=ts,
-                            critical_gap=result.critical_gap,
                         ),
                     )
                 return FetchResult(
                     df=_defensive_copy(result.df), is_stale=False, fetched_at=ts,
-                    critical_gap=result.critical_gap,
                 )
 
             with self._lock:
@@ -1428,7 +1370,6 @@ class CandleCache:
                             datetime.now(UTC),
                             FetchResult(
                                 df=stale[1], is_stale=True, fetched_at=stale[0],
-                                critical_gap=bool(stale[1].attrs.get("critical_gap", False)),
                             ),
                         )
                         return stale_result
@@ -1680,85 +1621,6 @@ def _validate_dataframe_schema(
     return True
 
 
-def _count_market_open_days_in_gap(
-    gs_ny: datetime, ge_ny: datetime,
-    instrument: str = "",
-) -> Tuple[int, int]:
-    current = gs_ny.date()
-    end_date = ge_ny.date()
-    holiday_or_weekend = 0
-    total = 0
-    _get_holiday_set = (
-        _get_de_holiday_set if instrument == "DE30_EUR" else _get_us_holiday_set
-    )
-    try:
-        while current <= end_date and total < 10:
-            if current.weekday() >= 5 or current in _get_holiday_set(current.year):
-                holiday_or_weekend += 1
-            total += 1
-            current = current + timedelta(days=1)
-    except (TypeError, ValueError) as exc:
-        _log_incident(
-            IncidentCode.DATA_VALIDATION, "holiday-bridge scan failed",
-            err=type(exc).__name__, level=logging.DEBUG,
-        )
-    return holiday_or_weekend, total
-
-
-def _detect_critical_gap(
-    df: pd.DataFrame, granularity: str, instrument: str,
-) -> bool:
-    if len(df) < 2:
-        return False
-    tolerance = _GAP_TOLERANCE.get(granularity)
-    if tolerance is None:
-        return False
-    deltas = df.index.to_series().diff().dropna()
-    if deltas.empty:
-        return False
-    candidate_gaps = deltas[deltas > tolerance]
-    if candidate_gaps.empty:
-        return False
-
-    for max_idx, max_gap in candidate_gaps.items():
-        gap_start_utc = max_idx - max_gap
-        gap_end_utc = max_idx
-        try:
-            gs_ny = gap_start_utc.tz_convert(NY_TZ)
-            ge_ny = gap_end_utc.tz_convert(NY_TZ)
-        except (TypeError, AttributeError):
-            try:
-                gs_ny = gap_start_utc.to_pydatetime().astimezone(NY_TZ)
-                ge_ny = gap_end_utc.to_pydatetime().astimezone(NY_TZ)
-            except Exception:
-                return True
-
-        is_weekend = (gs_ny.weekday() in (4, 5, 6)) and (ge_ny.weekday() in (6, 0, 1))
-        is_holiday_bridge = False
-        if _HAS_HOLIDAYS:
-            holiday_days, total_days = _count_market_open_days_in_gap(gs_ny, ge_ny, instrument)
-            if total_days > 0 and holiday_days / total_days >= 0.6:
-                is_holiday_bridge = True
-
-        if is_weekend or is_holiday_bridge:
-            _log_incident(
-                IncidentCode.DATA_GAPS, "tolerated weekend/holiday gap",
-                instrument=instrument, granularity=granularity,
-                max_gap_sec=int(max_gap.total_seconds()), level=logging.INFO,
-            )
-            continue
-
-        _log_incident(
-            IncidentCode.DATA_GAPS, "critical gap during market open",
-            instrument=instrument, granularity=granularity,
-            max_gap_sec=int(max_gap.total_seconds()),
-            tolerance_sec=int(tolerance.total_seconds()),
-        )
-        return True
-
-    return False
-
-
 def _fallback_bid_ask(candle: Any) -> Optional[Dict[str, float]]:
     if not isinstance(candle, dict):
         return None
@@ -2008,8 +1870,6 @@ def _fetch_candles_raw(
     if not _validate_dataframe_schema(df, instrument, granularity):
         return FetchResult(df=pd.DataFrame())
 
-    critical_gap = _detect_critical_gap(df, granularity, instrument)
-    df.attrs["critical_gap"] = critical_gap
     df.attrs["instrument"] = instrument
     df.attrs["granularity"] = granularity
 
@@ -2017,7 +1877,6 @@ def _fetch_candles_raw(
         df=df,
         is_stale=False,
         fetched_at=datetime.now(UTC),
-        critical_gap=critical_gap,
     )
 
 
@@ -2987,6 +2846,7 @@ def _empty_pair_result(pair: str, reason: str) -> Dict[str, Any]:
         "_active_tfs": 0,
         "_degraded": True,
         "_stale_tfs": (),
+        "_degraded_reasons": (reason,),
         "NC": None,
         "Age D1": None,
         "Age D1_censored": False,
@@ -3072,6 +2932,7 @@ def _assemble_pair_row(
     age: Optional[int],
     current_price: Optional[float] = None,
     age_censored: bool = False,
+    degraded_reasons: Tuple[str, ...] = (),
 ) -> Dict[str, Any]:
     mtf_str = f"{mtf_dir} ({mtf_score:.0f}%)" if mtf_dir != "Range" else "Range"
     mtf_pct = int(round(mtf_score)) if mtf_dir != "Range" else 0
@@ -3087,6 +2948,7 @@ def _assemble_pair_row(
         "_active_tfs": active_tfs,
         "_degraded": degraded,
         "_stale_tfs": stale_tfs,
+        "_degraded_reasons": degraded_reasons,
         "NC": int(nc),
         "Age D1": age,
         "Age D1_censored": age_censored,
@@ -3118,19 +2980,16 @@ def analyze_pair(
         if cache.get("is_incomplete"):
             return _empty_pair_result(pair, cache.get("error_reason", "Fetch failed"))
 
-        critical_gap = any(
-            cache[tf].attrs.get("critical_gap", False)
-            for tf in ("M", "W", "D", "4H", "1H", "15m")
-            if isinstance(cache.get(tf), pd.DataFrame)
-        )
-        degraded = (
-            bool(cache.get("_stale_tfs"))
-            or critical_gap
-            or bool(cache.get("_snapshot_drift_exceeded"))
-        )
-
-        if critical_gap:
-            return _empty_pair_result(pair, "Critical gap in open market")
+        degraded_reasons: List[str] = []
+        if cache.get("_stale_tfs"):
+            degraded_reasons.append(
+                "Données obsolètes : " + ", ".join(str(t) for t in cache["_stale_tfs"])
+            )
+        if cache.get("_snapshot_drift_exceeded"):
+            degraded_reasons.append(
+                "Dérive de snapshot > %.0f s" % CFG.ops.snapshot_drift_max_sec
+            )
+        degraded = bool(degraded_reasons)
 
         bundles = _build_pair_bundles(cache)
         if bundles is None:
@@ -3146,6 +3005,7 @@ def analyze_pair(
         trends, scores, atrs, degraded_daily = computed
         if degraded_daily:
             degraded = True
+            degraded_reasons.append("Bougie D1 dégradée (repli)")
 
         mtf_dir, mtf_score, active_tfs = score_mtf(trends, scores)
         age = trend_age_daily(cache["D"], bundles["D"])
@@ -3158,6 +3018,7 @@ def analyze_pair(
             degraded, tuple(cache.get("_stale_tfs", [])), nc, age,
             current_price=spot_mid,
             age_censored=age_censored,
+            degraded_reasons=tuple(degraded_reasons),
         )
     except Exception as e:
         _log_incident(
@@ -3353,9 +3214,8 @@ def _finalize_run(
 
     scores_list = [r["_mtf_score"] for r in results]
     nc_list = [r["NC"] for r in results]
-    run_degraded = meta["completeness"] < CFG.ops.completeness_min_tradable
     degraded_list = [
-        r["_degraded"] or run_degraded or "_error_reason" in r for r in results
+        bool(r["_degraded"] or "_error_reason" in r) for r in results
     ]
     grades = grade_hybrid(scores_list, nc_list, degraded_list)
 
@@ -3366,8 +3226,13 @@ def _finalize_run(
             r["Tradable_reason"] = r["_error_reason"]
         else:
             r["Quality"] = g
-            r["Tradable"] = not deg
-            r["Tradable_reason"] = None
+            pair_degraded = bool(r.get("_degraded"))
+            r["Tradable"] = not pair_degraded
+            if pair_degraded:
+                reasons = [x for x in (r.get("_degraded_reasons") or []) if x]
+                r["Tradable_reason"] = "; ".join(reasons) or "Paire dégradée"
+            else:
+                r["Tradable_reason"] = None
 
     df = pd.DataFrame(results)
     df = _coerce_output_dtypes(df)
@@ -3447,11 +3312,6 @@ def analyze_all_core(
         ellipsis = " …" if len(errors) > 10 else ""
         warnings.append(f"{len(errors)} paire(s) non analysée(s) : {sample}{ellipsis}")
 
-    if meta["completeness"] < CFG.ops.completeness_min_tradable and results:
-        warnings.append(
-            f"Couverture partielle — {meta['completeness']:.0%}. Run marqué NOT_TRADEABLE."
-        )
-
     return _finalize_run(results, errors, meta, warnings)
 
 
@@ -3507,9 +3367,27 @@ def build_export_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return records
 
 
+def _export_meta(df: pd.DataFrame) -> Dict[str, Any]:
+    raw = df.attrs.get("meta") or {}
+    out: Dict[str, Any] = {"scanner": "BLUESTAR-GPS"}
+    for k in (
+        "version", "env", "account_hash", "snapshot_to", "completeness",
+        "errors_count", "degraded_pairs", "timed_out",
+    ):
+        if k in raw:
+            out[k] = _json_scalar(raw[k])
+    if "version" in out:
+        out["scanner_version"] = out.pop("version")
+    return out
+
+
 def export_json(df: pd.DataFrame) -> bytes:
+    payload = {
+        "meta": _export_meta(df),
+        "assets": build_export_records(df),
+    }
     return json.dumps(
-        build_export_records(df), ensure_ascii=False, indent=2, allow_nan=False,
+        payload, ensure_ascii=False, indent=2, allow_nan=False,
     ).encode("utf-8")
 
 
@@ -4160,8 +4038,6 @@ def _sidebar_config() -> Tuple[bool, bool]:
         )
         if not is_fx_market_open():
             st.warning("📅 Marché FX fermé — données potentiellement obsolètes.")
-        if not _HAS_HOLIDAYS:
-            st.caption("ℹ️ Module `holidays` non installé — détection jours fériés dégradée.")
         st.markdown("---")
         if st.button("🗑️ Vider le cache", use_container_width=True):
             _get_candle_cache().clear()
@@ -4196,11 +4072,10 @@ def _emit_warnings(warnings: List[str], meta: Dict[str, Any]) -> None:
     if meta.get("timed_out"):
         st.error("⏱️ Analyse interrompue — connexion OANDA dégradée.")
     completeness = meta.get("completeness", 0.0)
-    if 0 < completeness < CFG.ops.completeness_min_tradable:
+    if completeness < 1.0:
         st.markdown(
-            f"<div class='degraded-warning'>⚠️ <b>Couverture partielle</b> — "
-            f"<b>{completeness:.0%}</b> des instruments analysés. "
-            "<b>Run marqué NOT_TRADEABLE.</b></div>",
+            f"<div class='degraded-warning'>ℹ️ <b>Couverture</b> : "
+            f"<b>{completeness:.0%}</b> des instruments analysés.</div>",
             unsafe_allow_html=True,
         )
     for w in warnings:
