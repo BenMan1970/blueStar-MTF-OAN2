@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V9.3.0 PRODUCTION-GRADE                           ║
+║  BLUESTAR HEDGE FUND GPS — V9.3.4 PRODUCTION-GRADE                           ║
 ║                                                                              ║
 ║  Base fonctionnelle : V9.1.0 (couche data, cache, votes, MTF, NC,            ║
 ║  grading inchangée hors corrections ci-dessous).                             ║
 ║                                                                              ║
-║  V9.3.0 — doctrine « direction seule » (audit empirique OANDA                ║
+║  V9.3.4 — doctrine « direction seule » (audit empirique OANDA                ║
 ║  practice : 33 instruments, 4 ans de bougies 2022-10 → 2026-09,              ║
 ║  rejeu de 1 097 runs jour par jour) :                                        ║
 ║  • AUCUN calendrier dans le MTF — week-end, fériés, pauses et                ║
@@ -227,7 +227,18 @@ class _SecretScrubFilter(logging.Filter):
         except (TypeError, ValueError) as exc:
             record.msg = f"[SCRUB_ERROR:{type(exc).__name__}]"
             record.args = ()
+        if record.exc_info:
+            try:
+                record.exc_text = self.scrub_text(
+                    _LOG_FORMATTER_STATIC.formatException(record.exc_info)
+                )
+            except Exception:  # noqa: BLE001
+                record.exc_text = None
+            record.exc_info = None
         return True
+
+
+_LOG_FORMATTER_STATIC: Final[logging.Formatter] = logging.Formatter()
 
 
 def _setup_logging() -> logging.Logger:
@@ -246,6 +257,12 @@ def _setup_logging() -> logging.Logger:
         )
         handler.addFilter(_SecretScrubFilter())
         root.addHandler(handler)
+
+    for _h in root.handlers:
+        if not any(
+            isinstance(f, _SecretScrubFilter) for f in _h.filters
+        ):
+            _h.addFilter(_SecretScrubFilter())
 
     log_level = os.environ.get("BLUESTAR_LOG_LEVEL", "WARNING").upper()
     root.setLevel(getattr(logging, log_level, logging.WARNING))
@@ -331,7 +348,7 @@ def _log_incident(
 # SECTION 3 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION: Final[str] = "9.3.0-PROD-GRADE"
+APP_VERSION: Final[str] = "9.3.4-PROD-GRADE"
 
 _OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
 OANDA_API_URL: Final[str] = (
@@ -448,7 +465,7 @@ class MtfConfig:
 class BarsConfig:
     min_bars_m: int = 60
     min_bars_w: int = 50
-    min_bars_d: int = 60
+    min_bars_d: int = 61
     min_bars_h4: int = 60
     min_bars_h1: int = 100
     min_bars_15m: int = 100
@@ -663,21 +680,7 @@ class IndicatorBundle:
     zlema: float
     has_nan: bool
     has_momentum_nan: bool = False
-
-
-@dataclass(frozen=True)
-class OandaCredentials:
-    """Account credentials with safe hashing."""
-    account_id: str
-    token: SecretToken
-
-    def __hash__(self) -> int:
-        return hash((self.account_id, self.token))
-
-    def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, OandaCredentials):
-            return False
-        return self.account_id == other.account_id and self.token == other.token
+    has_intraday_nan: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -931,6 +934,9 @@ def _build_bundle(
 ) -> IndicatorBundle:
     has_nan = any(v is None for v in (atr_v, e_short, e_long_cur))
     has_momentum_nan = any(v is None for v in (rsi_v, macd_v, signal_v))
+    has_intraday_nan = any(
+        v is None for v in (intra_fast, intra_long, zlema_v)
+    )
     return IndicatorBundle(
         atr_val=atr_v if atr_v is not None else 0.0,
         ema_short=e_short if e_short is not None else 0.0,
@@ -944,6 +950,7 @@ def _build_bundle(
         zlema=zlema_v if zlema_v is not None else 0.0,
         has_nan=has_nan,
         has_momentum_nan=has_momentum_nan,
+        has_intraday_nan=has_intraday_nan,
     )
 
 
@@ -1181,7 +1188,7 @@ def _get_session_registry() -> SessionRegistry:
 # SECTION 10 — CACHE ENGINE (LRU, single-flight, TTL-cleaned handoffs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CacheKey = Tuple[str, AccountHash, str, str, int]
+CacheKey = Tuple[str, AccountHash, str, str, int, int]
 LiveOpenKey = Tuple[str, AccountHash, str, str]
 PricingKey = Tuple[str, AccountHash, str]
 
@@ -1295,7 +1302,7 @@ class CandleCache:
                 key=str(key[2:]),
             )
         with self._lock:
-            handoff_entry = self._inflight_results.pop(key, None)
+            handoff_entry = self._inflight_results.get(key, None)
             if handoff_entry is not None:
                 _, handoff = handoff_entry
                 if not handoff.df.empty:
@@ -1694,18 +1701,38 @@ def _parse_candle_row(
     return row
 
 
+_TO_BUCKET_SEC: Final[Mapping[str, int]] = {
+    "M15": 900, "H1": 3600, "H4": 14400, "D": 86400,
+    "W": 604800, "M": 2678400,
+}
+
+
+def _to_bucket(to_iso: Optional[str], granularity: str) -> int:
+    """CACHE-02: bucket ``to`` by TF period so replay/backtest callers
+    can never share a cache slot with a now-caller, while normal runs
+    (to = now) keep warm-cache hits within the same bucket."""
+    if to_iso is None:
+        return -1
+    try:
+        dtv = datetime.fromisoformat(to_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return 0
+    step = _TO_BUCKET_SEC.get(granularity, 3600)
+    return int(dtv.timestamp() // step)
+
+
 def _parse_oanda_json(
     raw_json: Any, instrument: str, granularity: str, include_incomplete: bool,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], int]:
     if not isinstance(raw_json, dict):
         _log_incident(IncidentCode.JSON_INVALID, "root not dict",
                       instrument=instrument, granularity=granularity)
-        return []
+        return [], 0
     candles = raw_json.get("candles", [])
     if not isinstance(candles, list):
         _log_incident(IncidentCode.JSON_INVALID, "candles not list",
                       instrument=instrument, granularity=granularity)
-        return []
+        return [], 0
 
     is_index = instrument in INDICES
 
@@ -1752,7 +1779,7 @@ def _parse_oanda_json(
                 instrument=instrument, granularity=granularity,
                 total=total, failed=errors, error_rate=f"{error_rate:.1%}",
             )
-    return rows
+    return rows, errors
 
 
 def _handle_oanda_status(
@@ -1853,11 +1880,14 @@ def _fetch_candles_raw(
                       instrument=instrument, granularity=granularity)
         return FetchResult(df=pd.DataFrame())
 
-    rows = _parse_oanda_json(raw_json, instrument, granularity, include_incomplete)
+    rows, dropped = _parse_oanda_json(
+        raw_json, instrument, granularity, include_incomplete,
+    )
     if not rows:
         return FetchResult(df=pd.DataFrame())
 
     df = pd.DataFrame(rows)
+    n_before = len(df)
     df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df = df.dropna(subset=["date"])
     if df.empty:
@@ -1866,12 +1896,14 @@ def _fetch_candles_raw(
 
     if df.index.has_duplicates:
         df = df[~df.index.duplicated(keep="last")]
+    dropped += n_before - len(df)
 
     if not _validate_dataframe_schema(df, instrument, granularity):
         return FetchResult(df=pd.DataFrame())
 
     df.attrs["instrument"] = instrument
     df.attrs["granularity"] = granularity
+    df.attrs["dropped_bars"] = max(0, int(dropped))
 
     return FetchResult(
         df=df,
@@ -1959,7 +1991,10 @@ def fetch_cached(
     registry: SessionRegistry,
     to_iso: Optional[str] = None,
 ) -> FetchResult:
-    key: CacheKey = (_OANDA_ENV, account_hash, instrument, granularity, count)
+    key: CacheKey = (
+        _OANDA_ENV, account_hash, instrument, granularity, count,
+        _to_bucket(to_iso, granularity),
+    )
     ttl = _CACHE_TTL.get(granularity, CFG.cache.ttl_default)
     leader_budget = CFG.http.timeout_sec * (CFG.http.retry_total + 1) * 1.5 + 5.0
     return _get_candle_cache().get_candles(
@@ -2084,11 +2119,22 @@ def fetch_all_data(
         return cache
 
     cache["_snapshot_completed_at"] = datetime.now(UTC)
-    ts_list = [v for v in cache["_snapshot_per_tf"].values() if v is not None]
-    if ts_list:
-        drift = (max(ts_list) - min(ts_list)).total_seconds()
-        cache["_snapshot_drift_sec"] = drift
-        cache["_snapshot_drift_exceeded"] = drift > CFG.ops.snapshot_drift_max_sec
+    try:
+        run_start = datetime.fromisoformat(
+            snapshot_to_iso.replace("Z", "+00:00")
+        )
+    except (ValueError, AttributeError, TypeError):
+        run_start = None
+    fresh = [
+        v for v in cache["_snapshot_per_tf"].values()
+        if v is not None and (run_start is None or v >= run_start)
+    ]
+    cache["_snapshot_drift_sec"] = (
+        (max(fresh) - min(fresh)).total_seconds() if len(fresh) >= 2 else 0.0
+    )
+    cache["_snapshot_drift_exceeded"] = (
+        cache["_snapshot_drift_sec"] > CFG.ops.snapshot_drift_max_sec
+    )
 
     cache["_spot_mid"] = fetch_pricing_mid(
         instrument, account_id, account_hash, access_token, registry,
@@ -2190,7 +2236,10 @@ def _vote_swing_structure(
 @DAILY_VOTES.register(uid="ema_stack")
 def _vote_ema_stack(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
     name = "ema_stack"
-    cur = ctx.get("cur_struct") or ctx.get("cur")
+    cur_struct = ctx.get("cur_struct")
+    cur = (
+        cur_struct if cur_struct is not None else ctx.get("cur")
+    )
     e21 = ctx.get("e21")
     e50_cur = ctx.get("e50_cur")
     if cur is None or e21 is None or e50_cur is None:
@@ -2337,6 +2386,13 @@ def _vote_ema50_slope(_h, _lo, _c, ctx: Mapping[str, Any]) -> VoteSignal:
 # SECTION 15 — AGGREGATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_VOTE_NOMINAL_RELIABILITY: Final[Mapping[str, float]] = {
+    "swing_structure": 0.9, "ema_stack": 0.75, "weekly_open": 0.9,
+    "prev_midpoint": 0.8, "ema50_slope": 0.7,
+}
+_VOTE_NOMINAL_RELIABILITY_DEFAULT: Final[float] = 0.7
+
+
 def _aggregate_votes(
     votes: Tuple[VoteSignal, ...], atr_val: float, degraded: bool,
 ) -> DailyTrendResult:
@@ -2345,6 +2401,12 @@ def _aggregate_votes(
     bear_score = sum(v.weight * v.reliability for v in votes
                      if v.fired and v.direction == Direction.BEARISH)
     fired_possible = sum(v.weight * v.reliability for v in votes if v.fired)
+    possible_mass = sum(
+        v.weight * _VOTE_NOMINAL_RELIABILITY.get(
+            v.name, _VOTE_NOMINAL_RELIABILITY_DEFAULT,
+        )
+        for v in votes
+    )
     winning_score = max(bull_score, bear_score)
     min_votes_met = winning_score >= CFG.vote.min_reliable_score
 
@@ -2354,7 +2416,8 @@ def _aggregate_votes(
             bull_score, bear_score, votes, False, degraded,
         )
     direction = Direction.BULLISH if bull_score > bear_score else Direction.BEARISH
-    ratio = winning_score / fired_possible if fired_possible > 0 else 0.0
+    denom = max(fired_possible, possible_mass)
+    ratio = winning_score / denom if denom > 0 else 0.0
     strength = int(min(
         CFG.vote.strength_max,
         max(CFG.vote.strength_min_range, ratio * CFG.vote.strength_scaler),
@@ -2476,7 +2539,8 @@ def _trend_macro_weekly(c: pd.Series, e50_series: pd.Series, atr_val: float,
 
 
 def trend_macro(df: pd.DataFrame, tf: str, bundle: IndicatorBundle) -> TrendResult:
-    if len(df) < 50 or bundle.has_nan:
+    min_bars = CFG.bars.min_bars_m if tf == "M" else CFG.bars.min_bars_w
+    if len(df) < min_bars or bundle.has_nan:
         return TrendResult("Range", 0, bundle.atr_val)
     band = bundle.atr_val * CFG.vote.macro_band_atr_ratio
     c = df["Close"]
@@ -2583,7 +2647,9 @@ def trend_intraday(
 ) -> TrendResult:
     c = df["Close"]
     atr_val = bundle.atr_val
-    if len(df) < 70 or bundle.has_nan:
+    if len(df) < CFG.bars.min_bars_15m or bundle.has_nan:
+        return TrendResult("Range", 0, atr_val)
+    if bundle.has_intraday_nan:
         return TrendResult("Range", 0, atr_val)
     cur = spot_mid if spot_mid is not None else _safe_float(c.iloc[-1])
     if cur is None:
@@ -2623,7 +2689,7 @@ def trend_intraday(
 
 
 def trend_age_daily(df: pd.DataFrame, bundle: IndicatorBundle) -> Optional[int]:
-    if len(df) < 55 or bundle.has_nan:
+    if len(df) < CFG.bars.min_bars_d or bundle.has_nan:
         return None
     c = df["Close"]
     e50 = bundle.ema_long_series
@@ -2989,6 +3055,20 @@ def analyze_pair(
             degraded_reasons.append(
                 "Dérive de snapshot > %.0f s" % CFG.ops.snapshot_drift_max_sec
             )
+        _dropped = sum(
+            int(cache[tf].attrs.get("dropped_bars", 0))
+            for tf in ("M", "W", "D", "4H", "1H", "15m")
+            if isinstance(cache.get(tf), pd.DataFrame)
+        )
+        if _dropped > 0:
+            _log_incident(
+                IncidentCode.DATA_GAPS,
+                "%d barres invalides ecartees" % _dropped,
+                instrument=pair,
+            )
+            degraded_reasons.append(
+                "Barres invalides écartées : %d" % _dropped
+            )
         degraded = bool(degraded_reasons)
 
         bundles = _build_pair_bundles(cache)
@@ -2999,6 +3079,10 @@ def analyze_pair(
             return None
 
         spot_mid = cache.get("_spot_mid")
+        if spot_mid is None:
+            degraded_reasons.append("Prix spot indisponible")
+            degraded = True
+
         computed = _compute_pair_trends(cache, bundles, pair, spot_mid, stop_event)
         if computed is None:
             return None
@@ -3225,8 +3309,17 @@ def _finalize_run(
             r["Tradable"] = False
             r["Tradable_reason"] = r["_error_reason"]
         else:
-            r["Quality"] = g
             pair_degraded = bool(r.get("_degraded"))
+            if r.get("current_price") is None:
+                pair_degraded = True
+                r["_degraded"] = True
+                rr = list(r.get("_degraded_reasons") or [])
+                if "Prix spot indisponible" not in rr:
+                    rr.append("Prix spot indisponible")
+                r["_degraded_reasons"] = rr
+                if g in ("A+", "A"):
+                    g = "B+"
+            r["Quality"] = g
             r["Tradable"] = not pair_degraded
             if pair_degraded:
                 reasons = [x for x in (r.get("_degraded_reasons") or []) if x]
@@ -3234,6 +3327,14 @@ def _finalize_run(
             else:
                 r["Tradable_reason"] = None
 
+    _log.info(
+        "RUN SUMMARY completeness=%.3f errors=%d degraded=%d "
+        "timed_out=%s",
+        meta.get("completeness", 0.0),
+        meta.get("errors_count", 0),
+        len(meta.get("degraded_pairs", [])),
+        meta.get("timed_out", False),
+    )
     df = pd.DataFrame(results)
     df = _coerce_output_dtypes(df)
     df = sort_results(df)
@@ -3307,6 +3408,14 @@ def analyze_all_core(
         if r.get("_degraded") and "_error_reason" not in r
     )
 
+    analyzed = {r["Paire"].replace("/", "_") for r in results}
+    for inst in INSTRUMENTS:
+        if inst not in analyzed:
+            results.append(
+                _empty_pair_result(inst, "Non scannée (arrêt/timeout)")
+            )
+            errors.discard(inst)
+
     if errors:
         sample = ", ".join(e.replace("_", "/") for e in sorted(errors)[:10])
         ellipsis = " …" if len(errors) > 10 else ""
@@ -3362,14 +3471,27 @@ def build_export_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     src = sort_results(df)
     cols = [c for c in EXPORT_COLS if c in src.columns]
     records: List[Dict[str, Any]] = []
-    for _, row in src[cols].iterrows():
-        records.append({c: _json_scalar(row[c]) for c in cols})
+    has_score = "_mtf_score" in src.columns
+    for _, row in src.iterrows():
+        rec: Dict[str, Any] = {}
+        for c in cols:
+            rec[c] = _json_scalar(row[c])
+            if c == "MTF_pct" and has_score:
+                rec["MTF_score"] = _json_scalar(row["_mtf_score"])
+        records.append(rec)
     return records
 
 
-def _export_meta(df: pd.DataFrame) -> Dict[str, Any]:
-    raw = df.attrs.get("meta") or {}
-    out: Dict[str, Any] = {"scanner": "BLUESTAR-GPS"}
+def _export_meta(
+    df: pd.DataFrame, meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    raw = meta if isinstance(meta, dict) else (df.attrs.get("meta") or {})
+    out: Dict[str, Any] = {
+        "scanner": "BLUESTAR-GPS",
+        "schema_version": GPS_JSON_SCHEMA,
+    }
+    if not raw:
+        out["meta_incomplete"] = True
     for k in (
         "version", "env", "account_hash", "snapshot_to", "completeness",
         "errors_count", "degraded_pairs", "timed_out",
@@ -3381,9 +3503,14 @@ def _export_meta(df: pd.DataFrame) -> Dict[str, Any]:
     return out
 
 
-def export_json(df: pd.DataFrame) -> bytes:
+GPS_JSON_SCHEMA: Final[str] = "gps-1.1"
+
+
+def export_json(
+    df: pd.DataFrame, meta: Optional[Dict[str, Any]] = None,
+) -> bytes:
     payload = {
-        "meta": _export_meta(df),
+        "meta": _export_meta(df, meta),
         "assets": build_export_records(df),
     }
     return json.dumps(
@@ -3672,7 +3799,7 @@ def _load_secrets() -> Tuple[Optional[str], Optional[SecretToken]]:
                 IncidentCode.HTTP_AUTH, "secrets read error",
                 err=type(exc).__name__, level=logging.ERROR,
             )
-            return None, None
+            acc, tok = None, None
     if acc is None or tok is None:
         acc = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
         tok = os.environ.get("OANDA_ACCESS_TOKEN", "").strip()
@@ -4086,7 +4213,11 @@ def _hash_dataframe_for_pdf(df: pd.DataFrame) -> str:
     try:
         h = hashlib.sha256()
         h.update(str(len(df)).encode())
-        for col in ("Paire", "Quality", "MTF", "NC"):
+        for col in (
+            "Paire", "Quality", "MTF", "NC", "current_price",
+            "ATR Daily", "ATR H4", "ATR H1", "ATR 15m",
+            "Tradable", "Tradable_reason",
+        ):
             if col in df.columns:
                 h.update(col.encode())
                 h.update(str(df[col].tolist()).encode())
@@ -4148,7 +4279,11 @@ def _get_pdf_buffer(df_clean: pd.DataFrame) -> BytesIO:
     return buf
 
 
-def _render_downloads(df_clean: pd.DataFrame) -> None:
+def _render_downloads(
+    df_clean: pd.DataFrame,
+    df_full: Optional[pd.DataFrame] = None,
+) -> None:
+    df_data = df_full if df_full is not None else df_clean
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -4159,13 +4294,13 @@ def _render_downloads(df_clean: pd.DataFrame) -> None:
         )
     with c2:
         st.download_button(
-            "📊 CSV", data=export_csv(df_clean),
+            "📊 CSV", data=export_csv(df_data),
             file_name=f"Bluestar_GPS_{ts}.csv",
             mime="text/csv", use_container_width=True,
         )
     with c3:
         st.download_button(
-            "🗂️ JSON", data=export_json(df_clean),
+            "🗂️ JSON", data=export_json(df_data, st.session_state.get("df_meta")),
             file_name=f"Bluestar_GPS_{ts}.json",
             mime="application/json", use_container_width=True,
         )
@@ -4261,7 +4396,7 @@ def main() -> None:
         _render_interactive_table(df_clean)
 
     st.write("")
-    _render_downloads(df_clean)
+    _render_downloads(df_clean, st.session_state["df"])
 
 
 if __name__ == "__main__":
