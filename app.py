@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BLUESTAR HEDGE FUND GPS — V9.3.4 PRODUCTION-GRADE                           ║
+║  BLUESTAR HEDGE FUND GPS — V9.3.7 PRODUCTION-GRADE                           ║
 ║                                                                              ║
 ║  Base fonctionnelle : V9.1.0 (couche data, cache, votes, MTF, NC,            ║
 ║  grading inchangée hors corrections ci-dessous).                             ║
@@ -27,6 +27,11 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
+# V9.3.5 — correctifs d'audit (voir TUNING_LOG.md) : contrôleur de run par
+# session, snapshot_to = now - 5 s, warning des paires non analysées, cache,
+# seuils de grade dans MtfConfig, retrait de la dépendance morte `holidays`.
+# Aucun changement de design, des colonnes d'export ni des signaux.
+
 from __future__ import annotations
 
 import functools
@@ -36,6 +41,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -48,7 +54,7 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
     as_completed,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from io import BytesIO
@@ -88,13 +94,6 @@ except ImportError:
     FPDF = None  # type: ignore[assignment,misc]
     _FPDF_AVAILABLE = False  # type: ignore[misc]
     _FPDF2 = False  # type: ignore[misc]
-
-try:
-    import holidays as _holidays_lib
-    _HAS_HOLIDAYS: Final[bool] = True
-except ImportError:
-    _holidays_lib = None  # type: ignore[assignment]
-    _HAS_HOLIDAYS = False  # type: ignore[misc]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -348,7 +347,7 @@ def _log_incident(
 # SECTION 3 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION: Final[str] = "9.3.4-PROD-GRADE"
+APP_VERSION: Final[str] = "9.4.0-PROD"
 
 _OANDA_ENV: Final[str] = os.environ.get("OANDA_ENV", "practice").lower()
 OANDA_API_URL: Final[str] = (
@@ -425,6 +424,10 @@ class IndicatorConfig:
     max_pivot_age: int = 50
     pivot_prominence_atr_ratio: float = 0.5
     pivot_min_confirmations: int = 3
+    # monthly trend strength threshold (N4); "pct" is the historical mode
+    monthly_strength_mode: str = "pct"
+    monthly_gap_strong_pct: float = 0.3
+    monthly_gap_strong_atr: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -459,6 +462,16 @@ class MtfConfig:
     nc_mtf_min_for_a_plus: float = 70.0
     nc_min_for_a_plus: int = 3
     fast_tf_soft_opposition_factor: float = 0.5
+    grade_a_min: float = 55.0
+    grade_a_nc_min: int = 1
+    grade_b_plus_min: float = 38.0
+    grade_b_plus_degraded_min: float = 50.0
+    grade_b_plus_degraded_nc_min: int = 1
+    # alignment-bonus magnitudes (N3); defaults are the former hardcoded values
+    align_mw_pure: float = 15.0
+    align_mw_compat: float = 12.0
+    align_d4h_pure: float = 10.0
+    align_d4h_compat: float = 7.0
 
 
 @dataclass(frozen=True)
@@ -503,7 +516,66 @@ class TrendConfig:
             raise ValueError("timeout_sec > 0 required")
 
 
-CFG: Final[TrendConfig] = TrendConfig()
+# V9.4.0 — overlay de parametres de deploiement (S16).
+# Charge params_final.json (config tunée, validée Phase 5/6) au démarrage.
+# Comportement de repli : si le fichier est absent, vide, invalide ou hors
+# bornes, CFG reste exactement la factory TrendConfig() — la production ne
+# plante JAMAIS pour un problème de config. Le harnais (GPS HARNESS.py) garde
+# sa propre base TrendConfig() pour pouvoir mesurer la baseline historique.
+_PARAMS_FILE = Path(__file__).resolve().parent.parent / "params_final.json"
+_PARAMS_BOUNDS = {
+    "mtf": {
+        "align_mw_pure": (0.0, 15.0),
+        "align_mw_compat": (0.0, 12.0),
+        "align_d4h_pure": (0.0, 15.0),
+        "align_d4h_compat": (0.0, 12.0),
+    },
+}
+
+
+def _load_deployment_params() -> dict:
+    """Lit params_final.json et valide chaque champ contre les bornes.
+
+    Retourne {} (silencieusement) si absent/illisible/invalide -> repli usine.
+    """
+    try:
+        if not _PARAMS_FILE.exists():
+            return {}
+        data = json.loads(_PARAMS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data:
+            return {}
+        overlays: dict = {}
+        for sec, vals in data.items():
+            if not isinstance(vals, dict):
+                return {}
+            bounds = _PARAMS_BOUNDS.get(sec)
+            if bounds is None:
+                return {}
+            for k, v in vals.items():
+                if k not in bounds:
+                    return {}
+                lo, hi = bounds[k]
+                if not isinstance(v, (int, float)) or not (lo <= v <= hi):
+                    return {}
+            overlays[sec] = vals
+        return overlays
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _apply_deployment_overlay() -> TrendConfig:
+    """Construit la config de production = factory + overlay de déploiement."""
+    overlays = _load_deployment_params()
+    if not overlays:
+        return TrendConfig()
+    base = TrendConfig()
+    replaced = {sec: replace(getattr(base, sec), **vals)
+                for sec, vals in overlays.items()}
+    return replace(base, **replaced)
+
+
+CFG: Final[TrendConfig] = _apply_deployment_overlay()
+
 
 
 _CACHE_TTL: Final[Mapping[str, int]] = {
@@ -644,10 +716,7 @@ class DailyTrendResult:
     direction: Direction
     strength: int
     atr_val: float
-    bull_score: float
-    bear_score: float
     votes: Tuple[VoteSignal, ...]
-    min_votes_met: bool
     degraded: bool = False
 
 
@@ -687,23 +756,6 @@ class IndicatorBundle:
 # SECTION 6 — MARKET CALENDAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_FX_FULL_CLOSURE_HOLIDAYS_US: Final[FrozenSet[str]] = frozenset({
-    "New Year's Day",
-    "Christmas Day",
-})
-
-
-@functools.lru_cache(maxsize=8)
-def _get_us_holiday_map(year: int) -> Mapping[Any, str]:
-    """Date → holiday name map."""
-    if not _HAS_HOLIDAYS or _holidays_lib is None:
-        return {}
-    try:
-        return dict(_holidays_lib.country_holidays("US", years=[year]))
-    except Exception:
-        return {}
-
-
 def _is_weekend_closed(wd: int, hr: int) -> bool:
     if wd == 5:                # Saturday
         return True
@@ -715,7 +767,13 @@ def _is_weekend_closed(wd: int, hr: int) -> bool:
 
 
 def is_fx_market_open(now: Optional[datetime] = None) -> bool:
-    """FX market: Sunday 17:00 NY → Friday 17:00 NY. US major holidays closed."""
+    """FX market: Sunday 17:00 NY → Friday 17:00 NY.
+
+    V9.3.5 : la dépendance `holidays` (fériés US) est retirée — elle était
+    absente de requirements.txt (branche morte en production) et la détection
+    des fériés relève du module calendrier du pipeline amont, hors périmètre
+    « direction seule ».
+    """
     if now is None:
         now = datetime.now(UTC)
     elif now.tzinfo is None:
@@ -724,12 +782,6 @@ def is_fx_market_open(now: Optional[datetime] = None) -> bool:
     ny = now.astimezone(NY_TZ)
     if _is_weekend_closed(ny.weekday(), ny.hour):
         return False
-
-    if _HAS_HOLIDAYS:
-        hmap = _get_us_holiday_map(ny.year)
-        name = hmap.get(ny.date())
-        if name and any(h in name for h in _FX_FULL_CLOSURE_HOLIDAYS_US):
-            return False
 
     return True
 
@@ -1534,30 +1586,24 @@ _RUN_CONTROLLER_INSTANCE: Optional[_RunController] = None
 _RUN_CONTROLLER_LOCK = threading.Lock()
 
 
-def _st_run_controller_factory() -> _RunController:
-    return _RunController()
-
-
-if _STREAMLIT_AVAILABLE:
-    _st_run_controller: Optional[Callable[[], _RunController]] = st.cache_resource(
-        show_spinner=False,
-    )(_st_run_controller_factory)
-else:
-    _st_run_controller = None
+_RUN_CONTROLLER_SESSION_KEY: Final[str] = "_gps_run_controller"
 
 
 def _get_run_controller() -> _RunController:
+    """Un contrôleur PAR SESSION Streamlit : le run d'un utilisateur ne doit
+    jamais interrompre celui d'un autre (st.cache_resource = global serveur).
+    Hors runtime Streamlit (harnais, CLI) : singleton process."""
     global _RUN_CONTROLLER_INSTANCE
-    if (
-        _STREAMLIT_AVAILABLE
-        and _is_streamlit_runtime()
-        and _st_run_controller is not None
-    ):
+    if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
         try:
-            return _st_run_controller()
+            ctrl = st.session_state.get(_RUN_CONTROLLER_SESSION_KEY)
+            if not isinstance(ctrl, _RunController):
+                ctrl = _RunController()
+                st.session_state[_RUN_CONTROLLER_SESSION_KEY] = ctrl
+            return ctrl
         except Exception as e:
             _log_incident(
-                IncidentCode.UI_CALLBACK_ERROR, "streamlit run controller cache failed",
+                IncidentCode.UI_CALLBACK_ERROR, "session run controller failed",
                 err=type(e).__name__,
             )
     if _RUN_CONTROLLER_INSTANCE is None:
@@ -2084,9 +2130,7 @@ def fetch_all_data(
     snapshot_to_iso: Optional[str],
 ) -> Dict[str, Any]:
     specs = _build_tf_specs()
-    snapshot_started = datetime.now(UTC)
     cache: Dict[str, Any] = {
-        "_snapshot_started_at": snapshot_started,
         "_snapshot_per_tf": {},
         "_stale_tfs": [],
         "is_incomplete": False,
@@ -2118,7 +2162,6 @@ def fetch_all_data(
         cache["error_reason"] = "Stop requested"
         return cache
 
-    cache["_snapshot_completed_at"] = datetime.now(UTC)
     try:
         run_start = datetime.fromisoformat(
             snapshot_to_iso.replace("Z", "+00:00")
@@ -2307,16 +2350,16 @@ def _vote_prev_midpoint_fx(
         return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
                           0.0, False, "no_vol_data")
     try:
-        vol_nz = vol[vol > 0]
-        if len(vol_nz) < 1:
+        vol_j1 = _safe_float(vol.iloc[-1])
+        if vol_j1 is None or vol_j1 <= 0:
             return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
-                              0.0, False, "no nonzero vol")
-        vol_ref = vol_nz.iloc[:-1] if len(vol_nz) >= 1 else pd.Series(dtype=float)
-        vol_j1 = _safe_float(vol_nz.iloc[-1])
-        if vol_j1 is None or len(vol_ref) < 20:
+                              0.0, False, "vol J-1 nul/NaN")
+        vol_ref = vol.iloc[:-1]
+        vol_ref = vol_ref[vol_ref > 0]
+        if len(vol_ref) < 20:
             return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
-                              0.0, False, "vol_history<20 or NaN")
-        vol_ma = _safe_float(vol_ref.rolling(20).mean().iloc[-1])
+                              0.0, False, "vol_history<20")
+        vol_ma = _safe_float(vol_ref.iloc[-20:].mean())
         if vol_ma is None or vol_ma <= 0:
             return VoteSignal(name, Direction.RANGE, CFG.vote.weight_prev_midpoint,
                               0.0, False, "vol_ma invalide")
@@ -2413,7 +2456,7 @@ def _aggregate_votes(
     if bull_score == bear_score or not min_votes_met:
         return DailyTrendResult(
             Direction.RANGE, CFG.vote.strength_min_range, atr_val,
-            bull_score, bear_score, votes, False, degraded,
+            votes, degraded,
         )
     direction = Direction.BULLISH if bull_score > bear_score else Direction.BEARISH
     denom = max(fired_possible, possible_mass)
@@ -2423,8 +2466,7 @@ def _aggregate_votes(
         max(CFG.vote.strength_min_range, ratio * CFG.vote.strength_scaler),
     ))
     return DailyTrendResult(
-        direction, strength, atr_val, bull_score, bear_score, votes,
-        True, degraded,
+        direction, strength, atr_val, votes, degraded,
     )
 
 
@@ -2471,14 +2513,12 @@ def trend_daily(
     if len(df) < CFG.bars.min_bars_d or bundle.has_nan:
         guard = VoteSignal("guard", Direction.RANGE, 0.0, 1.0, False,
                            f"insuf/NaN (n={len(df)},nan={bundle.has_nan})")
-        return DailyTrendResult(Direction.RANGE, 0, atr_val, 0.0, 0.0,
-                                (guard,), False, True)
+        return DailyTrendResult(Direction.RANGE, 0, atr_val, (guard,), True)
 
     cur = spot_mid if spot_mid is not None else _safe_float(c.iloc[-1])
     if cur is None:
         guard = VoteSignal("guard", Direction.RANGE, 0.0, 1.0, False, "no spot/close")
-        return DailyTrendResult(Direction.RANGE, 0, atr_val, 0.0, 0.0,
-                                (guard,), False, True)
+        return DailyTrendResult(Direction.RANGE, 0, atr_val, (guard,), True)
 
     vol_series = (
         df["Volume"] if "Volume" in df.columns and instrument not in INDICES else None
@@ -2510,8 +2550,14 @@ def _trend_macro_monthly(c: pd.Series, e50_series: pd.Series, atr_val: float,
     cur = _safe_float(e50_series.iloc[-1])
     if ref is None or cur is None or ref == 0:
         return TrendResult("Range", 40, atr_val)
-    gap = abs(cur - ref) / ref * 100
-    s = 75 if gap > 0.3 else 60
+    ind = CFG.ind
+    if ind.monthly_strength_mode == "atr" and atr_val and atr_val > 0:
+        gap = abs(cur - ref) / atr_val
+        strong = gap > ind.monthly_gap_strong_atr
+    else:
+        gap = abs(cur - ref) / ref * 100
+        strong = gap > ind.monthly_gap_strong_pct
+    s = 75 if strong else 60
     if cur > ref + band:
         return TrendResult("Bullish", s, atr_val)
     if cur < ref - band:
@@ -2539,7 +2585,12 @@ def _trend_macro_weekly(c: pd.Series, e50_series: pd.Series, atr_val: float,
 
 
 def trend_macro(df: pd.DataFrame, tf: str, bundle: IndicatorBundle) -> TrendResult:
-    min_bars = CFG.bars.min_bars_m if tf == "M" else CFG.bars.min_bars_w
+    if tf == "M":
+        min_bars = CFG.bars.min_bars_m
+    else:
+        # _trend_macro_weekly exige CFG.ind.sma_macro (SMA200) ; en dessous de
+        # ce seuil la force W retombait silencieusement à "Range 40" (bug 8).
+        min_bars = max(CFG.bars.min_bars_w, CFG.ind.sma_macro)
     if len(df) < min_bars or bundle.has_nan:
         return TrendResult("Range", 0, bundle.atr_val)
     band = bundle.atr_val * CFG.vote.macro_band_atr_ratio
@@ -2598,12 +2649,19 @@ def _intraday_volume_vote(
     if len(df) < 2:
         return None, None
     vol = df["Volume"]
-    vol_nz = vol[vol > 0]
+    vol_cur = _safe_float(vol.iloc[-1])
+    # F1 (ex-B2) : la bougie courante doit avoir du volume reel, et sa moyenne
+    # de reference est calculee sur les 20 dernieres barres HORS bougie
+    # courante — sinon la bougie courante est incluse dans sa propre moyenne
+    # (auto-reference : un volume eleve gonfle la moyenne, un volume faible la
+    # tire vers le bas, ce qui fausse le test dans les deux sens).
+    if vol_cur is None or vol_cur <= 0:
+        return None, None
+    vol_nz = vol.iloc[:-1][vol.iloc[:-1] > 0]
     if len(vol_nz) < 20:
         return None, None
     vol_avg = _safe_float(vol_nz.rolling(20).mean().iloc[-1])
-    vol_cur = _safe_float(vol.iloc[-1])
-    if vol_avg is None or vol_avg <= 0 or vol_cur is None:
+    if vol_avg is None or vol_avg <= 0:
         return None, None
     close_cur = _safe_float(df["Close"].iloc[-1])
     close_prev = _safe_float(df["Close"].iloc[-2])
@@ -2752,10 +2810,17 @@ def _mtf_weighted_score(
     return w_bull, w_bear, active_count
 
 
-_ALIGNMENT_PAIRS: Final[Tuple[Tuple[str, str, int, int], ...]] = (
-    ("M",  "W",  15, 12),
-    ("D",  "4H", 10, 7),
-)
+def _alignment_pairs() -> Tuple[Tuple[str, str, float, float], ...]:
+    """Alignment-bonus pairs, read from CFG (N3).
+
+    Values were formerly hardcoded here; the defaults in MtfConfig are exactly
+    the previous constants so behaviour is unchanged.
+    """
+    m = CFG.mtf
+    return (
+        ("M",  "W",  m.align_mw_pure,   m.align_mw_compat),
+        ("D",  "4H", m.align_d4h_pure,  m.align_d4h_compat),
+    )
 
 
 def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
@@ -2772,7 +2837,7 @@ def _mtf_alignment_bonus(trends: Mapping[str, str], direction: str) -> int:
         and any(opposite_compat(t) for t in fast_trends)
     )
     bonus = 0
-    for tf1, tf2, pure_b, compat_b in _ALIGNMENT_PAIRS:
+    for tf1, tf2, pure_b, compat_b in _alignment_pairs():
         t1, t2 = trends.get(tf1, ""), trends.get(tf2, "")
         if t1 == pure and t2 == pure:
             bonus += pure_b
@@ -2881,14 +2946,16 @@ def grade_hybrid(
             sc = float(score)
         except (TypeError, ValueError):
             sc = 0.0
+        m = CFG.mtf
         if degraded:
-            grades.append("B+" if sc >= 50 and nc >= 1 else "B")
+            ok = sc >= m.grade_b_plus_degraded_min and nc >= m.grade_b_plus_degraded_nc_min
+            grades.append("B+" if ok else "B")
             continue
-        if sc >= CFG.mtf.nc_mtf_min_for_a_plus and nc >= CFG.mtf.nc_min_for_a_plus:
+        if sc >= m.nc_mtf_min_for_a_plus and nc >= m.nc_min_for_a_plus:
             grades.append("A+")
-        elif sc >= 55 and nc >= 1:
+        elif sc >= m.grade_a_min and nc >= m.grade_a_nc_min:
             grades.append("A")
-        elif sc >= 38:
+        elif sc >= m.grade_b_plus_min:
             grades.append("B+")
         else:
             grades.append("B")
@@ -3089,8 +3156,7 @@ def analyze_pair(
         trends, scores, atrs, degraded_daily = computed
         if degraded_daily:
             degraded = True
-            degraded_reasons.append("Bougie D1 dégradée (repli)")
-
+            degraded_reasons.append("Vote D1 critique en échec")
         mtf_dir, mtf_score, active_tfs = score_mtf(trends, scores)
         age = trend_age_daily(cache["D"], bundles["D"])
         stable_window = max(0, len(cache["D"]) - CFG.ind.ema_long)
@@ -3167,6 +3233,10 @@ def _process_completed_future(
             IncidentCode.UNKNOWN, "future result error",
             instrument=inst, err=type(e).__name__, exc_info=True,
         )
+
+
+# OANDA rejette (HTTP 400) un 'to' postérieur à son horloge serveur.
+_OANDA_TO_SAFETY_SEC: Final[float] = 5.0
 
 
 def _format_rfc3339(dt: datetime) -> str:
@@ -3358,7 +3428,7 @@ def analyze_all_core(
     registry = _get_session_registry()
     account_hash = _hash_account(account_id)
 
-    snapshot_to = datetime.now(UTC)
+    snapshot_to = datetime.now(UTC) - timedelta(seconds=_OANDA_TO_SAFETY_SEC)
     snapshot_to_iso = _format_rfc3339(snapshot_to)
 
     meta: Dict[str, Any] = {
@@ -3409,17 +3479,20 @@ def analyze_all_core(
     )
 
     analyzed = {r["Paire"].replace("/", "_") for r in results}
+    missing_pairs = set(errors)
     for inst in INSTRUMENTS:
         if inst not in analyzed:
             results.append(
                 _empty_pair_result(inst, "Non scannée (arrêt/timeout)")
             )
+            missing_pairs.add(inst)
             errors.discard(inst)
 
-    if errors:
-        sample = ", ".join(e.replace("_", "/") for e in sorted(errors)[:10])
-        ellipsis = " …" if len(errors) > 10 else ""
-        warnings.append(f"{len(errors)} paire(s) non analysée(s) : {sample}{ellipsis}")
+    if missing_pairs:
+        ordered = sorted(missing_pairs)
+        sample = ", ".join(e.replace("_", "/") for e in ordered[:10])
+        ellipsis = " …" if len(ordered) > 10 else ""
+        warnings.append(f"{len(ordered)} paire(s) non analysée(s) : {sample}{ellipsis}")
 
     return _finalize_run(results, errors, meta, warnings)
 
@@ -3611,6 +3684,34 @@ def _encode_pdf_output(out: Any) -> bytes:
     return bytes(out)
 
 
+def _pdf_bytes(pdf: Any) -> bytes:
+    """Return the PDF as bytes across fpdf2 versions.
+
+    fpdf2 >= 2.2 deprecates the ``dest`` argument of output(); the modern call
+    returns a bytearray directly. The legacy signature is kept only as a
+    version fallback for pre-2.2 releases.
+    """
+    try:
+        out = pdf.output()
+    except TypeError:
+        out = pdf.output(dest="S")
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    if isinstance(out, str):
+        return out.encode("latin-1", errors="replace")
+    return bytes(out)
+
+
+if _FPDF2:
+    from fpdf.enums import XPos, YPos  # noqa: E501
+    _PDF_LN: Final[Dict[str, Any]] = {
+        "new_x": XPos.LMARGIN,
+        "new_y": YPos.NEXT,
+    }
+else:
+    _PDF_LN: Final[Dict[str, Any]] = {"ln": True}
+
+
 _PDF_PAGE_W: Final[float] = 297.0
 _PDF_PAGE_H: Final[float] = 210.0
 _PDF_MARGIN: Final[float] = 10.0
@@ -3690,7 +3791,7 @@ def _pdf_render_subtitle(pdf: Any, df: pd.DataFrame) -> None:
         f"B+ {counts['B+']}  B {counts['B']}  |  Tradables: {tradable}  |  "
         "Tri: Grade > Tradable > NC > MTF%"
     )
-    pdf.cell(0, 5, _pdf_cell_text(line), ln=True, align="C")
+    pdf.cell(0, 5, _pdf_cell_text(line), align="C", **_PDF_LN)
     pdf.set_text_color(0, 0, 0)
 
 
@@ -3713,7 +3814,7 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
         pdf.set_font("Helvetica", "B", 15)
         pdf.set_text_color(15, 23, 42)
         pdf.cell(0, 9, _pdf_cell_text(f"BLUESTAR GPS V{APP_VERSION}"),
-                 ln=True, align="C")
+                 align="C", **_PDF_LN)
         _pdf_render_subtitle(pdf, data)
         pdf.ln(3)
 
@@ -3739,7 +3840,7 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
                          border=1, align="C", fill=True)
             pdf.ln()
 
-        buf.write(_encode_pdf_output(pdf.output(dest="S")))
+        buf.write(_pdf_bytes(pdf))
         buf.seek(0)
         return buf
     except Exception as e:
@@ -3752,8 +3853,8 @@ def create_pdf(df: pd.DataFrame) -> BytesIO:
             fallback = FPDF()
             fallback.add_page()
             fallback.set_font("Helvetica", "B", 12)
-            fallback.cell(0, 10, "PDF Generation Error", ln=True)
-            buf2.write(_encode_pdf_output(fallback.output(dest="S")))
+            fallback.cell(0, 10, "PDF Generation Error", **_PDF_LN)
+            buf2.write(_pdf_bytes(fallback))
         except Exception as exc:
             _log_incident(
                 IncidentCode.PDF_ERROR, "fallback PDF failed",
@@ -4166,13 +4267,9 @@ def _sidebar_config() -> Tuple[bool, bool]:
         if not is_fx_market_open():
             st.warning("📅 Marché FX fermé — données potentiellement obsolètes.")
         st.markdown("---")
-        if st.button("🗑️ Vider le cache", use_container_width=True):
+        if st.button("🗑️ Vider le cache", width="stretch"):
             _get_candle_cache().clear()
             if _STREAMLIT_AVAILABLE and _is_streamlit_runtime():
-                try:
-                    st.cache_resource.clear()
-                except Exception as e:
-                    _log.debug("Streamlit cache_resource clear failed: %s", e)
                 try:
                     st.cache_data.clear()
                 except Exception as e:
@@ -4290,19 +4387,19 @@ def _render_downloads(
         st.download_button(
             "📄 PDF", data=_get_pdf_buffer(df_clean),
             file_name=f"Bluestar_GPS_{ts}.pdf",
-            mime="application/pdf", use_container_width=True,
+            mime="application/pdf", width="stretch",
         )
     with c2:
         st.download_button(
             "📊 CSV", data=export_csv(df_data),
             file_name=f"Bluestar_GPS_{ts}.csv",
-            mime="text/csv", use_container_width=True,
+            mime="text/csv", width="stretch",
         )
     with c3:
         st.download_button(
             "🗂️ JSON", data=export_json(df_data, st.session_state.get("df_meta")),
             file_name=f"Bluestar_GPS_{ts}.json",
-            mime="application/json", use_container_width=True,
+            mime="application/json", width="stretch",
         )
 
 
@@ -4321,7 +4418,7 @@ def _render_interactive_table(df_clean: pd.DataFrame) -> None:
     st.dataframe(
         styled,
         height=min(800, max(400, (len(df_clean) + 1) * 38 + 10)),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -4364,7 +4461,7 @@ def main() -> None:
     if st.button(
         "🚀 LANCER L'ANALYSE TOUS ACTIFS",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=is_running,
     ):
         _run_analysis_action(acc, tok)

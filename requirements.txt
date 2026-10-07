@@ -1,8 +1,8 @@
-streamlit
-pandas
-numpy
-requests
-Pillow
-fpdf          
-oandapyV20     
-pytz          
+streamlit>=1.50,<2
+pandas>=2.1,<3
+numpy>=1.26,<3
+requests>=2.31
+urllib3>=2
+scipy>=1.11
+fpdf2>=2.7,<3
+pyarrow>=14
